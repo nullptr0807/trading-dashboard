@@ -178,11 +178,11 @@ function renderPnlHistogram(dist) {
   for (let i = 0; i <= 4; i++) {
     const y = MT + plotH * (i / 4);
     const label = Math.round(maxCount * (1 - i / 4));
-    svg += `<line x1="${ML}" y1="${y}" x2="${W - MR}" y2="${y}" stroke="rgba(255,255,255,0.05)"/>`;
-    svg += `<text x="${ML - 6}" y="${y + 3}" fill="rgba(255,255,255,0.4)" font-size="10" text-anchor="end">${label}</text>`;
+    svg += `<line x1="${ML}" y1="${y}" x2="${W - MR}" y2="${y}" stroke="rgba(0,0,0,0.06)"/>`;
+    svg += `<text x="${ML - 6}" y="${y + 3}" fill="rgba(0,0,0,0.55)" font-size="10" text-anchor="end">${label}</text>`;
   }
   if (zeroX !== null) {
-    svg += `<line x1="${zeroX}" y1="${MT}" x2="${zeroX}" y2="${MT + plotH}" stroke="rgba(255,255,255,0.25)" stroke-dasharray="3,3"/>`;
+    svg += `<line x1="${zeroX}" y1="${MT}" x2="${zeroX}" y2="${MT + plotH}" stroke="rgba(0,0,0,0.30)" stroke-dasharray="3,3"/>`;
   }
   // bars — stacked A, B, bench. Attach bin-index so mouse handler can look up accounts.
   const gap = Math.max(1, (plotW / N_BINS) * 0.15);
@@ -207,13 +207,13 @@ function renderPnlHistogram(dist) {
   // x-axis labels
   ticks.forEach(v => {
     const x = xOf(v);
-    svg += `<text x="${x}" y="${H - MB + 18}" fill="rgba(255,255,255,0.5)" font-size="10" text-anchor="middle">${v >= 0 ? '+' : ''}${v.toFixed(1)}%</text>`;
+    svg += `<text x="${x}" y="${H - MB + 18}" fill="rgba(0,0,0,0.55)" font-size="10" text-anchor="middle">${v >= 0 ? '+' : ''}${v.toFixed(1)}%</text>`;
   });
   // median / mean markers
   if (typeof dist.median_pct === 'number') {
     const mx = xOf(dist.median_pct);
     svg += `<line x1="${mx}" y1="${MT}" x2="${mx}" y2="${MT + plotH}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.7"/>`;
-    svg += `<text x="${mx + 4}" y="${MT + 12}" fill="#ffffff" font-size="10" opacity="0.8">${t('dist_median')} ${dist.median_pct >= 0 ? '+' : ''}${dist.median_pct.toFixed(2)}%</text>`;
+    svg += `<text x="${mx + 4}" y="${MT + 12}" fill="rgba(0,0,0,0.75)" font-size="10" opacity="1">${t('dist_median')} ${dist.median_pct >= 0 ? '+' : ''}${dist.median_pct.toFixed(2)}%</text>`;
   }
   svg += `</svg>`;
   // legend
@@ -233,7 +233,7 @@ function renderPnlHistogram(dist) {
     tip.className = 'pnl-hist-tooltip';
     tip.style.cssText = `
       position:fixed; pointer-events:none; z-index:9999;
-      background:rgba(15,18,28,0.96); border:1px solid rgba(255,255,255,0.15);
+      background:rgba(255,255,255,0.92); border:1px solid rgba(0,0,0,0.08); backdrop-filter:blur(20px) saturate(180%); -webkit-backdrop-filter:blur(20px) saturate(180%); color:var(--text-primary); box-shadow:0 12px 32px rgba(31,38,72,0.18);
       border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.5;
       color:#eaeaf0; box-shadow:0 8px 24px rgba(0,0,0,0.5);
       max-width:320px; display:none; backdrop-filter:blur(8px);
@@ -309,7 +309,7 @@ function renderEquityCurves(data) {
     height: 420,
     layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 12 },
     grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
-    crosshair: { mode: 0, vertLine: { color: 'rgba(255,255,255,0.1)', width: 1 }, horzLine: { color: 'rgba(255,255,255,0.1)', width: 1 } },
+    crosshair: { mode: 0, vertLine: { color: 'rgba(0,0,0,0.15)', width: 1 }, horzLine: { color: 'rgba(0,0,0,0.15)', width: 1 } },
     rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
     timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 10 },
     handleScroll: true,
