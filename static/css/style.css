@@ -1373,3 +1373,62 @@ body::after {
   border-radius: 9px;
   letter-spacing: 0.04em;
 }
+
+
+/* ============ Intro / README markdown page ============ */
+.intro-section { max-width: 920px; margin: 0 auto; }
+.intro-card { padding: 48px 56px; }
+.intro-body { color: var(--text-primary); font-size: 15.5px; line-height: 1.7; }
+.intro-body h1, .intro-body h2, .intro-body h3, .intro-body h4 {
+  font-weight: 700; letter-spacing: -0.02em; color: var(--text-primary);
+  margin: 1.6em 0 0.6em;
+}
+.intro-body h1 { font-size: 36px; margin-top: 0; letter-spacing: -0.03em;
+  background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.intro-body h2 { font-size: 26px; padding-bottom: 6px;
+  border-bottom: 1px solid rgba(0,0,0,0.08); }
+.intro-body h3 { font-size: 19px; }
+.intro-body h4 { font-size: 16px; color: var(--text-secondary); }
+.intro-body p { margin: 0.7em 0; }
+.intro-body blockquote {
+  margin: 1em 0; padding: 10px 16px;
+  background: rgba(0,113,227,0.06);
+  border-left: 3px solid var(--accent-blue);
+  border-radius: 6px; color: var(--text-secondary);
+  font-size: 14.5px;
+}
+.intro-body ul, .intro-body ol { margin: 0.6em 0 0.6em 1.6em; }
+.intro-body li { margin: 0.25em 0; }
+.intro-body code {
+  font-family: var(--font-mono); font-size: 0.88em;
+  background: rgba(0,0,0,0.06); padding: 2px 6px; border-radius: 4px;
+  color: #b3185f;
+}
+.intro-body pre {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55;
+  background: rgba(0,0,0,0.04);
+  border: 1px solid rgba(0,0,0,0.06);
+  border-radius: 10px; padding: 14px 16px;
+  overflow-x: auto; margin: 1em 0;
+}
+.intro-body pre code { background: none; padding: 0; color: var(--text-primary); }
+.intro-body table {
+  width: 100%; border-collapse: collapse; margin: 1em 0;
+  font-size: 14px;
+}
+.intro-body table th, .intro-body table td {
+  padding: 8px 12px; text-align: left;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+.intro-body table th {
+  background: rgba(0,0,0,0.03); font-weight: 600;
+  color: var(--text-primary);
+}
+.intro-body hr {
+  border: none; height: 1px;
+  background: rgba(0,0,0,0.08); margin: 2em 0;
+}
+.intro-body a { color: var(--accent-blue); text-decoration: none; }
+.intro-body a:hover { text-decoration: underline; }
+.intro-body strong { font-weight: 700; color: var(--text-primary); }

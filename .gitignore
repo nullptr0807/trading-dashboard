@@ -30,6 +30,7 @@ data/
 *.txt
 *.log
 *.md
+!README.md
 
 # 配置文件
 *.yaml
