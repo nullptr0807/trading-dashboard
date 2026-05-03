@@ -1442,3 +1442,69 @@ body::after {
 .intro-body a { color: var(--accent-blue); text-decoration: none; }
 .intro-body a:hover { text-decoration: underline; }
 .intro-body strong { font-weight: 700; color: var(--text-primary); }
+
+
+/* ============ Mobile / iPhone Safari nav (<=768px) ============ */
+@media (max-width: 768px) {
+  .nav-inner {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 56px;
+    padding: 8px 12px;
+    row-gap: 8px;
+    column-gap: 8px;
+  }
+  .logo { order: 1; flex: 0 0 auto; }
+  .logo-text { font-size: 15px; }
+  .nav-status { order: 2; flex: 0 0 auto; margin-left: auto; gap: 8px; }
+  /* Hide redundant text: badge + 'Live' label — keep dot + lang select */
+  .market-badge { display: none; }
+  .live-text { display: none; }
+  .nav-links {
+    order: 4;
+    flex: 1 1 100%;
+    justify-content: center;
+    gap: 4px;
+    width: 100%;
+    border-top: 1px solid rgba(0,0,0,0.06);
+    padding-top: 8px;
+  }
+  .nav-link {
+    /* Apple HIG: 44x44pt minimum tap target */
+    padding: 10px 12px;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    font-size: 13px;
+  }
+  .market-tabs {
+    order: 3;
+    flex: 0 0 auto;
+    gap: 4px;
+  }
+  .market-tab {
+    padding: 8px 12px;
+    min-height: 36px;
+    font-size: 12px;
+  }
+  .lang-select {
+    padding: 8px 10px;
+    min-height: 36px;
+    font-size: 13px;
+  }
+  /* Push main content down — nav is now ~110px tall */
+  #app { padding-top: 124px; padding-left: 16px; padding-right: 16px; }
+}
+
+@media (max-width: 480px) {
+  .logo-text { display: none; }   /* logo icon only on tiny screens */
+  .nav-link { font-size: 12.5px; padding: 10px 10px; }
+  .market-tab { padding: 8px 10px; }
+  .market-tab-cur { display: none; }  /* Hide '$' / '¥' suffix */
+  .intro-card { padding: 28px 20px; }
+  .intro-body h1 { font-size: 26px; }
+  .intro-body h2 { font-size: 20px; }
+  .intro-body { font-size: 14.5px; }
+  /* Tables overflow gracefully on narrow screens */
+  .intro-body table { display: block; overflow-x: auto; }
+}
