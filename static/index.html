@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cyber Quant Arena</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css">
+  <link rel="stylesheet" href="/static/css/style.css?v=10">
+</head>
+<body>
+  <nav class="navbar glass-nav">
+    <div class="nav-inner">
+      <a href="#/" class="logo">
+        <span class="logo-icon">◆</span>
+        <span class="logo-text" data-i18n="brand">Cyber Quant Arena</span>
+      </a>
+      <div class="nav-links">
+        <a href="#/trade" class="nav-link" data-route="trade" data-i18n="nav_trade">Trading Overview</a>
+        <a href="#/backtest" class="nav-link" data-route="backtest" data-i18n="nav_backtest">Backtest Analysis</a>
+      </div>
+      <div class="market-tabs" id="market-tabs" role="tablist" aria-label="Market">
+        <button class="market-tab active" data-market="US" role="tab">US <span class="market-tab-cur">$</span></button>
+        <button class="market-tab" data-market="CN" role="tab">CN <span class="market-tab-cur">¥</span></button>
+      </div>
+      <div class="nav-status">
+        <select id="lang-select" class="lang-select" aria-label="Language">
+          <option value="en">EN</option>
+          <option value="zh">中文</option>
+        </select>
+        <span class="market-badge" id="market-badge">US · $</span>
+        <span class="live-dot"></span>
+        <span class="live-text" data-i18n="nav_live">Live</span>
+      </div>
+    </div>
+  </nav>
+
+  <main id="app"></main>
+
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/js/i18n.js?v=6"></script>
+  <script src="/static/js/components.js?v=11"></script>
+  <script src="/static/js/events.js?v=3"></script>
+  <script src="/static/js/trade.js?v=12"></script>
+  <script src="/static/js/backtest.js?v=13"></script>
+  <script src="/static/js/app.js?v=8"></script>
+</body>
+</html>
