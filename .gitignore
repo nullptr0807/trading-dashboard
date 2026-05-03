@@ -1,11 +1,49 @@
+# Python
 __pycache__/
 *.pyc
 venv/
 .venv/
+.DS_Store
+
+# 数据库
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
-data/prices.deprecated_parquet/
-.DS_Store
+*.sqlite
+*.sqlite3
+
+# 数据文件
+data/
+*.parquet
+*.csv
+*.json
+*.jsonl
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.pkl
+*.pickle
+
+# 文本/日志
+*.txt
 *.log
+*.md
+
+# 配置文件
+*.yaml
+*.yml
+*.toml
+*.ini
+*.cfg
+*.conf
+.env
+.env.*
+config.py
+secrets.*
+
+# 依赖锁
+requirements.txt
+poetry.lock
+Pipfile.lock
