@@ -281,8 +281,8 @@ async function runBacktest() {
     <div style="width:100%;max-width:520px;padding:24px;">
       <div style="font-size:15px;margin-bottom:14px;color:var(--text-primary);">${t('bt_running_title')}</div>
       <div id="bt-progress-msg" style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;font-family:monospace;">${t('bt_starting')}</div>
-      <div style="background:rgba(255,255,255,0.06);height:10px;border-radius:5px;overflow:hidden;">
-        <div id="bt-progress-bar" style="width:0%;height:100%;background:linear-gradient(90deg,#00d4ff,#7b2ff7);transition:width 0.3s;"></div>
+      <div style="background:rgba(0,0,0,0.04);height:10px;border-radius:5px;overflow:hidden;">
+        <div id="bt-progress-bar" style="width:0%;height:100%;background:linear-gradient(90deg,var(--accent-blue),var(--accent-purple));transition:width 0.3s;"></div>
       </div>
       <div id="bt-progress-pct" style="font-size:11px;color:var(--text-secondary);margin-top:8px;text-align:right;">0%</div>
     </div>
@@ -410,11 +410,11 @@ function renderEquityChart(data) {
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
     height: 400,
-    layout: { background: { type: 'solid', color: '#0a0a0f' }, textColor: 'rgba(255,255,255,0.5)', fontSize: 12 },
-    grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+    layout: { background: { type: 'solid', color: '#ffffff' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 12 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
     crosshair: { mode: 0 },
-    timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true },
-    rightPriceScale: { borderColor: 'rgba(255,255,255,0.1)' },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
   });
   btChart = chart;
 
@@ -551,7 +551,7 @@ function openAccountDetail(acct) {
           <div class="section-title">
             ${t('bt_trade_details')} (${trades.length})
             <input id="bt-trade-filter" placeholder="${t('bt_filter_ticker')}"
-              style="margin-left:12px;padding:3px 8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--text-primary);font-size:12px;width:140px;">
+              style="margin-left:12px;padding:3px 8px;background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.10);border-radius:4px;color:var(--text-primary);font-size:12px;width:140px;">
           </div>
           <div style="max-height:220px;overflow:auto;">
             <table class="data-table" id="bt-trades-table">
@@ -588,11 +588,11 @@ function openAccountDetail(acct) {
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
     height: 280,
-    layout: { background: { type: 'solid', color: '#0a0a0f' }, textColor: 'rgba(255,255,255,0.6)', fontSize: 11 },
-    grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+    layout: { background: { type: 'solid', color: '#ffffff' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
     crosshair: { mode: 0 },
-    timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true },
-    rightPriceScale: { borderColor: 'rgba(255,255,255,0.1)' },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
   });
   _acctDetailChart = chart;
 

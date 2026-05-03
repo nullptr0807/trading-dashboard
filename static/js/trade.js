@@ -307,11 +307,11 @@ function renderEquityCurves(data) {
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
     height: 420,
-    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(255,255,255,0.75)', fontSize: 12 },
-    grid: { vertLines: { color: 'rgba(255,255,255,0.03)' }, horzLines: { color: 'rgba(255,255,255,0.03)' } },
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 12 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
     crosshair: { mode: 0, vertLine: { color: 'rgba(255,255,255,0.1)', width: 1 }, horzLine: { color: 'rgba(255,255,255,0.1)', width: 1 } },
-    rightPriceScale: { borderColor: 'rgba(255,255,255,0.2)' },
-    timeScale: { borderColor: 'rgba(255,255,255,0.2)', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 10 },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 10 },
     handleScroll: true,
     handleScale: true,
   });
