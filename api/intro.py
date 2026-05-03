@@ -1,16 +1,26 @@
-"""Serve the repo README.md as raw markdown for the Intro tab."""
+"""Serve the repo README.md (zh) or README.en.md (en) for the Intro tab."""
 from pathlib import Path
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import PlainTextResponse
 
 router = APIRouter(prefix='/api/intro', tags=['intro'])
 
-_README = Path(__file__).resolve().parent.parent / 'README.md'
+_REPO = Path(__file__).resolve().parent.parent
+_README_ZH = _REPO / 'README.md'
+_README_EN = _REPO / 'README.en.md'
 
 
 @router.get('', response_class=PlainTextResponse)
-async def get_intro():
-    """Return README.md content as text/plain (frontend renders with marked.js)."""
-    if not _README.exists():
+async def get_intro(lang: str = Query('en')):
+    """Return README content (markdown) for the requested language.
+
+    `lang=zh` -> README.md (Chinese, primary).
+    `lang=en` -> README.en.md (English, falls back to zh if missing).
+    """
+    lang = (lang or 'en').lower()
+    target = _README_ZH if lang in ('zh', 'cn') else _README_EN
+    if not target.exists():
+        target = _README_ZH if _README_ZH.exists() else _README_EN
+    if not target.exists():
         return PlainTextResponse('# README missing', status_code=404)
-    return _README.read_text(encoding='utf-8')
+    return target.read_text(encoding='utf-8')

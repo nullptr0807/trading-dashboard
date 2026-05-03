@@ -31,6 +31,7 @@ data/
 *.log
 *.md
 !README.md
+!README.en.md
 
 # 配置文件
 *.yaml

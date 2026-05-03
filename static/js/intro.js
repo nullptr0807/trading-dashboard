@@ -1,4 +1,4 @@
-// intro.js — render README.md fetched from /api/intro
+// intro.js — render README.md fetched from /api/intro (bilingual via ?lang=)
 async function renderIntroPage() {
   const app = document.getElementById('app');
   app.innerHTML = `
@@ -11,7 +11,8 @@ async function renderIntroPage() {
     </section>
   `;
   try {
-    const res = await fetch('/api/intro');
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    const res = await fetch(`/api/intro?lang=${encodeURIComponent(lang)}`);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const md = await res.text();
     const body = document.getElementById('intro-body');
