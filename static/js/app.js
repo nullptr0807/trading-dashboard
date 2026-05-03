@@ -107,6 +107,7 @@ async function api(path) {
 const routes = {
   '/trade': renderTradePage,
   '/backtest': renderBacktestPage,
+  '/intro': renderIntroPage,
 };
 
 function navigate() {

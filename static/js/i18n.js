@@ -8,6 +8,9 @@ const I18N_DICT = {
     title_doc: 'Cyber Quant Arena',
     nav_trade: 'Trading Overview',
     nav_backtest: 'Backtest Analysis',
+    nav_intro: 'Intro',
+    intro_loading: 'Loading documentation…',
+    intro_error: 'Failed to load README',
     nav_live: 'Live',
     lang_label: 'Language',
 
@@ -200,6 +203,9 @@ const I18N_DICT = {
     title_doc: 'Cyber Quant Arena — 量化交易仪表盘',
     nav_trade: '交易总览',
     nav_backtest: '回测分析',
+    nav_intro: '介绍',
+    intro_loading: '正在加载文档…',
+    intro_error: '加载 README 失败',
     nav_live: '实时',
     lang_label: '语言',
 
