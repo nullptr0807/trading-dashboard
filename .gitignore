@@ -32,6 +32,8 @@ data/
 *.md
 !README.md
 !README.en.md
+!static/explore/**/*.md
+!static/explore/index.json
 
 # 配置文件
 *.yaml

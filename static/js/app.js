@@ -107,6 +107,7 @@ async function api(path) {
 const routes = {
   '/trade': renderTradePage,
   '/backtest': renderBacktestPage,
+  '/explore': renderExplorePage,
   '/intro': renderIntroPage,
 };
 
@@ -114,14 +115,22 @@ function navigate() {
   const hash = location.hash.replace('#', '') || '/trade';
   const app = document.getElementById('app');
 
+  // Detect explore post: #/explore/<slug>
+  const exploreMatch = hash.match(/^\/explore\/(.+)$/);
+  const navKey = exploreMatch ? '/explore' : hash;
+
   document.querySelectorAll('.nav-link').forEach(link => {
-    link.classList.toggle('active', link.getAttribute('href') === '#' + hash);
+    link.classList.toggle('active', link.getAttribute('href') === '#' + navKey);
   });
 
   app.classList.add('fade-out');
   setTimeout(() => {
     app.classList.remove('fade-out');
     app.classList.add('fade-in');
+    if (exploreMatch) {
+      renderExplorePost(decodeURIComponent(exploreMatch[1]));
+      return;
+    }
     const handler = routes[hash];
     if (handler) handler();
     else renderTradePage();

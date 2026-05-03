@@ -1,0 +1,14 @@
+[
+  {
+    "slug": "position-sizing-experiment",
+    "date": "2026-05-03",
+    "category": "Risk / Portfolio Construction",
+    "category_zh": "风险 / 组合构建",
+    "title_en": "Position Sizing: Industry Practice, A Controlled Experiment, and a Counter-Intuitive Result",
+    "title_zh": "仓位控制：业界做法、对照实验与反直觉的结论",
+    "summary_en": "We tested four sizing schemes (Equal-Weight, Inverse-Vol, Vol-Targeting, both combined) on the same 20-day momentum signal over 5 years. Both industry-favourite tools lost to plain equal-weight — and we explore why.",
+    "summary_zh": "用同一个 20 日动量信号、同一只股票池、同一时间窗，对比四种仓位方案（等权 / 1σ 加权 / Vol Targeting / 两者叠加）。结果业界两个常用工具都没跑赢简单等权——本文给出原因和对当前系统的真实建议。",
+    "tags": ["sizing", "risk", "experiment", "momentum"],
+    "image": "sizing_comparison.png"
+  }
+]
