@@ -361,11 +361,11 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
   const color = groupChar === 'A' ? '#00aaff' : (groupChar === 'B' ? '#b388ff' : (groupChar === 'Q' ? '#34d399' : '#ffb74d'));
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth, height: 220,
-    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(255,255,255,0.5)', fontSize: 11 },
-    grid: { vertLines: { color: 'rgba(255,255,255,0.03)' }, horzLines: { color: 'rgba(255,255,255,0.03)' } },
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
     crosshair: { mode: 0 },
-    timeScale: { borderColor: 'rgba(255,255,255,0.06)', timeVisible: true, secondsVisible: false },
-    rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
   });
   const series = chart.addAreaSeries({ lineColor: color, topColor: color + '55', bottomColor: color + '05', lineWidth: 2 });
 
@@ -690,10 +690,10 @@ function renderDrawerEquity(curve, accountId, benchmarks) {
   const color = isA ? '#00aaff' : '#b388ff';
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth, height: 300,
-    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(255,255,255,0.5)', fontSize: 11 },
-    grid: { vertLines: { color: 'rgba(255,255,255,0.03)' }, horzLines: { color: 'rgba(255,255,255,0.03)' } },
-    timeScale: { borderColor: 'rgba(255,255,255,0.06)', timeVisible: true, secondsVisible: false },
-    rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
   });
   const series = chart.addAreaSeries({
     lineColor: color, topColor: color + '55', bottomColor: color + '05', lineWidth: 2,
