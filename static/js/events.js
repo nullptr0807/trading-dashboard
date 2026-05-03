@@ -77,20 +77,15 @@ function eventRowHtml(ev, isNew) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
   const safeTitle = escape(ev.title);
-  // Detail line: parse as JSON if possible, surface .reason; for git commits show sha + body.
+  // Detail line: parse as JSON if possible, surface .reason; plain text → 2nd line.
   let detailLine = '';
   if (ev.detail) {
     try {
       const d = JSON.parse(ev.detail);
-      if (d && d.sha) {
-        // Git commit
-        const reason = d.reason ? ` — ${escape(String(d.reason).split('\n')[0]).slice(0,160)}` : '';
-        detailLine = `<span class="ev-detail">↳ <code>${escape(d.sha)}</code> · ${escape(d.author || '')}${reason}</span>`;
-      } else if (d && d.reason) {
+      if (d && d.reason) {
         detailLine = `<span class="ev-detail">↳ ${escape(d.reason)}</span>`;
       }
     } catch {
-      // Plain-text detail (e.g. risk regime banners) — show first line only
       const first = String(ev.detail).split('\n').slice(1, 2)[0] || '';
       if (first) detailLine = `<span class="ev-detail">↳ ${escape(first.slice(0,200))}</span>`;
     }

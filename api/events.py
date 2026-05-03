@@ -57,15 +57,8 @@ def _load_git_commits() -> list[dict]:
             continue
         sha, ts, author, subject = parts[0], parts[1], parts[2], parts[3]
         body = parts[4].strip() if len(parts) >= 5 else ''
-        # Build event-shaped dict. ID prefixed 'git_' so it never collides with
-        # numeric DB ids and the frontend Set<id> works the same way.
+        # Title only — no detail expanded into the stream (cleaner UI).
         title = f"🧬 {subject}"
-        detail = json.dumps({
-            'sha': sha[:7],
-            'sha_full': sha,
-            'author': author,
-            'reason': body if body else None,
-        }, ensure_ascii=False)
         commits.append({
             'id': f'git_{sha[:12]}',
             'ts': ts,
@@ -74,7 +67,7 @@ def _load_git_commits() -> list[dict]:
             'account': None,
             'ticker': None,
             'title': title,
-            'detail': detail,
+            'detail': None,
         })
     _git_cache['ts'] = now
     _git_cache['commits'] = commits
