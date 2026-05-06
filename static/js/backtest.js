@@ -5,7 +5,6 @@ async function renderBacktestPage() {
   app.innerHTML = `
     <div class="backtest-layout fade-in">
       <div class="config-panel glass-card">
-        <div id="bt-qlib-status"></div>
         <div class="section">
           <div class="section-title">${t('bt_account_selection')}</div>
           <div id="bt-accounts-loading" style="color:var(--text-secondary);font-size:13px;">${t('bt_loading')}</div>
@@ -29,7 +28,8 @@ async function renderBacktestPage() {
         <button class="btn btn-accent bt-run-btn" id="bt-run">${t('bt_run')}</button>
       </div>
       <div class="results-panel">
-        <div id="bt-results-placeholder" style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);font-size:15px;">
+        <div id="bt-qlib-status"></div>
+        <div id="bt-results-placeholder" style="display:flex;align-items:center;justify-content:center;min-height:240px;color:var(--text-secondary);font-size:15px;">
           ${t('bt_placeholder')}
         </div>
         <div id="bt-results" style="display:none;">
