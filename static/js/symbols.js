@@ -210,8 +210,8 @@
             <div class="num">${t('sym_acct_col_holding')}</div>
           </div>
           ${d.accounts.map(a => `
-            <div class="sym-arow sym-arow-body" data-account="${a.account}">
-              <div><a href="#/trade?focus=${a.account}" class="sym-acct-link">${a.account}</a><span class="sym-grp grp-${a.group||'X'}">${a.group||''}</span></div>
+            <div class="sym-arow sym-arow-body" data-account="${a.account}" data-trades='${encodeURIComponent(JSON.stringify(a.trades))}'>
+              <div><span class="sym-acct-toggle" aria-hidden="true">▸</span><a href="#/trade?focus=${a.account}" class="sym-acct-link" onclick="event.stopPropagation();">${a.account}</a><span class="sym-grp grp-${a.group||'X'}">${a.group||''}</span></div>
               <div class="sym-strat">${a.strategy_name || '—'}</div>
               <div class="num">${a.trade_count}</div>
               <div class="num ${a.realized_pnl>=0?'positive':'negative'}">${signed(cur, a.realized_pnl)}</div>
@@ -226,7 +226,122 @@
     `;
 
     host.innerHTML = hero + chartCard + acctCard;
+    bindAccountRowExpand(d.ticker);
     drawSymbolChart(d);
+  }
+
+  // Click an account row → expand FIFO trade-by-trade ledger inline.
+  function bindAccountRowExpand(ticker) {
+    document.querySelectorAll('.sym-arow-body').forEach(row => {
+      row.addEventListener('click', (ev) => {
+        // Don't expand if clicking the account link itself.
+        if (ev.target.closest('a')) return;
+        const acc = row.dataset.account;
+        const next = row.nextElementSibling;
+        if (next && next.classList.contains('sym-arow-detail')) {
+          next.remove();
+          row.classList.remove('expanded');
+          return;
+        }
+        let trades = [];
+        try { trades = JSON.parse(decodeURIComponent(row.dataset.trades || '[]')); }
+        catch (e) { trades = []; }
+        const det = document.createElement('div');
+        det.className = 'sym-arow-detail';
+        det.innerHTML = renderTradesLedger(trades, acc, ticker);
+        row.after(det);
+        row.classList.add('expanded');
+      });
+    });
+  }
+
+  // Render a per-trade ledger for one account on this ticker. FIFO walk so
+  // each SELL row shows its realized PnL (matched against earliest open lots).
+  function renderTradesLedger(trades, account, ticker) {
+    const cur = currencySymbol();
+    if (!trades || !trades.length) return '<div class="sym-ledger-empty">No trades.</div>';
+    // sort by time ascending
+    const tr = trades.slice().sort((a, b) =>
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    // FIFO state mirrors backend api/symbols.py
+    const lots = [];  // [{shares, price}]
+    let cumRealized = 0;
+    const rows = tr.map(t => {
+      const side = (t.side || '').toLowerCase();
+      const sh = Number(t.shares) || 0;
+      const px = Number(t.price) || 0;
+      const fee = Number(t.cost) || 0;
+      const notional = sh * px;
+      let rowPnl = null;
+      let matchedShares = 0;
+      let matchedCost = 0;
+      if (side === 'buy') {
+        lots.push({ shares: sh, price: px });
+        cumRealized -= fee;
+      } else if (side === 'sell') {
+        let remaining = sh;
+        while (remaining > 1e-9 && lots.length) {
+          const lot = lots[0];
+          const take = Math.min(lot.shares, remaining);
+          matchedCost += take * lot.price;
+          matchedShares += take;
+          rowPnl = (rowPnl || 0) + (px - lot.price) * take;
+          lot.shares -= take;
+          remaining -= take;
+          if (lot.shares <= 1e-9) lots.shift();
+        }
+        cumRealized += (rowPnl || 0);
+        cumRealized -= fee;
+      }
+      const remShares = lots.reduce((s, l) => s + l.shares, 0);
+      const remAvg = remShares > 1e-9
+        ? lots.reduce((s, l) => s + l.shares * l.price, 0) / remShares
+        : 0;
+      const ts = (t.timestamp || '').replace('T', ' ').slice(0, 19);
+      const sideCls = side === 'buy' ? 'positive' : 'negative';
+      const pnlCell = rowPnl != null
+        ? `<span class="${rowPnl >= 0 ? 'positive' : 'negative'}">${signed(cur, rowPnl)}</span>`
+        : '—';
+      const matchAvg = matchedShares > 1e-9 ? matchedCost / matchedShares : 0;
+      const matchInfo = side === 'sell' && matchedShares > 1e-9
+        ? `<span class="sym-ledger-match">vs avg ${cur}${matchAvg.toFixed(2)}</span>`
+        : '';
+      return `
+        <div class="sym-ledger-row">
+          <div class="sym-ledger-ts">${ts}</div>
+          <div class="sym-ledger-side ${sideCls}">${side.toUpperCase()}</div>
+          <div class="num">${sh}</div>
+          <div class="num">${cur}${px.toFixed(2)}</div>
+          <div class="num">${cur}${notional.toFixed(2)}</div>
+          <div class="num">${cur}${fee.toFixed(2)}</div>
+          <div class="num">${pnlCell} ${matchInfo}</div>
+          <div class="num sym-ledger-pos">${remShares > 0 ? remShares.toFixed(2) + ' @ ' + cur + remAvg.toFixed(2) : '—'}</div>
+        </div>
+      `;
+    }).join('');
+
+    return `
+      <div class="sym-ledger-card">
+        <div class="sym-ledger-head">
+          <span><b>${account}</b> · ${ticker} · ${tr.length} trades</span>
+          <span class="${cumRealized >= 0 ? 'positive' : 'negative'}">Realized ${signed(cur, cumRealized)}</span>
+        </div>
+        <div class="sym-ledger-table">
+          <div class="sym-ledger-row sym-ledger-head-row">
+            <div>Time</div>
+            <div>Side</div>
+            <div class="num">Shares</div>
+            <div class="num">Price</div>
+            <div class="num">Notional</div>
+            <div class="num">Fee</div>
+            <div class="num">Trade PnL</div>
+            <div class="num">Position After</div>
+          </div>
+          ${rows}
+        </div>
+      </div>
+    `;
   }
 
   function signed(cur, v) {
