@@ -84,6 +84,21 @@ async function renderExplorePost(slug) {
         (_, pre, src) => `<img ${pre}src="/static/explore/${encodeURIComponent(slug)}/${src}"`
       );
       body.innerHTML = html;
+      // Render LaTeX math ($...$, $$...$$, \(...\), \[...\]) via KaTeX auto-render
+      if (window.renderMathInElement) {
+        try {
+          renderMathInElement(body, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '\\[', right: '\\]', display: true },
+              { left: '$',  right: '$',  display: false },
+              { left: '\\(', right: '\\)', display: false },
+            ],
+            throwOnError: false,
+            ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+          });
+        } catch (err) { console.warn('KaTeX render failed:', err); }
+      }
     } else {
       body.innerHTML = '<pre>' + md.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>';
     }

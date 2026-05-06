@@ -1,5 +1,82 @@
 [
   {
+    "slug": "facing-no-alpha-qa",
+    "date": "2026-05-05",
+    "category": "Methodology / Concepts",
+    "category_zh": "方法论 / 概念",
+    "title_en": "After Four Attribution Articles All Said \"No Alpha\": An Honest Q&A",
+    "title_zh": "当四篇归因文章都说\"没有 alpha\"之后：一份诚实的问答",
+    "summary_en": "Four explore articles concluded A-group, B-group, composite methods, and position sizing all lack provable alpha. Now what? This piece answers the seven concept questions that define the feasibility boundary: what t-stat actually means (and why 2 years can never produce |t|>2 even with real alpha), why 5-minute resampling won't save you, the alpha-decay vs. long-backtest paradox, HFT vs. daily factors, what cross-market OOS can and cannot prove, how to judge a complex factor's economic intuition, and why FF3 and IC are different angles. Ends with a P0/P1/P2 improvement roadmap.",
+    "summary_zh": "四篇 explore 文章得出了 A 组、B 组、合成方法、仓位控制都没有可证 alpha 的结论。接下来怎么办？本文回答决定可行性边界的七个概念问题：t-stat 究竟是什么（为什么真有 alpha，2 年样本也不可能跑出 |t|>2）；为什么 5 分钟重采样救不了你；alpha decay 与长回测的悖论；HFT 与日频因子的本质差别；跨市场 OOS 能/不能证明什么；如何判断一个复杂因子的经济直觉；FF3 与 IC 为什么是两个不同角度。最后给出 P0/P1/P2 提升路线图。",
+    "tags": [
+      "methodology",
+      "t-statistic",
+      "alpha-decay",
+      "FF3",
+      "IC",
+      "concepts",
+      "Q&A"
+    ],
+    "image": "hero.png"
+  },
+  {
+    "slug": "gp-factor-attribution",
+    "date": "2026-05-04",
+    "category": "Performance Attribution",
+    "category_zh": "业绩归因",
+    "title_en": "Attribution on B-Group (GP-Mined Factors): Honest Conclusions from a 20-Hour Backtest",
+    "title_zh": "给 B 组（GP 算法挖出来的因子）做归因：20 小时回测换来的诚实结论",
+    "summary_en": "We replayed all 3 representative B-group personalities through 8 quarters of walk-forward GP retraining (2024Q3-2026Q2, US+CN). 24 regressions across 4 panels: again 0 significant alpha (max t=1.96). The real story: GP systematically learned an 'anti-small-cap + anti-momentum' style on CN data (t(SMB)=-3.4, t(MOM)=-3.5), and B-group's β is significantly negative across the board — making it a better portfolio diversifier than A-group despite both lacking proven alpha. Plus: a 20-hour cost-estimation lesson now sealed as a skill.",
+    "summary_zh": "通过 8 个季度的 walk-forward GP 重训（2024Q3-2026Q2，US+CN），把 3 种代表性的 B 组人格完整重放一次。4 矩阵 24 次回归，再次 0 个显著 alpha（最高 t=1.96）。真正的发现：GP 在 CN 数据上系统性地学到了'反小盘+反动量'风格（t(SMB)=-3.4, t(MOM)=-3.5），B 组 β 系统性为负——这让它比 A 组更适合做组合分散化，虽然两者都没显著 alpha。另：一次 20 小时的成本估算翻车教训已沉淀为 skill。",
+    "tags": [
+      "GP",
+      "gplearn",
+      "walk-forward",
+      "attribution",
+      "alpha",
+      "beta",
+      "experiment"
+    ],
+    "image": "scatter_CN_walkfwd.png"
+  },
+  {
+    "slug": "alpha-beta-attribution",
+    "date": "2026-05-04",
+    "category": "Performance Attribution",
+    "category_zh": "业绩归因",
+    "title_en": "α or β? An Honest Attribution of A-Group's 20 Paper Accounts",
+    "title_zh": "α 还是 β？给 A 组 20 个策略账户做一次诚实的归因",
+    "summary_en": "We replayed all 10 A-group strategies on 2 years of US and CN price data, then ran CAPM + Fama-French 3-factor attribution. 80 regressions across 4 panels (US/CN × 2y/YTD): zero accounts had statistically significant alpha (|t|>2). The flashy YTD returns are almost entirely small-cap style exposure (SMB β t-stat 2.0–2.8). Includes the math on why proving real alpha needs 5+ years.",
+    "summary_zh": "把 A 组 10 个策略在 2 年 US/CN 价格数据上重放，跑 CAPM + Fama-French 三因子归因。4 矩阵（US/CN × 2y/YTD）共 80 次回归，没有一个账户的 alpha 统计上显著（|t|>2）。看起来漂亮的 YTD 收益几乎完全是小盘风格暴露（SMB β 的 t-stat 2.0–2.8）。文章包含'为什么证明真 alpha 需要 5 年以上'的数学推导。",
+    "tags": [
+      "attribution",
+      "CAPM",
+      "fama-french",
+      "alpha",
+      "beta",
+      "experiment"
+    ],
+    "image": "scatter_US_YTD.png"
+  },
+  {
+    "slug": "factor-composite-normalization",
+    "date": "2026-05-04",
+    "category": "Alpha / Multi-Factor Combination",
+    "category_zh": "Alpha / 多因子合成",
+    "title_en": "Cross-Sectional Normalization in Multi-Factor Composites: A Bug, an Experiment, and an Honest Patch",
+    "title_zh": "多因子合成中的量纲陷阱：从 Bug 到对照实验，再到诚实的修补",
+    "summary_en": "A-group accounts averaged 30 factors with wildly different scales (RSI∈[0,100] vs BETA∈±1e-5), so RSI silently dominated the score. We compared three composites — current (V0), per-factor rank (V1), and industry-standard MAD+neutralize+ICIR (V2) — over 2 years and YTD. The truth: Alpha158 has nearly no real alpha on R1000; current returns are mostly style beta. We shipped the V1 hotfix and kept V2 as an honest alpha detector.",
+    "summary_zh": "A 组账户把 30 个量纲完全不同的因子（RSI∈[0,100] vs BETA∈±1e-5）直接算术平均，RSI 一个因子悄悄主导了 score。我们对比了三种合成方法——现状 V0、按因子截面 rank 的 V1、业界标准 MAD+中性化+ICIR 的 V2——在 2 年和 YTD 两个窗口下。真相：Alpha158 在 R1000 上几乎没真 alpha，当前业绩主要是风格 beta。我们上线了 V1 hotfix，把 V2 留作诚实的 alpha 检测器。",
+    "tags": [
+      "alpha158",
+      "multi-factor",
+      "experiment",
+      "neutralization",
+      "ICIR"
+    ],
+    "image": "equity_curves_ytd.png"
+  },
+  {
     "slug": "position-sizing-experiment",
     "date": "2026-05-03",
     "category": "Risk / Portfolio Construction",
@@ -8,7 +85,12 @@
     "title_zh": "仓位控制：业界做法、对照实验与反直觉的结论",
     "summary_en": "We tested four sizing schemes (Equal-Weight, Inverse-Vol, Vol-Targeting, both combined) on the same 20-day momentum signal over 5 years. Both industry-favourite tools lost to plain equal-weight — and we explore why.",
     "summary_zh": "用同一个 20 日动量信号、同一只股票池、同一时间窗，对比四种仓位方案（等权 / 1σ 加权 / Vol Targeting / 两者叠加）。结果业界两个常用工具都没跑赢简单等权——本文给出原因和对当前系统的真实建议。",
-    "tags": ["sizing", "risk", "experiment", "momentum"],
+    "tags": [
+      "sizing",
+      "risk",
+      "experiment",
+      "momentum"
+    ],
     "image": "sizing_comparison.png"
   }
 ]
