@@ -167,3 +167,62 @@ B11–B16 是**第二代**，用了更精细的进化目标（夏普比率最大
 
 但它**是**：一个真实的、长期运行的、多策略对照的、有完整数据留痕的、可复现的纸面交易实验场。每天的 PnL 都是真实市场行情驱动的。哪个策略今天赚了哪一笔、为什么买、为什么卖，全部可追溯。
 
+---
+
+## 8. 本地运行 / 部署
+
+> 这个仓库是**前端 dashboard**。它读取 [quant-trading](https://github.com/nullptr0807/quant-trading) 写出的 SQLite 数据库 (`trading.db`) 并通过 FastAPI 暴露给浏览器。
+
+### 技术栈
+
+- **后端**: Python 3.11+, FastAPI, uvicorn, SQLite (只读)
+- **前端**: 纯 vanilla JS（无框架、无构建步骤）+ KaTeX (公式渲染)
+- **数据源**: 通过 `core/price_cache.py` 适配器复用 `~/quant-trading/trading.db`（单一数据源）
+
+### 目录结构
+
+```
+trading-dashboard/
+├── server.py              # FastAPI 入口
+├── api/                   # 路由模块（trade, factors, backtest, events, explore, intro）
+├── core/                  # 业务逻辑（db 访问、回测引擎、因子公式渲染、universe）
+├── static/
+│   ├── index.html
+│   ├── css/style.css
+│   ├── js/                # 前端模块（app/trade/factors/backtest/events/explore/i18n）
+│   └── explore/           # 研究文章 markdown（中英双语）
+└── scripts/prefetch_all.py
+```
+
+### 安装与启动
+
+```bash
+git clone https://github.com/nullptr0807/trading-dashboard.git
+cd trading-dashboard
+python3 -m venv venv && source venv/bin/activate
+pip install fastapi uvicorn jinja2 python-multipart pandas numpy
+# 让 dashboard 知道 quant-trading 数据库在哪
+export QUANT_DB_PATH=$HOME/quant-trading/data/trading.db
+uvicorn server:app --host 0.0.0.0 --port 8501
+```
+
+打开 http://localhost:8501 。如果 `trading.db` 还没数据，先去 [quant-trading](https://github.com/nullptr0807/quant-trading) 跑一次 `python main.py --once`。
+
+### 生产部署（参考）
+
+仓库主作者在 Azure VM 上的部署：
+- **nginx** 反向代理 443（自签 SSL）→ uvicorn :8501
+- HTTP 80 自动 301 → HTTPS
+- 配置文件 `/etc/nginx/sites-available/trading-dashboard`
+
+### 开发说明
+
+- 前端**没有 build 步骤**，改完 `static/js/*.js` 直接刷新浏览器即可
+- 所有 API 路由都在 `api/`，遵循 `/api/<feature>/<action>` 命名
+- 中英文切换走 `static/js/i18n.js` —— 所有文案都有 `data-i18n` key
+- 添加新研究文章：在 `static/explore/<slug>/` 放 `article.zh.md` + `article.en.md` + 任意配图，再 append 到 `static/explore/index.json`
+
+### License
+
+MIT — 仅供学习研究。**这不是投资建议**。
+
