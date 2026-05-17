@@ -150,7 +150,22 @@ Common retirement reasons:
 3. **Drawdown breach** (max drawdown exceeded preset threshold) → risk-control trigger
 4. **Test accounts** (e.g. `C01 test strategy`) archived after research goal achieved
 
-## 6. Recommended reading paths (by role)
+## 6. The Symbols Tab
+
+The **Symbols** tab inverts the dashboard's perspective — instead of grouping by account, it aggregates every account's activity by ticker.
+
+**List view**: one row per traded ticker, showing # accounts, # trades, realized PnL, and last-trade date. All four numeric columns are click-to-sort, plus a search box for quick lookup.
+
+**Detail view** (click any ticker):
+
+- **Price chart with multi-account trade markers**: each account that traded the ticker gets its own color; buy/sell arrows mark every fill on the price line; hover reveals account, side, shares, price
+- **Company profile card** (right side): full name, GICS sector / industry, 2-3 sentence business summary, next earnings date, website. Auto-switches EN/ZH based on language toggle (Google Translate, disk-cached so repeat lookups are free)
+- **Similar companies**: same-GICS-industry peers from the Russell 1000 universe (e.g. NVDA → AMD, AVGO, MU, INTC, QCOM, ...) — click any chip to navigate
+- **Per-account PnL table**: each account's strategy, trade count, realized / unrealized / total PnL, return %, current holding. Click a row to expand a FIFO ledger showing per-trade PnL and running position
+
+Data sources: yfinance for profile + industry classification, the Russell 1000 universe for the peer pool.
+
+## 7. Recommended reading paths (by role)
 
 - **Total beginner** → click any A-class account, look at the factor cards — every factor has a formula + plain-English motivation
 - **Quant newcomer** → compare A (handwritten) / B (GP-mined) / Q (ML-learned) curves over time — which class wins long-term?
@@ -158,7 +173,7 @@ Common retirement reasons:
 - **Trader** → compare same-named strategies across markets (A01 vs CA01) to test cross-market portability
 - **Want to validate an idea** → use the Backtest Analysis tab: pick an account, set a time window, replay history
 
-## 7. What this system is NOT
+## 8. What this system is NOT
 
 - **Not** a real-money trading system. All execution is in-memory, simulated against historical/live prices.
 - **Not** high-frequency. The fastest cron tick is minute-level; factors run on daily/hourly bars.
