@@ -8,6 +8,7 @@ from api.backtest import router as backtest_router
 from api.events import router as events_router
 from api.intro import router as intro_router
 from api.explore import router as explore_router
+from api.frontier import router as frontier_router
 from api.symbols import router as symbols_router
 
 app = FastAPI(title='Trading Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
@@ -18,6 +19,7 @@ app.include_router(backtest_router)
 app.include_router(events_router)
 app.include_router(intro_router)
 app.include_router(explore_router)
+app.include_router(frontier_router)
 app.include_router(symbols_router)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 

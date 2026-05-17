@@ -9,7 +9,44 @@
 
 (function () {
   // Tiny debounced filter so big universes (1000+ tickers) stay smooth.
-  const _state = { rows: [], filter: '' };
+  const _state = { rows: [], filter: '', sortKey: 'last_trade_ts', sortDir: 'desc' };
+
+  const SORT_KEYS = {
+    accounts_count: 'num',
+    trade_count: 'num',
+    realized_pnl: 'num',
+    last_trade_ts: 'ts',
+  };
+
+  function sortRows(rows) {
+    const k = _state.sortKey;
+    const dir = _state.sortDir === 'asc' ? 1 : -1;
+    const kind = SORT_KEYS[k] || 'num';
+    return rows.slice().sort((a, b) => {
+      let av = a[k], bv = b[k];
+      if (kind === 'ts') {
+        av = av ? new Date(av).getTime() : 0;
+        bv = bv ? new Date(bv).getTime() : 0;
+      } else {
+        av = Number(av) || 0;
+        bv = Number(bv) || 0;
+      }
+      if (av < bv) return -1 * dir;
+      if (av > bv) return  1 * dir;
+      return 0;
+    });
+  }
+
+  function setSort(key) {
+    if (_state.sortKey === key) {
+      _state.sortDir = _state.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      _state.sortKey = key;
+      // sensible defaults: timestamps & pnl & counts → desc first
+      _state.sortDir = 'desc';
+    }
+    paintSymbolTable();
+  }
 
   async function renderSymbolsPage() {
     const app = document.getElementById('app');
@@ -66,7 +103,7 @@
     const host = document.getElementById('sym-table-host');
     const cnNames = (typeof _tickerNameCache !== 'undefined' && _tickerNameCache.CN) || {};
     const f = _state.filter;
-    const rows = _state.rows.filter(r => {
+    let rows = _state.rows.filter(r => {
       if (!f) return true;
       const tk = (r.ticker || '').toLowerCase();
       const nm = (r.ticker_name_cn || cnNames[r.ticker]?.cn || '').toLowerCase();
@@ -82,16 +119,22 @@
       return;
     }
 
+    rows = sortRows(rows);
+
     const cur = currencySymbol();
     const fmtTs = (s) => s ? s.slice(0, 10) : '—';
 
+    const arrow = (key) => {
+      if (_state.sortKey !== key) return '<span class="sym-sort-ind">↕</span>';
+      return `<span class="sym-sort-ind active">${_state.sortDir === 'asc' ? '↑' : '↓'}</span>`;
+    };
     const headerHtml = `
       <div class="sym-row sym-row-head">
         <div class="sym-cell-tk">${t('sym_col_ticker')}</div>
-        <div class="sym-cell-num">${t('sym_col_accounts')}</div>
-        <div class="sym-cell-num">${t('sym_col_trades')}</div>
-        <div class="sym-cell-num">${t('sym_col_realized')}</div>
-        <div class="sym-cell-num">${t('sym_col_last')}</div>
+        <div class="sym-cell-num sym-sortable" data-sort="accounts_count">${t('sym_col_accounts')} ${arrow('accounts_count')}</div>
+        <div class="sym-cell-num sym-sortable" data-sort="trade_count">${t('sym_col_trades')} ${arrow('trade_count')}</div>
+        <div class="sym-cell-num sym-sortable" data-sort="realized_pnl">${t('sym_col_realized')} ${arrow('realized_pnl')}</div>
+        <div class="sym-cell-num sym-sortable" data-sort="last_trade_ts">${t('sym_col_last')} ${arrow('last_trade_ts')}</div>
       </div>
     `;
     const bodyHtml = rows.map(r => {
@@ -115,6 +158,10 @@
     }).join('');
 
     host.innerHTML = `<div class="sym-table">${headerHtml}${bodyHtml}</div>`;
+
+    host.querySelectorAll('.sym-sortable').forEach(el => {
+      el.addEventListener('click', () => setSort(el.dataset.sort));
+    });
   }
 
   // ---------------------------------------------------------------- Detail

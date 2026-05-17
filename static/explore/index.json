@@ -1,5 +1,25 @@
 [
   {
+    "slug": "chaos-and-attribution-dialogue",
+    "date": "2026-05-06",
+    "category": "Methodology / Dialogue Log",
+    "category_zh": "方法论 / 对话实录",
+    "title_en": "From \"Can a Chaotic System Even Be Backtested?\" to \"All 10 Strategies Bankrupt over 4 Years\": A Full Dialogue Replay",
+    "title_zh": "从\"混沌系统能不能回测\"到\"4 年回测全军覆没\"：一次完整的来回拉扯",
+    "summary_en": "A complete replay of one conversation. Starts with a philosophical question (markets are chaotic — can backtests ever match live?), gets pushed back on (\"my accounts beat QQQ, why isn't that promising?\"), corrects two methodology mistakes (a CN-timezone-contaminated denominator and misapplied walk-forward), pushes through a 1-year backtest that prints +245% / sharpe 2.4 (red flag), then a fixed 4-year backtest where 10/10 strategies trail QQQ and 4 have statistically significant negative alpha. Then a follow-up: was the signal eaten by friction, or reversed at the source? IC + Long-Short + per-factor + cross-market (CN CSI300) experiments answer: A-group treats a reverse-effective ranking as a forward signal — it didn't fail to find alpha, it found anti-alpha. In CN, 15/32 Alpha158 factors have |IC t|>2, all negative. The takeaway: every key turn was user pushback refusing to let pretty numbers stand as conclusions — which is the actual craft of quant research.",
+    "summary_zh": "完整复盘一次对话：从哲学问题开始（股市是混沌系统，回测能不能对上实盘？），被反问（\"我账户跑赢 QQQ，为什么不算 promising？\"），纠正了两次方法论错误（CN 时区污染的分母 + 滥用的 walk-forward），推到 1 年回测跑出 +245% / sharpe 2.4（红色警报），再到修复版 4 年回测——10/10 跑输 QQQ，4 个 α 统计显著为负。再追问一步：是信号被摩擦磨掉了，还是信号本身就是反的？IC + Long-Short + 单因子拆解 + 跨市场（CN CSI300）四件套给出答案：A 组从一开始就把反向有效的 ranking 当正向信号用——不是没找到 alpha，是找到了反 alpha。在 CN，15/32 个 Alpha158 因子 |IC t|>2，全部为负。真正的洞见：每一次关键转折都是用户反问在拒绝把好看的数字当结论——这才是量化研究的真工艺。",
+    "tags": [
+      "methodology",
+      "chaos",
+      "attribution",
+      "CAPM",
+      "fama-french",
+      "walk-forward",
+      "dialogue"
+    ],
+    "image": "hero.png"
+  },
+  {
     "slug": "facing-no-alpha-qa",
     "date": "2026-05-05",
     "category": "Methodology / Concepts",
