@@ -282,6 +282,31 @@
     bindAccountRowExpand(d.ticker);
     drawSymbolChart(d);
     loadProfile(d.ticker);
+    loadPeers(d.ticker);
+  }
+
+  async function loadPeers(ticker) {
+    const host = document.querySelector('#sym-profile .sym-profile-body');
+    if (!host) return;
+    try {
+      const res = await fetch(`/api/symbols/${encodeURIComponent(ticker)}/peers?market=${state.market}&limit=18`);
+      const p = await res.json();
+      if (!p.peers || !p.peers.length) return;
+      const label = p.match === 'industry' ? (p.industry || '') : (p.sector || '');
+      const chips = p.peers.map(tk =>
+        `<a class="sym-peer-chip" href="#/symbols/${encodeURIComponent(tk)}">${escapeHtml(tk)}</a>`
+      ).join('');
+      const extra = p.total > p.peers.length ? `<span class="sym-peer-more">+${p.total - p.peers.length}</span>` : '';
+      const block = `
+        <div class="sym-peers">
+          <div class="sym-peers-head">
+            <span class="sym-peers-title">${t('sym_peers_title')}</span>
+            <span class="sym-peers-tag">${escapeHtml(label)}</span>
+          </div>
+          <div class="sym-peers-chips">${chips}${extra}</div>
+        </div>`;
+      host.insertAdjacentHTML('beforeend', block);
+    } catch (e) { /* silent */ }
   }
 
   async function loadProfile(ticker) {

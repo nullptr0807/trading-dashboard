@@ -33,6 +33,20 @@ try:
 except Exception:
     _TRANS = {}
 
+# Persistent ticker → {sector, industry} map for peer lookup.
+_INDUSTRY_FILE = _TRANS_DIR / 'industry_map.json'
+try:
+    _INDUSTRY_MAP: dict = json.loads(_INDUSTRY_FILE.read_text()) if _INDUSTRY_FILE.exists() else {}
+except Exception:
+    _INDUSTRY_MAP = {}
+
+
+def _save_industry():
+    try:
+        _INDUSTRY_FILE.write_text(json.dumps(_INDUSTRY_MAP, ensure_ascii=False))
+    except Exception:
+        pass
+
 
 def _save_trans():
     try:
@@ -86,6 +100,10 @@ def _yf_profile(ticker: str) -> dict:
         out['sector'] = info.get('sector')
         out['industry'] = info.get('industry')
         out['website'] = info.get('website')
+        # Populate persistent industry map for peer lookup.
+        if out['sector'] or out['industry']:
+            _INDUSTRY_MAP[ticker] = {'sector': out['sector'], 'industry': out['industry']}
+            _save_industry()
         try:
             cal = tk.calendar
             if isinstance(cal, dict):
@@ -118,6 +136,46 @@ def _yf_profile(ticker: str) -> dict:
         out['error'] = str(e)
     _PROFILE_CACHE[ticker] = (time.time(), out)
     return out
+
+
+@router.get('/{ticker}/peers')
+async def symbol_peers(ticker: str, market: str = Query('US'), limit: int = 20):
+    """Return same-industry (fallback: same-sector) tickers from the universe.
+    Reads the persistent industry_map.json populated as profiles are viewed
+    or by scripts/warm_industry_map.py.
+    """
+    _validate_market(market)
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]+', ticker):
+        raise HTTPException(400, 'invalid ticker')
+    # Ensure self is mapped — triggers a yfinance lookup on first hit.
+    if ticker not in _INDUSTRY_MAP:
+        _yf_profile(ticker)
+    me = _INDUSTRY_MAP.get(ticker) or {}
+    industry = me.get('industry')
+    sector = me.get('sector')
+    if not industry and not sector:
+        return {'ticker': ticker, 'industry': None, 'sector': None,
+                'peers': [], 'coverage': len(_INDUSTRY_MAP)}
+    same_ind, same_sec = [], []
+    for tk, meta in _INDUSTRY_MAP.items():
+        if tk == ticker:
+            continue
+        if industry and meta.get('industry') == industry:
+            same_ind.append(tk)
+        elif sector and meta.get('sector') == sector:
+            same_sec.append(tk)
+    peers_src = same_ind if same_ind else same_sec
+    match_kind = 'industry' if same_ind else 'sector'
+    peers_src.sort()
+    return {
+        'ticker': ticker,
+        'industry': industry,
+        'sector': sector,
+        'match': match_kind,
+        'peers': peers_src[:limit],
+        'total': len(peers_src),
+        'coverage': len(_INDUSTRY_MAP),
+    }
 
 
 @router.get('/{ticker}/profile')
