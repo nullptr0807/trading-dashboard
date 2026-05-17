@@ -290,13 +290,19 @@
     try {
       const res = await fetch(`/api/symbols/${encodeURIComponent(ticker)}/profile?market=${state.market}`);
       const p = await res.json();
+      const lang = (typeof getLang === 'function') ? getLang() : 'en';
+      const pick = (zh, en) => (lang === 'zh' ? (zh || en) : en);
+      const name = pick(p.name_zh, p.name);
+      const summary = pick(p.summary_zh, p.summary);
+      const sector = pick(p.sector_zh, p.sector);
+      const industry = pick(p.industry_zh, p.industry);
       const parts = [];
-      if (p.name) parts.push(`<div class="sym-prof-name">${escapeHtml(p.name)}</div>`);
+      if (name) parts.push(`<div class="sym-prof-name">${escapeHtml(name)}</div>`);
       const meta = [];
-      if (p.sector) meta.push(escapeHtml(p.sector));
-      if (p.industry) meta.push(escapeHtml(p.industry));
+      if (sector) meta.push(escapeHtml(sector));
+      if (industry) meta.push(escapeHtml(industry));
       if (meta.length) parts.push(`<div class="sym-prof-meta">${meta.join(' · ')}</div>`);
-      if (p.summary) parts.push(`<p class="sym-prof-summary">${escapeHtml(p.summary)}</p>`);
+      if (summary) parts.push(`<p class="sym-prof-summary">${escapeHtml(summary)}</p>`);
       const earn = p.next_earnings ? String(p.next_earnings).slice(0, 10) : null;
       parts.push(`<div class="sym-prof-earn"><span class="sym-prof-label">${t('sym_profile_next_earnings')}</span> <span class="sym-prof-val">${earn || '—'}</span></div>`);
       if (p.website) parts.push(`<div class="sym-prof-link"><a href="${escapeAttr(p.website)}" target="_blank" rel="noopener">${escapeHtml(p.website.replace(/^https?:\/\//,''))}</a></div>`);

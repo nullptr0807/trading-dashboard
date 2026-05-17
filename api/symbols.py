@@ -7,8 +7,10 @@ buy/sell points on a single chart.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 from fastapi import APIRouter, HTTPException, Query
 
@@ -19,19 +21,55 @@ router = APIRouter(prefix='/api/symbols', tags=['symbols'])
 
 
 # ----------------------------- profile cache --------------------------------
-# yfinance hits the network and is slow + rate-limited. Cache per-ticker for
-# 12h in-process. Profile is "rarely changes" data (name/summary/earnings).
 _PROFILE_CACHE: dict[str, tuple[float, dict]] = {}
 _PROFILE_TTL = 12 * 3600
+
+# Persistent translation cache so we don't re-hit Google Translate.
+_TRANS_DIR = Path('/home/gexin/trading-dashboard/data/translations')
+_TRANS_DIR.mkdir(parents=True, exist_ok=True)
+_TRANS_FILE = _TRANS_DIR / 'symbol_zh.json'
+try:
+    _TRANS: dict = json.loads(_TRANS_FILE.read_text()) if _TRANS_FILE.exists() else {}
+except Exception:
+    _TRANS = {}
+
+
+def _save_trans():
+    try:
+        _TRANS_FILE.write_text(json.dumps(_TRANS, ensure_ascii=False, indent=0))
+    except Exception:
+        pass
+
+
+def _translate_zh(text: str) -> str | None:
+    """Translate English → Simplified Chinese via free Google Translate.
+    Returns None on failure (caller falls back to English).
+    """
+    if not text:
+        return None
+    key = text.strip()
+    if key in _TRANS:
+        return _TRANS[key]
+    try:
+        from deep_translator import GoogleTranslator
+        zh = GoogleTranslator(source='en', target='zh-CN').translate(key)
+        if zh:
+            _TRANS[key] = zh
+            _save_trans()
+        return zh
+    except Exception:
+        return None
 
 
 def _yf_profile(ticker: str) -> dict:
     cached = _PROFILE_CACHE.get(ticker)
     if cached and (time.time() - cached[0]) < _PROFILE_TTL:
         return cached[1]
-    out: dict = {'ticker': ticker, 'name': None, 'summary': None,
-                 'sector': None, 'industry': None, 'website': None,
-                 'next_earnings': None, 'source': None}
+    out: dict = {'ticker': ticker, 'name': None, 'name_zh': None,
+                 'summary': None, 'summary_zh': None,
+                 'sector': None, 'sector_zh': None,
+                 'industry': None, 'industry_zh': None,
+                 'website': None, 'next_earnings': None, 'source': None}
     try:
         import yfinance as yf
         tk = yf.Ticker(ticker)
@@ -43,13 +81,11 @@ def _yf_profile(ticker: str) -> dict:
         out['name'] = info.get('longName') or info.get('shortName')
         summary = info.get('longBusinessSummary') or ''
         if summary:
-            # Keep first 2–3 sentences.
             parts = re.split(r'(?<=[.!?])\s+', summary.strip())
             out['summary'] = ' '.join(parts[:3]).strip()
         out['sector'] = info.get('sector')
         out['industry'] = info.get('industry')
         out['website'] = info.get('website')
-        # Next earnings — try calendar first, then info fields.
         try:
             cal = tk.calendar
             if isinstance(cal, dict):
@@ -68,6 +104,15 @@ def _yf_profile(ticker: str) -> dict:
                     out['next_earnings'] = _dt.datetime.utcfromtimestamp(int(ts)).strftime('%Y-%m-%d')
                 except Exception:
                     pass
+        # Chinese translations (cached on disk)
+        if out['name']:
+            out['name_zh'] = _translate_zh(out['name'])
+        if out['summary']:
+            out['summary_zh'] = _translate_zh(out['summary'])
+        if out['sector']:
+            out['sector_zh'] = _translate_zh(out['sector'])
+        if out['industry']:
+            out['industry_zh'] = _translate_zh(out['industry'])
         out['source'] = 'yfinance'
     except Exception as e:
         out['error'] = str(e)
