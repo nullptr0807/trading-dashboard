@@ -1746,7 +1746,7 @@ body::after {
 
 /* Symbol detail — chart + profile side-by-side */
 .sym-chart-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; margin-bottom: 16px; }
-.sym-chart-col, .sym-profile-col { margin: 0; }
+.sym-chart-col, .sym-profile-col { margin: 0; padding: 24px 26px; }
 .sym-profile-body { padding-top: 4px; }
 .sym-prof-name { font-size: 16px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
 .sym-prof-meta { font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
