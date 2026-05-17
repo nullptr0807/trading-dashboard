@@ -1743,3 +1743,18 @@ body::after {
 .sym-sortable:hover { color: var(--accent-blue); }
 .sym-sort-ind { display: inline-block; margin-left: 4px; font-size: 10px; color: var(--text-tertiary); }
 .sym-sort-ind.active { color: var(--accent-blue); font-weight: 600; }
+
+/* Symbol detail — chart + profile side-by-side */
+.sym-chart-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; margin-bottom: 16px; }
+.sym-chart-col, .sym-profile-col { margin: 0; }
+.sym-profile-body { padding-top: 4px; }
+.sym-prof-name { font-size: 16px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+.sym-prof-meta { font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
+.sym-prof-summary { font-size: 13px; line-height: 1.55; color: var(--text-primary); margin: 0 0 14px 0; }
+.sym-prof-earn { font-size: 13px; padding: 8px 10px; background: rgba(0,113,227,0.06); border-radius: 6px; margin-bottom: 10px; }
+.sym-prof-label { color: var(--text-secondary); margin-right: 6px; }
+.sym-prof-val { color: var(--accent-blue); font-weight: 600; }
+.sym-prof-link { font-size: 12px; }
+.sym-prof-link a { color: var(--accent-blue); text-decoration: none; }
+.sym-prof-link a:hover { text-decoration: underline; }
+@media (max-width: 900px) { .sym-chart-grid { grid-template-columns: 1fr; } }

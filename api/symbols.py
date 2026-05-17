@@ -7,6 +7,8 @@ buy/sell points on a single chart.
 """
 from __future__ import annotations
 
+import re
+import time
 from collections import defaultdict, deque
 from fastapi import APIRouter, HTTPException, Query
 
@@ -14,6 +16,71 @@ from core.db import fetch_all, fetch_one
 from api.trade import _cn_ticker_names, _validate_market
 
 router = APIRouter(prefix='/api/symbols', tags=['symbols'])
+
+
+# ----------------------------- profile cache --------------------------------
+# yfinance hits the network and is slow + rate-limited. Cache per-ticker for
+# 12h in-process. Profile is "rarely changes" data (name/summary/earnings).
+_PROFILE_CACHE: dict[str, tuple[float, dict]] = {}
+_PROFILE_TTL = 12 * 3600
+
+
+def _yf_profile(ticker: str) -> dict:
+    cached = _PROFILE_CACHE.get(ticker)
+    if cached and (time.time() - cached[0]) < _PROFILE_TTL:
+        return cached[1]
+    out: dict = {'ticker': ticker, 'name': None, 'summary': None,
+                 'sector': None, 'industry': None, 'website': None,
+                 'next_earnings': None, 'source': None}
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(ticker)
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        out['name'] = info.get('longName') or info.get('shortName')
+        summary = info.get('longBusinessSummary') or ''
+        if summary:
+            # Keep first 2–3 sentences.
+            parts = re.split(r'(?<=[.!?])\s+', summary.strip())
+            out['summary'] = ' '.join(parts[:3]).strip()
+        out['sector'] = info.get('sector')
+        out['industry'] = info.get('industry')
+        out['website'] = info.get('website')
+        # Next earnings — try calendar first, then info fields.
+        try:
+            cal = tk.calendar
+            if isinstance(cal, dict):
+                ed = cal.get('Earnings Date')
+                if isinstance(ed, list) and ed:
+                    out['next_earnings'] = str(ed[0])
+                elif ed:
+                    out['next_earnings'] = str(ed)
+        except Exception:
+            pass
+        if not out['next_earnings']:
+            ts = info.get('earningsTimestamp') or info.get('earningsTimestampStart')
+            if ts:
+                import datetime as _dt
+                try:
+                    out['next_earnings'] = _dt.datetime.utcfromtimestamp(int(ts)).strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+        out['source'] = 'yfinance'
+    except Exception as e:
+        out['error'] = str(e)
+    _PROFILE_CACHE[ticker] = (time.time(), out)
+    return out
+
+
+@router.get('/{ticker}/profile')
+async def symbol_profile(ticker: str, market: str = Query('US')):
+    _validate_market(market)
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]+', ticker):
+        raise HTTPException(400, 'invalid ticker')
+    return _yf_profile(ticker)
 
 
 def _fifo_realized(trades: list[dict]) -> tuple[float, float, float]:

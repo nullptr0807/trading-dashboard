@@ -235,10 +235,16 @@
     `;
 
     const chartCard = `
-      <div class="glass-card section">
-        <div class="section-title-row"><div class="section-title">${t('sym_chart_title')}</div></div>
-        <div id="sym-chart" style="height:360px;position:relative;"></div>
-        <div id="sym-chart-legend" class="sym-chart-legend"></div>
+      <div class="sym-chart-grid">
+        <div class="glass-card section sym-chart-col">
+          <div class="section-title-row"><div class="section-title">${t('sym_chart_title')}</div></div>
+          <div id="sym-chart" style="height:360px;position:relative;"></div>
+          <div id="sym-chart-legend" class="sym-chart-legend"></div>
+        </div>
+        <div class="glass-card section sym-profile-col" id="sym-profile">
+          <div class="section-title-row"><div class="section-title">${t('sym_profile_title')}</div></div>
+          <div class="sym-profile-body"><p style="color:var(--text-secondary);">${t('sym_loading')}</p></div>
+        </div>
       </div>
     `;
 
@@ -275,7 +281,36 @@
     host.innerHTML = hero + chartCard + acctCard;
     bindAccountRowExpand(d.ticker);
     drawSymbolChart(d);
+    loadProfile(d.ticker);
   }
+
+  async function loadProfile(ticker) {
+    const host = document.querySelector('#sym-profile .sym-profile-body');
+    if (!host) return;
+    try {
+      const res = await fetch(`/api/symbols/${encodeURIComponent(ticker)}/profile?market=${state.market}`);
+      const p = await res.json();
+      const parts = [];
+      if (p.name) parts.push(`<div class="sym-prof-name">${escapeHtml(p.name)}</div>`);
+      const meta = [];
+      if (p.sector) meta.push(escapeHtml(p.sector));
+      if (p.industry) meta.push(escapeHtml(p.industry));
+      if (meta.length) parts.push(`<div class="sym-prof-meta">${meta.join(' · ')}</div>`);
+      if (p.summary) parts.push(`<p class="sym-prof-summary">${escapeHtml(p.summary)}</p>`);
+      const earn = p.next_earnings ? String(p.next_earnings).slice(0, 10) : null;
+      parts.push(`<div class="sym-prof-earn"><span class="sym-prof-label">${t('sym_profile_next_earnings')}</span> <span class="sym-prof-val">${earn || '—'}</span></div>`);
+      if (p.website) parts.push(`<div class="sym-prof-link"><a href="${escapeAttr(p.website)}" target="_blank" rel="noopener">${escapeHtml(p.website.replace(/^https?:\/\//,''))}</a></div>`);
+      if (!parts.length) parts.push(`<p style="color:var(--text-secondary);">${t('sym_profile_unavailable')}</p>`);
+      host.innerHTML = parts.join('');
+    } catch (e) {
+      host.innerHTML = `<p style="color:var(--text-secondary);">${t('sym_profile_unavailable')}</p>`;
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
 
   // Click an account row → expand FIFO trade-by-trade ledger inline.
   function bindAccountRowExpand(ticker) {
