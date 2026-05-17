@@ -1758,3 +1758,15 @@ body::after {
 .sym-prof-link a { color: var(--accent-blue); text-decoration: none; }
 .sym-prof-link a:hover { text-decoration: underline; }
 @media (max-width: 900px) { .sym-chart-grid { grid-template-columns: 1fr; } }
+
+/* Symbol detail — peer companies */
+.sym-peers { margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(0,0,0,0.08); }
+.sym-peers-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.sym-peers-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.sym-peers-tag { font-size: 11px; color: var(--text-secondary); }
+.sym-peers-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.sym-peer-chip { display: inline-block; padding: 4px 10px; font-size: 12px; font-weight: 500;
+  background: rgba(0,113,227,0.08); color: var(--accent-blue); border-radius: 999px;
+  text-decoration: none; transition: all 0.15s; }
+.sym-peer-chip:hover { background: rgba(0,113,227,0.18); transform: translateY(-1px); }
+.sym-peer-more { font-size: 11px; color: var(--text-tertiary); align-self: center; margin-left: 4px; }
