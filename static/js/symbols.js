@@ -281,8 +281,10 @@
     host.innerHTML = hero + chartCard + acctCard;
     bindAccountRowExpand(d.ticker);
     drawSymbolChart(d);
-    loadProfile(d.ticker);
-    loadPeers(d.ticker);
+    (async () => {
+      await loadProfile(d.ticker);
+      loadPeers(d.ticker);
+    })();
   }
 
   async function loadPeers(ticker) {
