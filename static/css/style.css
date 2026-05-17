@@ -1737,3 +1737,9 @@ body::after {
   .sym-ledger-row { grid-template-columns: 1.5fr 0.6fr 0.7fr 1fr 1fr; font-size: 11px; }
   .sym-ledger-row > div:nth-child(n+6) { display: none; }
 }
+
+/* Symbols list — sortable column headers */
+.sym-sortable { cursor: pointer; user-select: none; transition: color 0.15s; }
+.sym-sortable:hover { color: var(--accent-blue); }
+.sym-sort-ind { display: inline-block; margin-left: 4px; font-size: 10px; color: var(--text-tertiary); }
+.sym-sort-ind.active { color: var(--accent-blue); font-weight: 600; }

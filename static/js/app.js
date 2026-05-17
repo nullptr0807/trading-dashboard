@@ -108,6 +108,7 @@ const routes = {
   '/trade': renderTradePage,
   '/backtest': renderBacktestPage,
   '/explore': renderExplorePage,
+  '/frontier': renderFrontierPage,
   '/symbols': renderSymbolsPage,
   '/intro': renderIntroPage,
 };
@@ -118,9 +119,13 @@ function navigate() {
 
   // Detect explore post: #/explore/<slug>
   const exploreMatch = hash.match(/^\/explore\/(.+)$/);
+  // Detect frontier paper: #/frontier/<arxiv_id>
+  const frontierMatch = hash.match(/^\/frontier\/(.+)$/);
   // Detect symbol detail: #/symbols/<ticker>
   const symbolMatch = hash.match(/^\/symbols\/(.+)$/);
-  const navKey = exploreMatch ? '/explore' : (symbolMatch ? '/symbols' : hash);
+  const navKey = exploreMatch ? '/explore'
+    : (frontierMatch ? '/frontier'
+    : (symbolMatch ? '/symbols' : hash));
 
   document.querySelectorAll('.nav-link').forEach(link => {
     link.classList.toggle('active', link.getAttribute('href') === '#' + navKey);
@@ -132,6 +137,10 @@ function navigate() {
     app.classList.add('fade-in');
     if (exploreMatch) {
       renderExplorePost(decodeURIComponent(exploreMatch[1]));
+      return;
+    }
+    if (frontierMatch) {
+      renderFrontierPost(decodeURIComponent(frontierMatch[1]));
       return;
     }
     if (symbolMatch) {
