@@ -759,7 +759,7 @@ body::after {
 .events-card::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.18); border-radius: 4px; }
 .events-card::-webkit-scrollbar-track { background: transparent; }
 
-.events-list { display: flex; flex-direction: column; }
+.events-list { display: flex; flex-direction: column; padding-bottom: 4px; }
 .events-empty {
   padding: 24px; text-align: center;
   color: var(--text-tertiary); font-size: 13px;

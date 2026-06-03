@@ -85,10 +85,12 @@
     }
 
     _state.rows = data.symbols || [];
-    _state.filter = '';
+    // Preserve search filter across market switches (and any re-render of this
+    // route). The user explicitly typed it; clearing silently is surprising.
     paintSymbolTable();
 
     const input = document.getElementById('sym-search');
+    if (_state.filter) input.value = _state.filter;
     let debTimer = null;
     input.addEventListener('input', () => {
       clearTimeout(debTimer);
