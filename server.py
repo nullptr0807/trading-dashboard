@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from api.trade import router as trade_router
 from api.factors import router as factors_router
+from api.factor_ai import router as factor_ai_router
 from api.backtest import router as backtest_router
 from api.events import router as events_router
 from api.intro import router as intro_router
@@ -15,6 +16,7 @@ app = FastAPI(title='Trading Dashboard', docs_url=None, redoc_url=None, openapi_
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 app.include_router(trade_router)
 app.include_router(factors_router)
+app.include_router(factor_ai_router)
 app.include_router(backtest_router)
 app.include_router(events_router)
 app.include_router(intro_router)

@@ -1771,3 +1771,73 @@ body::after {
   text-decoration: none; transition: all 0.15s; }
 .sym-peer-chip:hover { background: rgba(0,113,227,0.18); transform: translateY(-1px); }
 .sym-peer-more { font-size: 11px; color: var(--text-tertiary); align-self: center; margin-left: 4px; }
+
+/* ============================================================
+   AI Factor Interpretation block (LLM subagent, 2h cache)
+   ============================================================ */
+.factor-ai-block {
+  margin-top: 18px;
+  padding: 14px 16px 16px;
+  background: linear-gradient(135deg, rgba(99,102,241,0.06), rgba(168,85,247,0.04));
+  border: 1px solid rgba(99,102,241,0.18);
+  border-radius: 10px;
+  position: relative;
+}
+.factor-ai-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 12px;
+}
+.factor-ai-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: #6366f1;
+}
+.factor-ai-meta {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.factor-ai-status {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+.factor-ai-refresh {
+  background: rgba(99,102,241,0.12);
+  color: #6366f1;
+  border: 1px solid rgba(99,102,241,0.22);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 7px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.factor-ai-refresh:hover { background: rgba(99,102,241,0.22); }
+.factor-ai-skeleton { display: flex; flex-direction: column; gap: 8px; }
+.factor-ai-md { font-size: 13.5px; line-height: 1.65; color: var(--text-primary); }
+.factor-ai-md h2 {
+  font-size: 14px; font-weight: 600; margin: 18px 0 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(99,102,241,0.15);
+  color: #6366f1;
+}
+.factor-ai-md h2:first-child { margin-top: 0; }
+.factor-ai-md h3 { font-size: 13px; font-weight: 600; margin: 12px 0 6px; }
+.factor-ai-md p { margin: 6px 0; }
+.factor-ai-md ul, .factor-ai-md ol { margin: 6px 0; padding-left: 22px; }
+.factor-ai-md li { margin: 3px 0; }
+.factor-ai-md code {
+  background: rgba(99,102,241,0.10);
+  padding: 1px 5px; border-radius: 4px;
+  font-size: 12.5px;
+}
+.factor-ai-md strong { color: var(--text-primary); }
+.factor-ai-md blockquote {
+  border-left: 3px solid rgba(99,102,241,0.4);
+  margin: 8px 0; padding: 4px 12px;
+  color: var(--text-secondary);
+  background: rgba(99,102,241,0.04);
+  border-radius: 0 6px 6px 0;
+}

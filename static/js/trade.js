@@ -688,6 +688,8 @@ function renderTombstoneModal(body, accountId, accData, factors) {
     } else {
       renderFactors(factorsContainer, factors.factors || [], factors.composite);
     }
+    factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
+    loadFactorAi(accountId, accData, factors);
   }
 }
 

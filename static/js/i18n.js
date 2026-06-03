@@ -152,6 +152,29 @@ const I18N_DICT = {
     bt_error_prefix: 'Error:',
     bt_generic_fail: 'Backtest failed',
 
+    // Backtest — Qlib status banner (Q-group disabled / checkpoint accumulation)
+    bt_qst_pill: 'Q-group backtest not yet enabled',
+    bt_qst_coverage: 'Checkpoint coverage',
+    bt_qst_models: 'models',
+    bt_qst_earliest: 'Earliest replay date',
+    bt_qst_disk: 'Disk',
+    bt_qst_intro: 'Qlib model backtests carry look-ahead risk. Retraining on historical data is currently disallowed — we are resolving this with a frozen daily-checkpoint scheme.',
+    bt_qst_leakage: 'Leakage vectors',
+    bt_qst_plan: 'Solution',
+    bt_qst_size_per_day: 'Per-day size',
+    bt_qst_yearly: 'Yearly storage',
+    bt_qst_todo: 'TODO / Done',
+    bt_qst_coverage_table: 'Per-model checkpoint coverage',
+    bt_qst_model: 'Model',
+    bt_qst_range: 'Date range',
+    bt_qst_count: 'Days',
+    bt_qst_size: 'Size',
+    bt_qst_no_data: 'Checkpoint accumulation has not started yet. The daily 23:00 UTC cron will write the first entry after its next training run.',
+    bt_qst_data_growing: 'Accumulated {nWith}/{nTotal} models; new checkpoints append daily at 23:00 UTC.',
+    bt_qst_done: 'Shipped',
+    bt_qlib_blocked_badge: 'CHECKPOINT ACCUMULATING',
+    bt_qlib_block_tooltip: 'Qlib model backtests are not yet supported. See the explanation above.',
+
     // Backtest table headers
     th_account: 'Account',
     th_strategy: 'Strategy',
@@ -219,9 +242,18 @@ const I18N_DICT = {
     factor_trade_motivation: '💡 Trading Motivation',
     factor_no_data: 'No factor data',
 
+    // AI factor interpretation
+    factor_ai_title: '🤖 AI Interpretation · LLM Subagent',
+    factor_ai_loading: 'Generating…',
+    factor_ai_fresh: 'fresh · cached {ttl}',
+    factor_ai_cached: 'cached · expires in {ttl}',
+    factor_ai_error: 'AI generation failed',
+    factor_ai_failed: 'failed',
+    factor_ai_refresh: 'Regenerate',
+
     // Detail sections
     detail_equity: 'Equity Curve',
-    detail_factors: 'Strategy Factors · Math & Physics',
+    detail_factors: 'Strategy Factors · Formulas',
     detail_positions: 'Current Positions',
     detail_recent_trades: 'Recent Trades',
     no_positions: 'No positions',
@@ -379,6 +411,29 @@ const I18N_DICT = {
     bt_error_prefix: '错误:',
     bt_generic_fail: '回测失败',
 
+    // Backtest — Qlib status banner (Q 组未启用 / Checkpoint 累积)
+    bt_qst_pill: 'Q 组回测暂未启用',
+    bt_qst_coverage: 'Checkpoint 覆盖',
+    bt_qst_models: '模型',
+    bt_qst_earliest: '可回放起点',
+    bt_qst_disk: '磁盘',
+    bt_qst_intro: 'Qlib 模型回测涉及前瞻偏差风险。当前不允许在历史数据上 retrain — 我们正在用 frozen daily checkpoint 方案解决。',
+    bt_qst_leakage: '风险向量',
+    bt_qst_plan: '解决方案',
+    bt_qst_size_per_day: '单日大小',
+    bt_qst_yearly: '年存储',
+    bt_qst_todo: 'TODO / 已完成',
+    bt_qst_coverage_table: '每模型 Checkpoint 覆盖',
+    bt_qst_model: '模型',
+    bt_qst_range: '日期范围',
+    bt_qst_count: '天数',
+    bt_qst_size: '大小',
+    bt_qst_no_data: 'Checkpoint 累积尚未开始。每日 23:00 UTC cron 训练后会自动写入；首条数据将在下次 cron 运行后出现。',
+    bt_qst_data_growing: '已积累 {nWith}/{nTotal} 个模型，每日 23:00 UTC 自动追加。',
+    bt_qst_done: '已上线',
+    bt_qlib_blocked_badge: 'CHECKPOINT 累积中',
+    bt_qlib_block_tooltip: 'Qlib 模型回测暂未支持，详见上方说明',
+
     th_account: '账户',
     th_strategy: '策略',
     th_total_return: '总收益',
@@ -441,8 +496,17 @@ const I18N_DICT = {
     factor_trade_motivation: '💡 交易动机',
     factor_no_data: '暂无因子数据',
 
+    // AI factor interpretation
+    factor_ai_title: '🤖 AI 解读 · LLM Subagent',
+    factor_ai_loading: '生成中…',
+    factor_ai_fresh: '新生成 · 缓存 {ttl}',
+    factor_ai_cached: '已缓存 · {ttl} 后过期',
+    factor_ai_error: 'AI 生成失败',
+    factor_ai_failed: '失败',
+    factor_ai_refresh: '重新生成',
+
     detail_equity: '权益曲线',
-    detail_factors: '策略因子 · 数学与物理解释',
+    detail_factors: '策略因子 · 公式',
     detail_positions: '当前持仓',
     detail_recent_trades: '最近交易',
     no_positions: '暂无持仓',
@@ -475,6 +539,17 @@ const STRATEGY_EN = {
   '纳斯达克100指数': 'NASDAQ-100 Index',
   '标普500指数': 'S&P 500 Index',
   '测试策略': 'Test Strategy',
+  // Q-group (Qlib ML models)
+  'LightGBM 排序': 'LightGBM (ranking)',
+  'XGBoost 排序': 'XGBoost (ranking)',
+  'CatBoost 排序': 'CatBoost (ranking)',
+  'Ridge 线性': 'Ridge (linear)',
+  'MLP 神经网': 'MLP (neural net)',
+  'LSTM 时序': 'LSTM (sequence)',
+  'GRU 时序': 'GRU (sequence)',
+  'Transformer 注意力': 'Transformer (attention)',
+  'TCN 卷积时序': 'TCN (temporal conv)',
+  'ALSTM 注意力 LSTM': 'ALSTM (attention LSTM)',
 };
 
 function tStrategy(name, accountId) {

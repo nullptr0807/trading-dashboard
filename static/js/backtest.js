@@ -106,17 +106,23 @@ function renderQlibStatusBanner(s) {
     </tr>`;
   }).join('');
 
+  const isEn = (typeof getLang === 'function') && getLang() === 'en';
+  const pick = (zh, en) => (isEn && en) ? en : zh;
+
   const leakHtml = (s.leakage_vectors || []).map(v => `
-    <li><b>${v.title}</b><br><span class="qst-desc">${v.desc}</span></li>
+    <li><b>${pick(v.title, v.title_en)}</b><br><span class="qst-desc">${pick(v.desc, v.desc_en)}</span></li>
   `).join('');
 
   const todoHtml = (s.todo || []).map(it => `
     <li class="${it.done ? 'qst-done' : 'qst-pending'}">
-      <span class="qst-check">${it.done ? '✅' : '⬜'}</span> ${it.text}
+      <span class="qst-check">${it.done ? '✅' : '⬜'}</span> ${pick(it.text, it.text_en)}
     </li>
   `).join('');
 
-  const doneHtml = (s.done || []).map(d => `<li>✓ ${d}</li>`).join('');
+  const doneList = (isEn && s.done_en) ? s.done_en : (s.done || []);
+  const doneHtml = doneList.map(d => `<li>✓ ${d}</li>`).join('');
+
+  const planApproach = pick((s.plan && s.plan.approach) || '', s.plan && s.plan.approach_en);
 
   host.innerHTML = `
     <div class="qst-banner">
@@ -142,7 +148,7 @@ function renderQlibStatusBanner(s) {
 
           <div class="qst-section">
             <div class="qst-section-title">📋 ${t('bt_qst_plan') || '解决方案'}</div>
-            <div class="qst-plan-text">${(s.plan && s.plan.approach) || ''}</div>
+            <div class="qst-plan-text">${planApproach}</div>
             <div class="qst-plan-meta">
               ${t('bt_qst_size_per_day') || '单日大小'}: ~${(s.plan && s.plan.checkpoint_size_per_day_kb) || 0} KB ·
               ${t('bt_qst_yearly') || '年存储'}: ~${(s.plan && s.plan.yearly_storage_mb) || 0} MB
@@ -168,8 +174,8 @@ function renderQlibStatusBanner(s) {
           </table>
           <div class="qst-coverage-note">
             ${nWith === 0
-              ? (t('bt_qst_no_data') || 'Checkpoint 累积尚未开始。每日 23:00 UTC cron 训练后会自动写入；首条数据将在下次 cron 运行后出现。')
-              : (t('bt_qst_data_growing') || `已积累 ${nWith}/${nTotal} 个模型，每日 23:00 UTC 自动追加。`)}
+              ? t('bt_qst_no_data')
+              : t('bt_qst_data_growing', { nWith, nTotal })}
           </div>
         </div>
 

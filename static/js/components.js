@@ -103,11 +103,6 @@ function renderGpFactors(accountId, factors) {
     const latexId = `gplatex-${accountId}-${i}-${Math.random().toString(36).slice(2,6)}`;
     const ic = f.ic != null ? (f.ic * 100).toFixed(2) + '%' : '—';
     const icClass = (f.ic || 0) >= 0 ? 'positive' : 'negative';
-    const varsHtml = (f.vars_used || []).map(v =>
-      `<li><code>${v.name}</code> — ${v.desc}</li>`).join('');
-    const warnHtml = (f.warnings && f.warnings.length) ?
-      `<div class="gp-factor-warn">⚠️ ${f.warnings.join('<br>⚠️ ')}</div>` : '';
-    const alphaSrc = (f.alpha_source || '').replace(/\n/g, '<br>');
     return `
       <div class="gp-factor-card" data-latex="${encodeURIComponent(f.latex || '')}" data-id="${latexId}">
         <div class="gp-factor-head">
@@ -118,11 +113,6 @@ function renderGpFactors(accountId, factors) {
         <pre class="factor-gp">${f.s_expression || ''}</pre>
         <div class="gp-factor-label">${t('factor_math')}</div>
         <div class="gp-factor-latex" id="${latexId}"></div>
-        ${f.intuition ? `<div class="gp-factor-section"><div class="gp-factor-label">${t('factor_intuition')}</div><div class="gp-factor-text">${f.intuition}</div></div>` : ''}
-        ${f.motivation ? `<div class="gp-factor-section"><div class="gp-factor-label">${t('factor_motivation')}</div><div class="gp-factor-text">${f.motivation}</div></div>` : ''}
-        ${alphaSrc ? `<div class="gp-factor-section"><div class="gp-factor-label">${t('factor_alpha')}</div><div class="gp-factor-text">${alphaSrc}</div></div>` : ''}
-        ${varsHtml ? `<div class="gp-factor-label">${t('factor_vars')}</div><ul class="gp-factor-vars">${varsHtml}</ul>` : ''}
-        ${warnHtml}
       </div>`;
   }).join('');
 }
@@ -141,7 +131,6 @@ function renderGpBlock(container, factors, compositeId, composite, accountId, gp
     <div class="factor-composite">
       <div class="composite-title">${t('factor_composite')}</div>
       <div class="composite-formula" id="${compositeId}"></div>
-      <div class="composite-motivation">${(composite.motivation || '').replace(/\n/g,'<br>')}</div>
     </div>` : '';
   container.innerHTML = `
     <div class="factor-item">
@@ -168,20 +157,116 @@ function renderGpBlock(container, factors, compositeId, composite, accountId, gp
   }
 }
 
+// ============================================================
+// AI Factor Interpretation (LLM-driven, cached 2h server-side)
+// ============================================================
+function createFactorAiBlock(accountId) {
+  // Returned HTML is appended after the regular factors block.
+  // Caller is responsible for kicking off loadFactorAi(...) afterwards.
+  return `
+    <div class="factor-ai-block" id="factor-ai-${accountId}">
+      <div class="factor-ai-header">
+        <div class="factor-ai-title">${t('factor_ai_title')}</div>
+        <div class="factor-ai-meta">
+          <span class="factor-ai-status" data-role="status">${t('factor_ai_loading')}</span>
+          <button class="factor-ai-refresh" data-role="refresh" title="${t('factor_ai_refresh')}" style="display:none;">↻</button>
+        </div>
+      </div>
+      <div class="factor-ai-body" data-role="body">
+        <div class="factor-ai-skeleton">
+          <div class="skeleton skeleton-text" style="width:90%;"></div>
+          <div class="skeleton skeleton-text" style="width:75%;"></div>
+          <div class="skeleton skeleton-text" style="width:85%;"></div>
+          <div class="skeleton skeleton-text" style="width:60%;"></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function _fmtTtl(seconds) {
+  if (seconds == null || seconds <= 0) return '';
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + 'm' : ''}`;
+}
+
+async function loadFactorAi(accountId, accData, factorsResp, opts = {}) {
+  const root = document.getElementById(`factor-ai-${accountId}`);
+  if (!root) return;
+  const body = root.querySelector('[data-role="body"]');
+  const status = root.querySelector('[data-role="status"]');
+  const refreshBtn = root.querySelector('[data-role="refresh"]');
+
+  // Reset to loading state (refresh case)
+  body.innerHTML = `
+    <div class="factor-ai-skeleton">
+      <div class="skeleton skeleton-text" style="width:90%;"></div>
+      <div class="skeleton skeleton-text" style="width:75%;"></div>
+      <div class="skeleton skeleton-text" style="width:85%;"></div>
+      <div class="skeleton skeleton-text" style="width:60%;"></div>
+    </div>`;
+  status.textContent = t('factor_ai_loading');
+  refreshBtn.style.display = 'none';
+
+  const lang = (typeof getLang === 'function' && getLang() === 'en') ? 'en' : 'zh';
+  const payload = {
+    account_id: accountId,
+    group: factorsResp.group,
+    strategy_name: factorsResp.strategy_name || accData?.strategy_name || '',
+    gp_info: factorsResp.gp_info || '',
+    factors: factorsResp.factors || [],
+    composite: factorsResp.composite || {},
+    positions: accData?.positions || [],
+    trades: (accData?.trades || []).slice(-30),
+  };
+
+  try {
+    let url = `/api/factor_ai/${accountId}?lang=${lang}`;
+    if (opts.force) {
+      // Bust cache first
+      await fetch(`/api/factor_ai/${accountId}?lang=${lang}`, { method: 'DELETE' }).catch(() => {});
+    }
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+    }
+    const data = await resp.json();
+    const md = data.markdown || '';
+    const html = (window.marked ? marked.parse(md) : md.replace(/\n/g, '<br>'));
+    body.innerHTML = `<div class="factor-ai-md">${html}</div>`;
+    // KaTeX render inside the markdown if any $...$ slipped through
+    body.querySelectorAll('code').forEach(el => {
+      const txt = el.textContent || '';
+      const m = txt.match(/^\$(.+)\$$/);
+      if (m && window.katex) {
+        try { katex.render(m[1], el, { throwOnError: false }); } catch(e) {}
+      }
+    });
+    const ttl = _fmtTtl(data.ttl_remaining);
+    status.textContent = data.cached
+      ? t('factor_ai_cached', { ttl })
+      : t('factor_ai_fresh', { ttl });
+    refreshBtn.style.display = '';
+    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { force: true });
+  } catch (e) {
+    body.innerHTML = `<p style="color:var(--negative);font-size:13px;padding:8px;">${t('factor_ai_error')}: ${e.message}</p>`;
+    status.textContent = t('factor_ai_failed');
+    refreshBtn.style.display = '';
+    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { force: true });
+  }
+}
+
 function renderFactors(container, factors, composite) {
   const hasFactors = factors && factors.length;
   const factorsHtml = hasFactors ? factors.map(f => `
     <div class="factor-item">
       <div class="factor-name">${f.name || ''}</div>
       <div class="factor-formula"></div>
-      <div class="factor-block">
-        <div class="factor-block-label">${t('factor_math_intuition')}</div>
-        <div class="factor-block-text">${f.physics || f.explanation || f.description || ''}</div>
-      </div>
-      <div class="factor-block">
-        <div class="factor-block-label">${t('factor_trade_motivation')}</div>
-        <div class="factor-block-text">${f.motivation || ''}</div>
-      </div>
     </div>
   `).join('') : `<p style="color:var(--text-secondary);font-size:13px;">${t('factor_no_data')}</p>`;
 
@@ -189,7 +274,6 @@ function renderFactors(container, factors, composite) {
     <div class="factor-composite">
       <div class="composite-title">${t('factor_composite')}</div>
       <div class="composite-formula"></div>
-      <div class="composite-motivation">${(composite.motivation || '').replace(/\n/g, '<br>')}</div>
     </div>
   ` : '';
 
@@ -343,6 +427,9 @@ async function toggleRowExpand(row, accountId) {
     } else {
       renderFactors(factorsContainer, factors.factors || [], factors.composite);
     }
+    // Append AI interpretation block (LLM subagent, 2h cache)
+    factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
+    loadFactorAi(accountId, accData, factors);
     renderRowEquity(`rowchart-${accountId}`, accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks, accData.alpha, accData.trades || [], accData.snapshots || []);
   } catch (e) {
     detail.querySelector('.row-detail-inner').innerHTML = `<p style="color:var(--negative);padding:16px;">${t('load_failed')} ${e.message}</p>`;
@@ -672,6 +759,9 @@ async function openAccountDrawer(accountId) {
     } else {
       renderFactors(factorsContainer, factors.factors || [], factors.composite);
     }
+    // Append AI interpretation block (LLM subagent, 2h cache)
+    factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
+    loadFactorAi(accountId, accData, factors);
 
     // Equity curve + benchmarks
     renderDrawerEquity(accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks || []);
