@@ -239,8 +239,12 @@
     const chartCard = `
       <div class="sym-chart-grid">
         <div class="glass-card section sym-chart-col">
-          <div class="section-title-row"><div class="section-title">${t('sym_chart_title')}</div></div>
-          <div id="sym-chart" style="height:360px;position:relative;"></div>
+          <div class="section-title-row">
+            <div class="section-title">${t('sym_chart_title')}</div>
+            <div class="sym-chart-hint">${t('sym_chart_hint')}</div>
+          </div>
+          <div id="sym-chart-tools" class="sym-chart-tools"></div>
+          <div id="sym-chart" style="height:460px;position:relative;"></div>
           <div id="sym-chart-legend" class="sym-chart-legend"></div>
         </div>
         <div class="glass-card section sym-profile-col" id="sym-profile">
@@ -478,6 +482,14 @@
     return ACCT_PALETTE[h % ACCT_PALETTE.length];
   }
 
+  // Chart UI state per-render: which accounts are visible, label mode, side filter.
+  const _chartUI = {
+    visibleAccts: null,     // Set<string> | null (null = all visible)
+    soloAcct: null,         // single account focus
+    sideFilter: 'all',      // 'all' | 'buy' | 'sell'
+    showLabels: false,      // off by default — labels caused the overload
+  };
+
   function drawSymbolChart(d) {
     const host = document.getElementById('sym-chart');
     if (!host || !window.LightweightCharts) return;
@@ -486,16 +498,27 @@
       return;
     }
     host.innerHTML = '';
+
+    // Reset per-symbol UI state — switching tickers should not inherit filters.
+    _chartUI.visibleAccts = null;
+    _chartUI.soloAcct = null;
+    _chartUI.sideFilter = 'all';
+    _chartUI.showLabels = false;
+
     const chart = LightweightCharts.createChart(host, {
-      width: host.clientWidth, height: 360,
+      width: host.clientWidth, height: 460,
       layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
-      grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
+      grid: { vertLines: { color: 'rgba(0,0,0,0.05)' }, horzLines: { color: 'rgba(0,0,0,0.05)' } },
       crosshair: { mode: 0 },
-      timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false },
+      timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false, rightOffset: 4 },
       rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
     });
-    const priceSeries = chart.addAreaSeries({
-      lineColor: '#0071e3', topColor: 'rgba(0,113,227,0.20)', bottomColor: 'rgba(0,113,227,0.02)', lineWidth: 2,
+    // Price line — LineSeries (not area) so it stays crisp and high contrast.
+    // Deep navy keeps it readable on white AND distinguishes it from B/S dots.
+    const priceSeries = chart.addLineSeries({
+      color: '#1e3a8a', lineWidth: 3,
+      priceLineColor: 'rgba(30,58,138,0.4)', priceLineStyle: 2,
+      lastValueVisible: true, crosshairMarkerRadius: 5,
     });
     const data = d.price_curve.map(p => ({
       time: Math.floor(new Date(p.timestamp.replace(' ', 'T') + 'Z').getTime() / 1000),
@@ -517,68 +540,216 @@
       return Math.abs(a - tnum) <= Math.abs(b - tnum) ? a : b;
     }
 
-    // Group all trades by account, project markers onto the price line.
-    const markers = [];
+    // Pre-build the FULL marker pool once; filtering is just a paint operation.
+    // Each marker carries _meta so the tooltip + legend can read account state.
+    const allMarkers = [];
     const legendItems = [];
     d.accounts.forEach(a => {
       const col = colorForAccount(a.account);
-      legendItems.push({ account: a.account, color: col, total: a.total_pnl });
+      legendItems.push({
+        account: a.account,
+        color: col,
+        total: a.total_pnl,
+        group: a.group || 'X',
+        n: a.trade_count,
+      });
       a.trades.forEach(tr => {
         const raw = Math.floor(new Date(tr.timestamp).getTime() / 1000);
         if (isNaN(raw)) return;
         const tt = snap(raw);
         const isBuy = (tr.side || '').toLowerCase() === 'buy';
-        markers.push({
+        allMarkers.push({
           time: tt,
-          position: isBuy ? 'belowBar' : 'aboveBar',
-          color: col,
-          shape: isBuy ? 'arrowUp' : 'arrowDown',
-          text: a.account + (isBuy ? ' B' : ' S'),
+          _account: a.account,
+          _color: col,
+          _side: isBuy ? 'buy' : 'sell',
           _meta: { account: a.account, side: tr.side, shares: tr.shares, price: tr.price, ts: tr.timestamp },
         });
       });
     });
-    markers.sort((a, b) => a.time - b.time);
-    if (markers.length && markers.length < 3000) priceSeries.setMarkers(markers);
+    allMarkers.sort((a, b) => a.time - b.time);
 
-    // Legend
-    const cur = currencySymbol();
-    const legend = document.getElementById('sym-chart-legend');
-    if (legend) {
-      legend.innerHTML = legendItems
-        .sort((a, b) => b.total - a.total)
-        .map(it => `<span class="sym-legend-chip" style="--c:${it.color};">
-            <span class="dot"></span>${it.account}
-            <span class="${it.total>=0?'positive':'negative'}">${signed(cur, it.total)}</span>
-          </span>`).join('');
+    // Side-of-bar position by buy/sell so they don't overlap each other vertically.
+    // Color comes from the account palette only when an account is "focused"
+    // (solo'd or hovered); otherwise we use neutral semantic colors:
+    //   buy  → translucent green
+    //   sell → translucent red
+    // This makes the price line the visual hero — markers become a backdrop swarm.
+    const BUY_DIM = 'rgba(34,197,94,0.55)';   // green
+    const SELL_DIM = 'rgba(239,68,68,0.55)';  // red
+    const BUY_HI = '#16a34a';
+    const SELL_HI = '#dc2626';
+
+    function buildMarkers() {
+      const vis = _chartUI.visibleAccts;
+      const solo = _chartUI.soloAcct;
+      const sideF = _chartUI.sideFilter;
+      const labels = _chartUI.showLabels;
+      const out = [];
+      for (const m of allMarkers) {
+        if (sideF !== 'all' && m._side !== sideF) continue;
+        if (vis && !vis.has(m._account)) continue;
+        const focused = solo === m._account;
+        const dimmed  = solo && solo !== m._account;
+        if (dimmed) continue; // hide non-solo accounts when soloing
+        const isBuy = m._side === 'buy';
+        out.push({
+          time: m.time,
+          position: isBuy ? 'belowBar' : 'aboveBar',
+          color: focused ? m._color : (isBuy ? BUY_DIM : SELL_DIM),
+          shape: 'circle',
+          size: focused ? 2 : 1,
+          text: (labels || focused) ? m._account + (isBuy ? '↑' : '↓') : '',
+        });
+      }
+      return out;
     }
 
-    // Hover tooltip — show price on date + any trade markers there
+    function applyMarkers() {
+      const ms = buildMarkers();
+      // LightweightCharts caps markers ≈ no hard limit but >2k tanks perf
+      priceSeries.setMarkers(ms.length < 4000 ? ms : []);
+      // Update count badge
+      const badge = document.getElementById('sym-chart-count');
+      if (badge) badge.textContent = ms.length + ' / ' + allMarkers.length;
+    }
+
+    // --- Toolbar -----------------------------------------------------------
+    const tools = document.getElementById('sym-chart-tools');
+    if (tools) {
+      tools.innerHTML = `
+        <div class="sym-tool-group" role="tablist">
+          <button class="sym-tool-btn active" data-side="all">${t('sym_filter_all')}</button>
+          <button class="sym-tool-btn" data-side="buy">${t('sym_filter_buys')}</button>
+          <button class="sym-tool-btn" data-side="sell">${t('sym_filter_sells')}</button>
+        </div>
+        <div class="sym-tool-group">
+          <button class="sym-tool-btn" data-action="top5">${t('sym_filter_top5')}</button>
+          <button class="sym-tool-btn" data-action="winners">${t('sym_filter_winners')}</button>
+          <button class="sym-tool-btn" data-action="losers">${t('sym_filter_losers')}</button>
+          <button class="sym-tool-btn" data-action="all">${t('sym_filter_show_all')}</button>
+          <button class="sym-tool-btn" data-action="hide">${t('sym_filter_hide_all')}</button>
+        </div>
+        <label class="sym-tool-toggle">
+          <input type="checkbox" id="sym-toggle-labels" />
+          <span>${t('sym_filter_show_labels')}</span>
+        </label>
+        <span class="sym-chart-count" id="sym-chart-count"></span>
+      `;
+      tools.querySelectorAll('[data-side]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          _chartUI.sideFilter = btn.dataset.side;
+          tools.querySelectorAll('[data-side]').forEach(b => b.classList.toggle('active', b === btn));
+          applyMarkers();
+        });
+      });
+      tools.querySelectorAll('[data-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const act = btn.dataset.action;
+          if (act === 'all') {
+            _chartUI.visibleAccts = null;
+            _chartUI.soloAcct = null;
+          } else if (act === 'hide') {
+            _chartUI.visibleAccts = new Set();
+            _chartUI.soloAcct = null;
+          } else {
+            // Pick top-N by total_pnl using the chosen rule.
+            const sorted = legendItems.slice().sort((a, b) => b.total - a.total);
+            let pick = [];
+            if (act === 'top5')    pick = sorted.slice(0, 5).map(x => x.account);
+            if (act === 'winners') pick = sorted.filter(x => x.total > 0).map(x => x.account);
+            if (act === 'losers')  pick = sorted.filter(x => x.total < 0).map(x => x.account);
+            _chartUI.visibleAccts = new Set(pick);
+            _chartUI.soloAcct = null;
+          }
+          paintLegend();
+          applyMarkers();
+        });
+      });
+      const cb = document.getElementById('sym-toggle-labels');
+      if (cb) cb.addEventListener('change', () => {
+        _chartUI.showLabels = cb.checked;
+        applyMarkers();
+      });
+    }
+
+    // --- Legend with click-to-solo / shift-click to toggle ----------------
+    const legend = document.getElementById('sym-chart-legend');
+    const cur = currencySymbol();
+    function paintLegend() {
+      if (!legend) return;
+      const sorted = legendItems.slice().sort((a, b) => b.total - a.total);
+      legend.innerHTML = sorted.map(it => {
+        const vis = _chartUI.visibleAccts;
+        const solo = _chartUI.soloAcct;
+        const hidden = vis && !vis.has(it.account);
+        const focused = solo === it.account;
+        const otherSolo = solo && !focused;
+        const cls = ['sym-legend-chip'];
+        if ((hidden || otherSolo) && !focused) cls.push('dim');
+        if (focused) cls.push('focused');
+        return `<button class="${cls.join(' ')}" style="--c:${it.color};" data-acct="${it.account}" title="${t('sym_legend_hint')}">
+            <span class="dot"></span>
+            <span class="sym-legend-grp grp-${it.group}">${it.group}</span>
+            <b>${it.account}</b>
+            <span class="sym-legend-n">×${it.n}</span>
+            <span class="${it.total>=0?'positive':'negative'}">${signed(cur, it.total)}</span>
+          </button>`;
+      }).join('');
+      legend.querySelectorAll('[data-acct]').forEach(el => {
+        el.addEventListener('click', (ev) => {
+          const acct = el.dataset.acct;
+          if (ev.shiftKey) {
+            // Shift-click = toggle individual account in visibility set
+            if (!_chartUI.visibleAccts) {
+              _chartUI.visibleAccts = new Set(legendItems.map(x => x.account));
+            }
+            if (_chartUI.visibleAccts.has(acct)) _chartUI.visibleAccts.delete(acct);
+            else _chartUI.visibleAccts.add(acct);
+            _chartUI.soloAcct = null;
+          } else {
+            // Click = solo (or un-solo if already soloed)
+            _chartUI.soloAcct = _chartUI.soloAcct === acct ? null : acct;
+            if (_chartUI.soloAcct) _chartUI.visibleAccts = null;
+          }
+          paintLegend();
+          applyMarkers();
+        });
+      });
+    }
+    paintLegend();
+    applyMarkers();
+
+    // Hover tooltip
     const tip = document.createElement('div');
     tip.className = 'sym-chart-tip';
     tip.style.display = 'none';
     host.appendChild(tip);
 
     const markersByTime = {};
-    markers.forEach(m => { (markersByTime[m.time] = markersByTime[m.time] || []).push(m); });
+    allMarkers.forEach(m => { (markersByTime[m.time] = markersByTime[m.time] || []).push(m); });
 
     chart.subscribeCrosshairMove(param => {
       if (!param || !param.time || !param.point) { tip.style.display = 'none'; return; }
-      const px = priceSeries.dataByIndex
-        ? null
-        : null;
       const v = param.seriesData ? param.seriesData.get(priceSeries) : null;
       const close = v && (v.value || v.close);
       const dStr = new Date(param.time * 1000).toISOString().slice(0,10);
-      const trList = markersByTime[param.time] || [];
+      const trList = (markersByTime[param.time] || []).filter(m => {
+        if (_chartUI.sideFilter !== 'all' && m._side !== _chartUI.sideFilter) return false;
+        const vis = _chartUI.visibleAccts;
+        const solo = _chartUI.soloAcct;
+        if (solo && solo !== m._account) return false;
+        if (vis && !vis.has(m._account)) return false;
+        return true;
+      });
       let html = `<div class="tip-head">${dStr}</div>`;
-      if (close != null) html += `<div>${cur}${Number(close).toFixed(2)}</div>`;
+      if (close != null) html += `<div class="tip-price"><span class="tip-px-dot"></span>${cur}${Number(close).toFixed(2)}</div>`;
       if (trList.length) {
         html += '<div class="tip-sep"></div>';
         trList.forEach(m => {
           const meta = m._meta;
-          const sCls = (meta.side||'').toLowerCase()==='buy' ? 'positive' : 'negative';
-          html += `<div class="tip-tr"><span style="color:${m.color}">●</span> <b>${meta.account}</b> <span class="${sCls}">${meta.side.toUpperCase()}</span> ${meta.shares}@${cur}${Number(meta.price).toFixed(2)}</div>`;
+          const isBuy = (meta.side||'').toLowerCase()==='buy';
+          html += `<div class="tip-tr"><span style="color:${m._color}">●</span> <b>${meta.account}</b> <span class="${isBuy?'positive':'negative'}">${isBuy?'BUY':'SELL'}</span> ${meta.shares}@${cur}${Number(meta.price).toFixed(2)}</div>`;
         });
       }
       tip.innerHTML = html;
@@ -590,8 +761,14 @@
       tip.style.top = y + 'px';
     });
 
-    // Resize
-    const ro = new ResizeObserver(() => chart.applyOptions({ width: host.clientWidth }));
+    // Fit + resize: refit on rAF (drawer animations) AND inside the observer
+    // — see trading-dashboard-frontend skill, LightweightCharts fitContent pitfall.
+    chart.timeScale().fitContent();
+    requestAnimationFrame(() => chart.timeScale().fitContent());
+    const ro = new ResizeObserver(() => {
+      chart.applyOptions({ width: host.clientWidth });
+      chart.timeScale().fitContent();
+    });
     ro.observe(host);
   }
 

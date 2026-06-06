@@ -654,7 +654,15 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
   });
 
   chart.timeScale().fitContent();
-  new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth })).observe(container);
+  // Re-fit on next frame in case container was 0-width at first paint (row
+  // expand / drawer / tombstone modal animate in → fitContent runs before the
+  // container has stable width and the visible range gets stuck on the last
+  // few points). Refit again after resize so width changes don't crop history.
+  requestAnimationFrame(() => chart.timeScale().fitContent());
+  new ResizeObserver(() => {
+    chart.applyOptions({ width: container.clientWidth });
+    chart.timeScale().fitContent();
+  }).observe(container);
 
   // Alpha summary + legend
   if (alpha || benchmarks?.length) {
@@ -836,5 +844,11 @@ function renderDrawerEquity(curve, accountId, benchmarks) {
   }
 
   chart.timeScale().fitContent();
-  new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth })).observe(container);
+  // Drawer animates in → container may be 0-width at first paint. Refit next
+  // frame, and refit on every resize so width changes don't crop history.
+  requestAnimationFrame(() => chart.timeScale().fitContent());
+  new ResizeObserver(() => {
+    chart.applyOptions({ width: container.clientWidth });
+    chart.timeScale().fitContent();
+  }).observe(container);
 }
