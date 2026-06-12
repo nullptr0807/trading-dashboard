@@ -771,9 +771,12 @@ body::after {
 
 .ev-row {
   display: grid;
-  grid-template-columns: 14px auto auto 1fr auto;
+  grid-template-columns: 14px max-content max-content minmax(0, 1fr) max-content;
+  grid-template-areas:
+    "dot time cat title tag"
+    ". . . detail detail";
   align-items: baseline;
-  gap: 10px;
+  gap: 4px 10px;
   padding: 11px 18px;
   font-size: 13px;
   line-height: 1.45;
@@ -787,6 +790,7 @@ body::after {
 .ev-row:hover { background: rgba(0, 113, 227, 0.14) !important; }
 
 .ev-dot {
+  grid-area: dot;
   width: 8px; height: 8px; border-radius: 50%;
   display: inline-block;
   align-self: center;
@@ -794,6 +798,7 @@ body::after {
   flex-shrink: 0;
 }
 .ev-time {
+  grid-area: time;
   font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
   color: var(--text-secondary);
@@ -801,6 +806,7 @@ body::after {
   white-space: nowrap;
 }
 .ev-cat {
+  grid-area: cat;
   font-size: 10.5px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -812,10 +818,16 @@ body::after {
   white-space: nowrap;
 }
 .ev-title {
+  grid-area: title;
+  min-width: 0;
   color: var(--text-primary);
-  word-break: break-word;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 .ev-tag {
+  grid-area: tag;
+  min-width: max-content;
+  justify-self: end;
   font-size: 11px;
   color: var(--text-secondary);
   font-family: 'SF Mono', 'JetBrains Mono', Consolas, monospace;
@@ -842,9 +854,13 @@ body::after {
   color: #f87171; border-color: rgba(248, 113, 113, 0.3);
 }
 .ev-row .ev-detail {
+  grid-area: detail;
+  min-width: 0;
   display: block;
-  margin-left: 28px; margin-top: 2px;
+  margin-top: 2px;
   font-size: 0.78rem; opacity: 0.7; font-style: italic;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 /* Retired-account pill — used in backtest checkboxes, factor headers, etc. */
@@ -872,11 +888,19 @@ body::after {
 
 @media (max-width: 700px) {
   .ev-row {
-    grid-template-columns: 12px auto auto 1fr;
-    grid-template-areas: "dot time cat title" "dot tag tag tag";
+    grid-template-columns: 12px max-content max-content minmax(0, 1fr);
+    grid-template-areas:
+      "dot time cat title"
+      ". tag tag tag"
+      ". detail detail detail";
     row-gap: 4px;
   }
-  .ev-tag { grid-area: tag; }
+  .ev-tag {
+    justify-self: start;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 /* ===== Market tabs (CN/US) ===== */
