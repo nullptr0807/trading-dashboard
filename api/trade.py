@@ -311,12 +311,14 @@ async def equity_curves(market: str = Query('US')):
         {'market': market}
     )
 
-    # Dedup to ≤1 point per 15-min bucket per account. Upstream update_prices.py
-    # can write 60 near-identical equity rows/hour while a market is closed;
-    # that visually squashes earlier trading days on the chart. Keep the LAST
-    # value seen within each bucket so the most recent equity wins.
-    from datetime import datetime as _dt
-    BUCKET_SEC = 15 * 60
+    # Dedup overview curves to ≤1 point per hour per account. Upstream writers
+    # can emit many snapshots per hour; more importantly, per-account timestamps
+    # often differ by milliseconds, so LightweightCharts treats them as distinct
+    # logical bars across 40+ series and cannot zoom out to the full Apr→now
+    # history. Canonicalize every point to the bucket timestamp so all accounts
+    # share the same time axis. Per-account detail charts still use raw snapshots.
+    from datetime import datetime as _dt, timezone as _tz
+    BUCKET_SEC = 60 * 60
 
     def _bucket_key(ts: str) -> int:
         try:
@@ -324,6 +326,9 @@ async def equity_curves(market: str = Query('US')):
         except Exception:
             return 0
         return epoch - (epoch % BUCKET_SEC)
+
+    def _bucket_ts(bucket: int) -> str:
+        return _dt.fromtimestamp(bucket, _tz.utc).isoformat()
 
     curves: dict[str, list[dict]] = {}
     last_bucket: dict[str, int] = {}  # name → last bucket_key
@@ -352,10 +357,11 @@ async def equity_curves(market: str = Query('US')):
         bk = _bucket_key(r['timestamp'])
         buf = curves.setdefault(name, [])
         if last_bucket.get(name) == bk and buf:
-            # Replace — keep the last value within this 15-min bucket
-            buf[-1] = {'equity': round(r['equity'], 2), 'timestamp': r['timestamp']}
+            # Replace — keep the last value within this hour bucket, but expose
+            # the canonical bucket timestamp to the frontend so all series align.
+            buf[-1] = {'equity': round(r['equity'], 2), 'timestamp': _bucket_ts(bk)}
         else:
-            buf.append({'equity': round(r['equity'], 2), 'timestamp': r['timestamp']})
+            buf.append({'equity': round(r['equity'], 2), 'timestamp': _bucket_ts(bk)})
             last_bucket[name] = bk
 
     first_row = await fetch_one(
