@@ -240,6 +240,15 @@ def _stats_from_curve(equity_curve, initial_capital, total_trades, wins, losses,
         "win_rate": round(win_rate, 2),
         "profit_factor": round(profit_factor, 4),
         "total_trades": total_trades,
+        # Hidden-but-useful realized trade aggregates. The frontend ignores
+        # these directly, but _build_combined needs them; otherwise the
+        # summary grid for a single-account backtest shows win rate / profit
+        # factor as 0 even though the per-account row is correct.
+        "wins": wins,
+        "losses": losses,
+        "gross_profit": round(gross_profit, 4),
+        "gross_loss": round(gross_loss, 4),
+        "realized_pnl": round(total_pnl, 4),
     }
 
 
@@ -432,9 +441,15 @@ def _build_combined(per_account, initial_capital):
     combined_curve = [{"timestamp": ts, "equity": sum(m[ts] for m in filled.values())} for ts in all_ts]
     n = len(per_account)
     combined_initial = initial_capital * n
+    total_trades = sum((a.get("stats") or {}).get("total_trades", 0) for a in per_account)
+    wins = sum((a.get("stats") or {}).get("wins", 0) for a in per_account)
+    losses = sum((a.get("stats") or {}).get("losses", 0) for a in per_account)
+    gross_profit = sum((a.get("stats") or {}).get("gross_profit", 0.0) for a in per_account)
+    gross_loss = sum((a.get("stats") or {}).get("gross_loss", 0.0) for a in per_account)
+    realized_pnl = sum((a.get("stats") or {}).get("realized_pnl", 0.0) for a in per_account)
     stats = _stats_from_curve(combined_curve, combined_initial,
-                               sum(a["stats"]["total_trades"] for a in per_account),
-                               0, 0, 0, 0, 0)
+                               total_trades, wins, losses,
+                               gross_profit, gross_loss, realized_pnl)
     return {"equity_curve": combined_curve, "stats": stats}
 
 
