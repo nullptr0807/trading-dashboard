@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.trade import router as trade_router
 from api.factors import router as factors_router
 from api.factor_ai import router as factor_ai_router
+from api.signal_quality import router as signal_quality_router
 from api.backtest import router as backtest_router
 from api.events import router as events_router
 from api.intro import router as intro_router
@@ -17,6 +18,7 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], all
 app.include_router(trade_router)
 app.include_router(factors_router)
 app.include_router(factor_ai_router)
+app.include_router(signal_quality_router)
 app.include_router(backtest_router)
 app.include_router(events_router)
 app.include_router(intro_router)

@@ -4,7 +4,7 @@ function createCard(account) {
   const id = account.id || account.account_id;
   const groupChar = id.charAt(0) === 'C' ? id.charAt(1) : id.charAt(0);
   const isA = groupChar === 'A';
-  const isB = groupChar === 'B';
+  const isB = groupChar === 'B' || groupChar === 'F';
   const isQ = groupChar === 'Q';
   const isIDX = id.startsWith('IDX');
   const badgeClass = isA ? 'badge-a' : (isB ? 'badge-b' : (isQ ? 'badge-q' : 'badge-idx'));
@@ -97,28 +97,71 @@ function createSparkline(canvas, data, isBlue) {
   ctx.fill();
 }
 
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderFactorStatus(status) {
+  if (!status) return '';
+  const sev = status.severity || 'warn';
+  const statusText = status.status || 'unknown';
+  const rows = [];
+  rows.push([t('factor_status_active'), status.active_factors ?? 0]);
+  if (status.latest_factor_date) rows.push([t('factor_status_latest'), status.latest_factor_date]);
+  if (status.persisted_tickers != null) rows.push([t('factor_status_coverage'), `${status.persisted_tickers || 0} tickers · ${status.persisted_rows || 0} rows`]);
+  if (status.failure_reason) rows.push([t('factor_status_reason'), status.failure_reason]);
+  if (status.retry_after) rows.push([t('factor_status_retry'), formatDate(status.retry_after)]);
+  return `
+    <div class="factor-status-card factor-status-${_esc(sev)}">
+      <div class="factor-status-head">
+        <span class="factor-status-dot"></span>
+        <span class="factor-status-title">${t('factor_status_title')}</span>
+        <span class="factor-status-pill">${_esc(statusText)}</span>
+      </div>
+      <div class="factor-status-detail">${_esc(status.detail || '')}</div>
+      <div class="factor-status-grid">
+        ${rows.map(([k, v]) => `<div><span>${_esc(k)}</span><b>${_esc(v)}</b></div>`).join('')}
+      </div>
+    </div>`;
+}
+
 function renderGpFactors(accountId, factors) {
   if (!factors || !factors.length) return '';
   return factors.map((f, i) => {
     const latexId = `gplatex-${accountId}-${i}-${Math.random().toString(36).slice(2,6)}`;
     const ic = f.ic != null ? (f.ic * 100).toFixed(2) + '%' : '—';
     const icClass = (f.ic || 0) >= 0 ? 'positive' : 'negative';
+    const featureHtml = (f.vars_used || []).length ? `
+      <div class="gp-factor-label">${t('factor_vars')}</div>
+      <div class="gp-var-list">
+        ${(f.vars_used || []).map(v => `<span class="gp-var-chip" title="${_esc(v.desc || '')}"><code>${_esc(v.name)}</code><em>${_esc(v.desc || '')}</em></span>`).join('')}
+      </div>` : '';
+    const targetHtml = f.y_target ? `<span class="gp-factor-target">${_esc(f.y_target)}</span>` : '';
     return `
       <div class="gp-factor-card" data-latex="${encodeURIComponent(f.latex || '')}" data-id="${latexId}">
         <div class="gp-factor-head">
-          <span class="gp-factor-name">${f.name || t('factor_n', {n: i+1})}</span>
+          <span class="gp-factor-name">${_esc(f.name || t('factor_n', {n: i+1}))}</span>
           <span class="gp-factor-ic ${icClass}">IC ${ic}</span>
+          ${targetHtml}
         </div>
         <div class="gp-factor-label">${t('factor_raw_s')}</div>
-        <pre class="factor-gp">${f.s_expression || ''}</pre>
+        <pre class="factor-gp">${_esc(f.s_expression || '')}</pre>
+        ${featureHtml}
         <div class="gp-factor-label">${t('factor_math')}</div>
         <div class="gp-factor-latex" id="${latexId}"></div>
       </div>`;
   }).join('');
 }
 
-function renderGpBlock(container, factors, compositeId, composite, accountId, gpInfo, gpParams) {
+function renderGpBlock(container, factors, compositeId, composite, accountId, gpInfo, gpParams, factorStatus) {
   const gpFactorsHtml = renderGpFactors(accountId, factors);
+  const statusHtml = renderFactorStatus(factorStatus);
+  const noFactorHtml = (!gpFactorsHtml && factorStatus) ? `<p class="gp-no-factor-note">${_esc(factorStatus.detail || t('factor_no_data'))}</p>` : '';
   const paramsHtml = (gpParams && gpParams.length) ? `
     <div class="gp-params">
       ${gpParams.map(p => `
@@ -133,12 +176,13 @@ function renderGpBlock(container, factors, compositeId, composite, accountId, gp
       <div class="composite-formula" id="${compositeId}"></div>
     </div>` : '';
   container.innerHTML = `
+    ${statusHtml}
     <div class="factor-item">
       <div class="factor-name" style="color:#b388ff;">${accountId} · ${t('gp_evolved_factor')}</div>
-      <pre class="factor-gp">${gpInfo || t('factor_no_gp_params')}</pre>
+      <pre class="factor-gp">${_esc(gpInfo || t('factor_no_gp_params'))}</pre>
       ${paramsHtml}
     </div>
-    ${gpFactorsHtml}
+    ${gpFactorsHtml || noFactorHtml}
     ${motivationHtml}`;
   // KaTeX for each gp factor
   container.querySelectorAll('.gp-factor-card').forEach(card => {
@@ -190,6 +234,182 @@ function _fmtTtl(seconds) {
   return `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + 'm' : ''}`;
 }
 
+function _fmtMetric(v, digits = 3, suffix = '') {
+  if (v == null || isNaN(Number(v))) return '—';
+  const n = Number(v);
+  const sign = n > 0 ? '+' : '';
+  return sign + n.toFixed(digits) + suffix;
+}
+
+function _metricClass(v) {
+  if (v == null || isNaN(Number(v))) return '';
+  return Number(v) >= 0 ? 'positive' : 'negative';
+}
+
+function summarizeSignalQuality(sq) {
+  if (!sq || !sq.supported || !sq.summary) return null;
+  const s = sq.summary;
+  return {
+    horizon: sq.horizon,
+    window: sq.window,
+    mean_ic: s.mean_ic,
+    icir: s.icir,
+    latest_rolling_icir: s.latest_rolling_icir,
+    win_rate: s.win_rate,
+    n_days: s.n_days,
+    avg_universe_size: s.avg_universe_size,
+    latest_ic: s.latest_ic,
+    warnings: sq.warnings || [],
+    signal_source: sq.signal_source || {},
+  };
+}
+
+function createSignalQualityBlock(accountId) {
+  return `
+    <div class="signal-quality-block" id="signal-quality-${accountId}">
+      <div class="signal-quality-head">
+        <div>
+          <div class="signal-quality-title">${t('sq_title')}</div>
+          <div class="signal-quality-subtitle">${t('sq_subtitle')}</div>
+        </div>
+        <div class="signal-quality-controls" data-role="horizons">
+          ${[1,5,10,20].map(h => `<button class="sq-horizon ${h===5?'active':''}" data-h="${h}">${h}D</button>`).join('')}
+        </div>
+      </div>
+      <div class="signal-quality-body" data-role="body">
+        <div class="factor-ai-skeleton">
+          <div class="skeleton skeleton-text" style="width:88%;"></div>
+          <div class="skeleton skeleton-text" style="width:70%;"></div>
+          <div class="skeleton" style="height:180px;"></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function _renderSignalQualitySummary(sq) {
+  const s = sq.summary || {};
+  const win = s.win_rate == null ? '—' : (Number(s.win_rate) * 100).toFixed(1) + '%';
+  const chips = [
+    [t('sq_mean_ic'), _fmtMetric(s.mean_ic, 3), _metricClass(s.mean_ic)],
+    [t('sq_icir'), _fmtMetric(s.icir, 2), _metricClass(s.icir)],
+    [t('sq_roll_icir'), _fmtMetric(s.latest_rolling_icir, 2), _metricClass(s.latest_rolling_icir)],
+    [t('sq_win_rate'), win, ''],
+    [t('sq_n_days'), s.n_days ?? '—', ''],
+    [t('sq_universe'), s.avg_universe_size ?? '—', ''],
+  ];
+  return `
+    <div class="signal-quality-summary">
+      ${chips.map(([label, value, klass]) => `
+        <div class="sq-chip">
+          <span>${label}</span>
+          <b class="${klass || ''}">${value}</b>
+        </div>`).join('')}
+    </div>`;
+}
+
+function _renderSignalQualityWarnings(sq) {
+  const warnings = sq.warnings || [];
+  if (!warnings.length) return '';
+  return `<div class="sq-warnings">${warnings.map(w => `<div>⚠ ${_esc(w)}</div>`).join('')}</div>`;
+}
+
+function renderSignalQualityChart(containerId, sq) {
+  const container = document.getElementById(containerId);
+  if (!container || !window.LightweightCharts) return;
+  const data = (sq.series || []).filter(x => x.ic != null).map(x => ({
+    time: x.date,
+    value: Number(x.ic),
+    color: Number(x.ic) >= 0 ? 'rgba(31,157,85,0.70)' : 'rgba(224,45,45,0.70)'
+  }));
+  const icir = (sq.series || []).filter(x => x.rolling_icir != null).map(x => ({ time: x.date, value: Number(x.rolling_icir) }));
+  if (!data.length) {
+    container.innerHTML = `<p style="color:var(--text-secondary);font-size:13px;padding:12px;">${t('sq_no_data')}</p>`;
+    return;
+  }
+  container.innerHTML = '';
+  container.style.position = 'relative';
+  const chart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 260,
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(0,0,0,0.05)' }, horzLines: { color: 'rgba(0,0,0,0.05)' } },
+    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)', scaleMargins: { top: 0.08, bottom: 0.55 } },
+    leftPriceScale: { visible: true, borderColor: 'rgba(0,0,0,0.12)', scaleMargins: { top: 0.62, bottom: 0.08 } },
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)' },
+    crosshair: { mode: 0 },
+  });
+  const hist = chart.addHistogramSeries({
+    priceScaleId: 'right',
+    priceFormat: { type: 'price', precision: 3, minMove: 0.001 },
+    lastValueVisible: false,
+    priceLineVisible: false,
+  });
+  hist.setData(data);
+  if (icir.length) {
+    const line = chart.addLineSeries({
+      priceScaleId: 'left',
+      color: '#6366f1',
+      lineWidth: 2,
+      priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    line.setData(icir);
+  }
+  const legend = document.createElement('div');
+  legend.className = 'sq-chart-legend';
+  legend.innerHTML = `<span><i class="sq-dot sq-dot-ic"></i>${t('sq_rank_ic')}</span><span><i class="sq-dot sq-dot-icir"></i>${t('sq_rolling_icir')}</span>`;
+  container.appendChild(legend);
+  chart.timeScale().fitContent();
+  requestAnimationFrame(() => chart.timeScale().fitContent());
+  new ResizeObserver(() => {
+    chart.applyOptions({ width: container.clientWidth });
+    chart.timeScale().fitContent();
+  }).observe(container);
+}
+
+function paintSignalQuality(root, sq) {
+  const body = root.querySelector('[data-role="body"]');
+  if (!body) return;
+  if (!sq.supported) {
+    body.innerHTML = `<div class="sq-empty">${_esc(sq.message || t('sq_no_data'))}</div>`;
+    return;
+  }
+  const chartId = `sq-chart-${sq.account_id}-${sq.horizon}-${Math.random().toString(36).slice(2,7)}`;
+  body.innerHTML = `
+    ${_renderSignalQualitySummary(sq)}
+    <div id="${chartId}" class="signal-quality-chart"></div>
+    ${_renderSignalQualityWarnings(sq)}
+    <div class="sq-method">${t('sq_method_note')}</div>
+  `;
+  renderSignalQualityChart(chartId, sq);
+}
+
+async function loadSignalQuality(accountId, horizon = 5) {
+  const root = document.getElementById(`signal-quality-${accountId}`);
+  if (!root) return null;
+  const body = root.querySelector('[data-role="body"]');
+  if (body) body.innerHTML = `<div class="factor-ai-skeleton"><div class="skeleton skeleton-text" style="width:86%;"></div><div class="skeleton" style="height:180px;"></div></div>`;
+  try {
+    const sq = await api(`/signal-quality/${accountId}?horizon=${horizon}&window=20`);
+    root.querySelectorAll('.sq-horizon').forEach(btn => btn.classList.toggle('active', Number(btn.dataset.h) === horizon));
+    paintSignalQuality(root, sq);
+    return sq;
+  } catch (e) {
+    if (body) body.innerHTML = `<p style="color:var(--negative);font-size:13px;padding:8px;">${t('sq_load_failed')}: ${e.message}</p>`;
+    return null;
+  }
+}
+
+function bindSignalQualityControls(accountId) {
+  const root = document.getElementById(`signal-quality-${accountId}`);
+  if (!root || root.dataset.bound) return;
+  root.dataset.bound = '1';
+  root.querySelectorAll('.sq-horizon').forEach(btn => {
+    btn.addEventListener('click', () => loadSignalQuality(accountId, Number(btn.dataset.h || 5)));
+  });
+}
+
 async function loadFactorAi(accountId, accData, factorsResp, opts = {}) {
   const root = document.getElementById(`factor-ai-${accountId}`);
   if (!root) return;
@@ -216,6 +436,7 @@ async function loadFactorAi(accountId, accData, factorsResp, opts = {}) {
     gp_info: factorsResp.gp_info || '',
     factors: factorsResp.factors || [],
     composite: factorsResp.composite || {},
+    signal_quality: opts.signalQuality || opts.signal_quality || null,
     positions: accData?.positions || [],
     trades: (accData?.trades || []).slice(-30),
   };
@@ -252,12 +473,12 @@ async function loadFactorAi(accountId, accData, factorsResp, opts = {}) {
       ? t('factor_ai_cached', { ttl })
       : t('factor_ai_fresh', { ttl });
     refreshBtn.style.display = '';
-    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { force: true });
+    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { ...opts, force: true });
   } catch (e) {
     body.innerHTML = `<p style="color:var(--negative);font-size:13px;padding:8px;">${t('factor_ai_error')}: ${e.message}</p>`;
     status.textContent = t('factor_ai_failed');
     refreshBtn.style.display = '';
-    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { force: true });
+    refreshBtn.onclick = () => loadFactorAi(accountId, accData, factorsResp, { ...opts, force: true });
   }
 }
 
@@ -396,6 +617,7 @@ async function toggleRowExpand(row, accountId) {
             <div class="detail-section-title">${t('detail_equity')}</div>
             <div id="rowchart-${accountId}" style="height:220px;position:relative;"></div>
           </div>
+          ${createSignalQualityBlock(accountId)}
           <div class="row-detail-section">
             <div class="detail-section-title">${t('detail_positions')}</div>
             <div id="rowpos-${accountId}"><div class="skeleton" style="height:60px;"></div></div>
@@ -421,15 +643,18 @@ async function toggleRowExpand(row, accountId) {
     detail.querySelector(`#rowpos-${accountId}`).innerHTML = createPositionsTable(accData.positions, accEquity);
     detail.querySelector(`#rowtrades-${accountId}`).innerHTML = createTradesTable((accData.trades || []).slice().reverse().slice(0, 50));
     const factorsContainer = detail.querySelector(`#rowfactors-${accountId}`);
-    if (factors.group === 'B') {
+    if (factors.group === 'B' || factors.group === 'F') {
       const compId = `gp-comp-${Math.random().toString(36).slice(2,9)}`;
-      renderGpBlock(factorsContainer, factors.factors || [], compId, factors.composite, accountId, factors.gp_info || '', factors.gp_params || []);
+      renderGpBlock(factorsContainer, factors.factors || [], compId, factors.composite, accountId, factors.gp_info || '', factors.gp_params || [], factors.factor_status);
     } else {
       renderFactors(factorsContainer, factors.factors || [], factors.composite);
     }
     // Append AI interpretation block (LLM subagent, 2h cache)
     factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
-    loadFactorAi(accountId, accData, factors);
+    bindSignalQualityControls(accountId);
+    loadSignalQuality(accountId, 5).then(sq => {
+      loadFactorAi(accountId, accData, factors, { signalQuality: summarizeSignalQuality(sq) });
+    });
     renderRowEquity(`rowchart-${accountId}`, accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks, accData.alpha, accData.trades || [], accData.snapshots || []);
   } catch (e) {
     detail.querySelector('.row-detail-inner').innerHTML = `<p style="color:var(--negative);padding:16px;">${t('load_failed')} ${e.message}</p>`;
@@ -725,6 +950,7 @@ async function openAccountDrawer(accountId) {
             <div class="detail-section-title">${t('detail_equity')}</div>
             <div id="drawer-equity" style="height:300px;position:relative;"></div>
           </div>
+          ${createSignalQualityBlock(accountId)}
           <div class="drawer-section">
             <div class="detail-section-title">${t('detail_factors')}</div>
             <div id="drawer-factors" class="factors-container"><div class="skeleton" style="height:120px;"></div></div>
@@ -761,15 +987,18 @@ async function openAccountDrawer(accountId) {
 
     // Factors: handle A-group (list) and B-group (GP expressions)
     const factorsContainer = overlay.querySelector('#drawer-factors');
-    if (factors.group === 'B') {
+    if (factors.group === 'B' || factors.group === 'F') {
       const compId = `gp-comp-${Math.random().toString(36).slice(2,9)}`;
-      renderGpBlock(factorsContainer, factors.factors || [], compId, factors.composite, accountId, factors.gp_info || '', factors.gp_params || []);
+      renderGpBlock(factorsContainer, factors.factors || [], compId, factors.composite, accountId, factors.gp_info || '', factors.gp_params || [], factors.factor_status);
     } else {
       renderFactors(factorsContainer, factors.factors || [], factors.composite);
     }
     // Append AI interpretation block (LLM subagent, 2h cache)
     factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
-    loadFactorAi(accountId, accData, factors);
+    bindSignalQualityControls(accountId);
+    loadSignalQuality(accountId, 5).then(sq => {
+      loadFactorAi(accountId, accData, factors, { signalQuality: summarizeSignalQuality(sq) });
+    });
 
     // Equity curve + benchmarks
     renderDrawerEquity(accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks || []);

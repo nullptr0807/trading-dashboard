@@ -253,6 +253,14 @@ const I18N_DICT = {
     factor_trade_motivation: '💡 Trading Motivation',
     factor_no_data: 'No factor data',
 
+    // FactorMiner / GP account status
+    factor_status_title: 'FactorMiner status',
+    factor_status_active: 'Active factors',
+    factor_status_latest: 'Latest factor date',
+    factor_status_coverage: 'Persisted coverage',
+    factor_status_reason: 'Reason',
+    factor_status_retry: 'Retry after',
+
     // AI factor interpretation
     factor_ai_title: '🤖 AI Interpretation · LLM Subagent',
     factor_ai_loading: 'Generating…',
@@ -261,6 +269,21 @@ const I18N_DICT = {
     factor_ai_error: 'AI generation failed',
     factor_ai_failed: 'failed',
     factor_ai_refresh: 'Regenerate',
+
+    // Signal quality / IC diagnostics
+    sq_title: '🧪 Signal Detector · Rank IC / ICIR',
+    sq_subtitle: 'Does this account’s cross-sectional score predict future returns?',
+    sq_mean_ic: 'Mean IC',
+    sq_icir: 'ICIR',
+    sq_roll_icir: 'Rolling ICIR',
+    sq_win_rate: 'Win rate',
+    sq_n_days: 'N days',
+    sq_universe: 'Universe',
+    sq_rank_ic: 'Rank IC',
+    sq_rolling_icir: 'Rolling 20D ICIR',
+    sq_no_data: 'No signal-quality data',
+    sq_load_failed: 'Signal detector failed',
+    sq_method_note: 'Method: signal at t predicts close[t+1+h] / close[t+1] - 1. A group uses rank → mean → rank; mean-reversion accounts are direction-adjusted.',
 
     // Detail sections
     detail_equity: 'Equity Curve',
@@ -518,6 +541,14 @@ const I18N_DICT = {
     factor_trade_motivation: '💡 交易动机',
     factor_no_data: '暂无因子数据',
 
+    // FactorMiner / GP account status
+    factor_status_title: 'FactorMiner 状态',
+    factor_status_active: '活跃因子',
+    factor_status_latest: '最新因子日期',
+    factor_status_coverage: '持久化覆盖',
+    factor_status_reason: '原因',
+    factor_status_retry: '下次重试',
+
     // AI factor interpretation
     factor_ai_title: '🤖 AI 解读 · LLM Subagent',
     factor_ai_loading: '生成中…',
@@ -526,6 +557,21 @@ const I18N_DICT = {
     factor_ai_error: 'AI 生成失败',
     factor_ai_failed: '失败',
     factor_ai_refresh: '重新生成',
+
+    // Signal quality / IC diagnostics
+    sq_title: '🧪 信号检测仪 · Rank IC / ICIR',
+    sq_subtitle: '这个账户的横截面打分，是否真的能预测未来收益？',
+    sq_mean_ic: '平均 IC',
+    sq_icir: 'ICIR',
+    sq_roll_icir: '滚动 ICIR',
+    sq_win_rate: '胜率',
+    sq_n_days: '样本天数',
+    sq_universe: '股票数',
+    sq_rank_ic: 'Rank IC',
+    sq_rolling_icir: '滚动20日 ICIR',
+    sq_no_data: '暂无信号质量数据',
+    sq_load_failed: '信号检测失败',
+    sq_method_note: '口径：t日信号预测 close[t+1+h] / close[t+1] - 1。A组按 rank → mean → rank 合成；均值回归账户已按真实交易方向取反。',
 
     detail_equity: '权益曲线',
     detail_factors: '策略因子 · 公式',

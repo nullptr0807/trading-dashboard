@@ -35,6 +35,7 @@ def _build_prompt(payload: dict, lang: str) -> str:
     positions = payload.get('positions') or []
     trades = payload.get('trades') or []
     gp_info = payload.get('gp_info') or ''
+    signal_quality = payload.get('signal_quality') or {}
 
     # Trim payload — LLMs choke on huge JSON
     factors_min = []
@@ -77,6 +78,7 @@ def _build_prompt(payload: dict, lang: str) -> str:
             'weights': composite.get('weights'),
             'n_factors': composite.get('n_factors'),
         },
+        'signal_quality': signal_quality,
         'positions': positions_min,
         'recent_trades': trades_min,
     }, ensure_ascii=False, indent=2)
@@ -124,10 +126,13 @@ Break down each factor: what raw inputs it uses, how the formula combines them, 
 ## 2. Mathematical / Physical Meaning
 For each factor, explain the math intuition (derivatives, moments, ratios, etc.) and the underlying market microstructure or behavioral hypothesis. Don't just rephrase the formula — interpret it.
 
-## 3. LLM Critique
-Your honest assessment: strengths, weaknesses, redundancies between factors, look-ahead / overfitting risks, regime sensitivity. Be specific. If two factors are essentially the same thing, say so. If something looks fragile, flag it.
+## 3. Signal Quality Evidence (Rank IC / ICIR)
+Use the `signal_quality` block if present. Interpret mean Rank IC, ICIR, rolling ICIR, win rate, sample size, universe size, and warnings. Be statistically honest: short samples are directional evidence, not proof. Distinguish “signal predicts cross-section” from “portfolio made money”.
 
-## 4. Trading-Floor Perspective (Holdings + Recent Trades)
+## 4. LLM Critique
+Your honest assessment: strengths, weaknesses, redundancies between factors, look-ahead / overfitting risks, regime sensitivity. Be specific. If two factors are essentially the same thing, say so. If something looks fragile, flag it. The Signal Quality section should inform this critique — do not ignore negative IC/ICIR.
+
+## 5. Trading-Floor Perspective (Holdings + Recent Trades)
 Look at the current positions and recent trades. Comment as a working trader:
 - Does the portfolio composition match what the factors should produce?
 - Concentration / sector tilt / obvious risks?
@@ -156,10 +161,13 @@ Rules:
 ## 2. 数学 / 物理含义
 逐个解释每个因子的数学直觉（导数、矩、比值等）以及背后的市场微结构或行为金融假设。不要只复述公式——要解读。
 
-## 3. LLM 评价
-你的真实判断：因子的优点、缺点、彼此之间的冗余、look-ahead / 过拟合风险、对市场状态的敏感度。要具体。如果两个因子本质上一样，直接说出来；如果哪里看起来脆弱，指出来。
+## 3. 信号质量证据（Rank IC / ICIR）
+如果 `signal_quality` 存在，请使用它判断。解读平均 Rank IC、ICIR、滚动 ICIR、IC 胜率、样本天数、股票池规模和 warnings。统计上要诚实：短样本只能作为方向证据，不是证明。区分“信号能预测横截面”和“组合最后赚了钱”。
 
-## 4. 交易员视角（持仓 + 最近交易）
+## 4. LLM 评价
+你的真实判断：因子的优点、缺点、彼此之间的冗余、look-ahead / 过拟合风险、对市场状态的敏感度。要具体。如果两个因子本质上一样，直接说出来；如果哪里看起来脆弱，指出来。信号质量数据必须进入你的判断——不要无视负 IC / 负 ICIR。
+
+## 5. 交易员视角（持仓 + 最近交易）
 看当前持仓和最近交易，以一线交易员的视角点评：
 - 组合构成和因子应该产出的结果是否一致？
 - 集中度 / 行业偏向 / 明显风险？
