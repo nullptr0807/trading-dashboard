@@ -299,7 +299,7 @@ async def equity_curves(market: str = Query('US')):
     # (snapshots written after retirement are skipped by update_prices.py, but
     # any historical drift is still visible — clip server-side to be safe).
     meta_rows = await fetch_all(
-        "SELECT account_id, status, retired_at, retire_reason "
+        "SELECT account_id, status, retired_at, retire_reason, initial_cash "
         "FROM account_meta WHERE market = :market",
         {'market': market}
     )
@@ -330,8 +330,14 @@ async def equity_curves(market: str = Query('US')):
     def _bucket_ts(bucket: int) -> str:
         return _dt.fromtimestamp(bucket, _tz.utc).isoformat()
 
-    curves: dict[str, list[dict]] = {}
-    last_bucket: dict[str, int] = {}  # name → last bucket_key
+    base_initial = 100000.0 if market == 'CN' else 10000.0
+    # First collect raw points into hourly buckets, then use the median equity
+    # within each bucket. This is deliberately more robust than "last point wins":
+    # CN minute snapshots can contain occasional bad/partial valuations that
+    # would otherwise become the representative point for the whole hour and
+    # create sawtooth curves (CB13 was the smoking gun).
+    bucket_values: dict[str, dict[int, list[float]]] = {}
+    last_good_equity: dict[str, float] = {}
     # Parse retired_at once → epoch sec for fast comparison
     retired_cutoff: dict[str, int] = {}
     for acct_id, m in meta_by_acct.items():
@@ -354,15 +360,63 @@ async def equity_curves(market: str = Query('US')):
                     continue
             except Exception:
                 pass
+        initial = (meta_by_acct.get(name) or {}).get('initial_cash') or base_initial
+        equity = float(r['equity'] or 0)
+        cash = float(r.get('cash') or 0)
+        # Read-time guard for historical avg_cost-fallback pollution: if an
+        # account is mostly invested (low cash) but equity snaps back near the
+        # starting capital after it previously had a materially different real
+        # valuation, skip the point rather than drawing a fake V-dip. This is
+        # non-destructive; raw rows remain in SQLite for audit/backfill.
+        prev_good = last_good_equity.get(name)
+        looks_like_fallback = (
+            cash < initial * 0.20
+            and initial * 0.98 <= equity <= initial * 1.02
+            and prev_good is not None
+            and abs(prev_good - initial) > initial * 0.05
+        )
+        if looks_like_fallback:
+            continue
         bk = _bucket_key(r['timestamp'])
-        buf = curves.setdefault(name, [])
-        if last_bucket.get(name) == bk and buf:
-            # Replace — keep the last value within this hour bucket, but expose
-            # the canonical bucket timestamp to the frontend so all series align.
-            buf[-1] = {'equity': round(r['equity'], 2), 'timestamp': _bucket_ts(bk)}
-        else:
-            buf.append({'equity': round(r['equity'], 2), 'timestamp': _bucket_ts(bk)})
-            last_bucket[name] = bk
+        bucket_values.setdefault(name, {}).setdefault(bk, []).append(equity)
+        last_good_equity[name] = equity
+
+    def _drop_isolated_outliers(pts: list[dict]) -> list[dict]:
+        """Remove single-point overview spikes from historical bad snapshots.
+
+        This is intentionally conservative: only drops a point when both its
+        neighbours agree with each other, while the point itself is far from
+        both. Real regime moves that persist into the next point are kept.
+        Raw DB rows are unchanged.
+        """
+        if len(pts) < 3:
+            return pts
+        kept = [pts[0]]
+        for i in range(1, len(pts) - 1):
+            a = float(pts[i - 1]['equity'])
+            b = float(pts[i]['equity'])
+            c = float(pts[i + 1]['equity'])
+            base = max(abs(a), abs(c), 1.0)
+            neighbours_close = abs(a - c) / base <= 0.06
+            point_far = abs(b - a) / max(abs(a), 1.0) >= 0.08 and abs(b - c) / max(abs(c), 1.0) >= 0.08
+            if neighbours_close and point_far:
+                continue
+            kept.append(pts[i])
+        kept.append(pts[-1])
+        return kept
+
+    curves: dict[str, list[dict]] = {}
+    for name, by_bucket in bucket_values.items():
+        pts = []
+        for bk, vals in sorted(by_bucket.items()):
+            vals = sorted(vals)
+            n = len(vals)
+            if n % 2:
+                eq = vals[n // 2]
+            else:
+                eq = (vals[n // 2 - 1] + vals[n // 2]) / 2
+            pts.append({'equity': round(eq, 2), 'timestamp': _bucket_ts(bk)})
+        curves[name] = _drop_isolated_outliers(pts)
 
     first_row = await fetch_one(
         'SELECT MIN(timestamp) as ts FROM trades '
