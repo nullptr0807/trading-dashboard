@@ -107,6 +107,7 @@ async function api(path) {
 const routes = {
   '/trade': renderTradePage,
   '/backtest': renderBacktestPage,
+  '/factor-lab': renderFactorLabPage,
   '/explore': renderExplorePage,
   '/frontier': renderFrontierPage,
   '/symbols': renderSymbolsPage,
