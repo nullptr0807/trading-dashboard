@@ -118,10 +118,14 @@
               </div>
             </div>
             <div class="fl-auto-note" id="fl-auto-note"></div>
-            <div class="fl-field-row">
+            <div class="fl-field-row fl-field-row-3">
               <div class="bt-field">
                 <label>${t('fl_rebalance_days')}</label>
                 <input type="number" id="fl-rebalance-days" class="bt-input" min="1" max="60" value="1">
+              </div>
+              <div class="bt-field">
+                <label>${t('fl_hold_band_mult')}</label>
+                <input type="number" id="fl-hold-band" class="bt-input" min="1" max="10" value="3">
               </div>
               <div class="bt-field">
                 <label>${t('fl_horizon')}</label>
@@ -187,6 +191,7 @@
       document.getElementById('fl-capital').value = defaults.initial_capital || (state.market === 'CN' ? 100000 : 10000);
       document.getElementById('fl-topn').value = defaults.top_n || 5;
       document.getElementById('fl-rebalance-days').value = defaults.rebalance_days || 1;
+      document.getElementById('fl-hold-band').value = defaults.hold_band_mult || 3;
       document.getElementById('fl-cooldown').value = defaults.cooldown_days || 0;
       document.getElementById('fl-min-hold').value = defaults.min_hold_days || 0;
       const note = document.getElementById('fl-auto-note');
@@ -347,6 +352,7 @@
       top_n: parseInt(document.getElementById('fl-topn').value, 10) || 5,
       rebalance: 'daily',
       rebalance_days: parseInt(document.getElementById('fl-rebalance-days').value, 10) || 1,
+      hold_band_mult: parseInt(document.getElementById('fl-hold-band').value, 10) || 1,
       cooldown_days: parseInt(document.getElementById('fl-cooldown').value, 10) || 0,
       min_hold_days: parseInt(document.getElementById('fl-min-hold').value, 10) || 0,
       horizon: parseInt(document.getElementById('fl-horizon').value, 10) || 5,
@@ -398,7 +404,7 @@
         <div class="section-title-row">
           <div>
             <div class="section-title">${t('fl_result_title')}</div>
-            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
+            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('fl_hold_band_mult')}: ${esc(meta.hold_band_mult || 1)} (hold top ${esc(meta.hold_threshold || (meta.top_n || 0))}) · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
           </div>
         </div>
         <div class="bt-stats-grid fl-stats-grid">
@@ -410,6 +416,7 @@
           ${statBox(t('sq_win_rate'), pct((s.ic_win_rate || 0) * 100), '')}
           ${statBox(t('fl_turnover'), pct(s.avg_turnover_pct), '')}
           ${statBox(t('fl_avg_cost'), pct(s.avg_cost_pct, 3), '')}
+          ${statBox(t('fl_hysteresis_kept'), String(s.held_by_hysteresis || 0), '')}
           ${statBox(t('sq_n_days'), String(s.n_ic_days || 0), '')}
         </div>
         <div class="fl-chart-grid">

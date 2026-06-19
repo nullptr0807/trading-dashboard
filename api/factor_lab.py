@@ -35,6 +35,7 @@ class FactorLabRunRequest(BaseModel):
     top_n: int | None = Field(None, ge=1, le=500)
     rebalance: Literal["daily", "weekly", "monthly"] | None = None
     rebalance_days: int | None = Field(None, ge=1, le=60)
+    hold_band_mult: int | None = Field(None, ge=1, le=10)
     cooldown_days: int | None = Field(None, ge=0, le=60)
     min_hold_days: int | None = Field(None, ge=0, le=60)
     horizon: int = Field(5, ge=1, le=60)

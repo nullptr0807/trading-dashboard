@@ -42,6 +42,7 @@ MARKET_DEFAULTS = {
         "top_n": 5,
         "rebalance": "daily",
         "rebalance_days": 1,
+        "hold_band_mult": 3,
         "cooldown_days": 0,
         "min_hold_days": 0,
     },
@@ -50,6 +51,7 @@ MARKET_DEFAULTS = {
         "top_n": 5,
         "rebalance": "daily",
         "rebalance_days": 1,
+        "hold_band_mult": 3,
         "cooldown_days": 1,
         "min_hold_days": 1,
     },
@@ -496,6 +498,7 @@ def _run_portfolio(
     top_n: int,
     rebalance: str,
     rebalance_days: int,
+    hold_band_mult: int,
     cooldown_days: int,
     min_hold_days: int,
     market: str,
@@ -517,6 +520,7 @@ def _run_portfolio(
     cost_pcts: list[float] = []
     skipped_cooldown = 0
     skipped_min_hold = 0
+    held_by_hysteresis = 0
 
     sig_by_date = {dt: g.sort_values("signal", ascending=False) for dt, g in signal.groupby("date")}
     for idx, dt in enumerate(rb_dates):
@@ -532,14 +536,28 @@ def _run_portfolio(
             continue
 
         raw_picks = sig_by_date[dt][sig_by_date[dt]["ticker"].isin(close.columns)].copy()
-        allowed = []
-        for tkr in raw_picks["ticker"].tolist():
+        ranked_tickers = raw_picks["ticker"].tolist()
+        top_n_i = max(1, int(top_n or 20))
+        hold_mult_i = max(1, int(hold_band_mult or 1))
+        hold_n = top_n_i * hold_mult_i
+        buy_band = set(ranked_tickers[:top_n_i])
+        hold_band = set(ranked_tickers[:hold_n])
+
+        # Rank-cutoff hysteresis / no-trade band:
+        # new buys must pass the strict top-N buy band, but existing holdings
+        # are not sold until they fall outside top_N * hold_band_mult.
+        retained = [tkr for tkr in ranked_tickers if tkr in prev_w.index and tkr in hold_band]
+        held_by_hysteresis += sum(1 for tkr in retained if tkr not in buy_band)
+        allowed = list(retained)
+        for tkr in ranked_tickers:
+            if len(allowed) >= top_n_i:
+                break
+            if tkr in allowed:
+                continue
             if cooldown_until.get(tkr) and dt <= cooldown_until[tkr]:
                 skipped_cooldown += 1
                 continue
             allowed.append(tkr)
-            if len(allowed) >= max(1, int(top_n or 20)):
-                break
         target = pd.Series(1.0 / len(allowed), index=allowed, dtype=float) if allowed else pd.Series(dtype=float)
 
         if min_hold_days > 0 and len(prev_w):
@@ -622,6 +640,9 @@ def _run_portfolio(
         "avg_cost_pct": _round(float(np.mean(cost_pcts)) * 100, 4) if cost_pcts else 0,
         "skipped_cooldown": skipped_cooldown,
         "skipped_min_hold": skipped_min_hold,
+        "held_by_hysteresis": held_by_hysteresis,
+        "hold_band_mult": max(1, int(hold_band_mult or 1)),
+        "hold_threshold": max(1, int(top_n or 20)) * max(1, int(hold_band_mult or 1)),
         "cost_model": "CNCosts" if market == "CN" else "MoomooAUCosts",
     }
     return curve, period_returns, avg_turnover, latest_holdings, trades[-100:], diagnostics
@@ -644,6 +665,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     horizon = int(request.get("horizon") or 5)
     window = int(request.get("window") or 20)
     rebalance_days = int(request.get("rebalance_days") or defaults["rebalance_days"])
+    hold_band_mult = int(request.get("hold_band_mult") or defaults["hold_band_mult"])
     cooldown_days = int(request.get("cooldown_days") or defaults["cooldown_days"])
     min_hold_days = int(request.get("min_hold_days") or defaults["min_hold_days"])
     rebalance = str(request.get("rebalance") or defaults["rebalance"]).lower()
@@ -657,6 +679,8 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("top_n must be 1..500")
     if not (1 <= rebalance_days <= 60):
         raise ValueError("rebalance_days must be 1..60")
+    if not (1 <= hold_band_mult <= 10):
+        raise ValueError("hold_band_mult must be 1..10")
     if not (0 <= cooldown_days <= 60):
         raise ValueError("cooldown_days must be 0..60")
     if not (0 <= min_hold_days <= 60):
@@ -681,7 +705,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         ic_series, ic_summary, quantile_returns = _compute_ic(signal, close, horizon, window)
         equity_curve, returns, avg_turnover, latest_holdings, sample_trades, exec_diag = _run_portfolio(
             signal, close, initial_capital, top_n, rebalance, rebalance_days,
-            cooldown_days, min_hold_days, market,
+            hold_band_mult, cooldown_days, min_hold_days, market,
         )
         st = _stats(equity_curve, returns, initial_capital)
         merged_terms = [t for t in terms if len(t.periods) > 1]
@@ -691,6 +715,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "因子先做横截面 rank/z-score 后组合，避免 RSI/BETA/ROC 等尺度污染。",
             "可调周期因子按日线 OHLCV 临时计算；输入 5,10,20 会先合并同族周期，再参与总表达式。",
             f"股票池自动使用 {market} 配置宇宙（可用 {len(selected)} 支）；交易成本使用 {exec_diag.get('cost_model')} 估算。",
+            f"已应用 rank-cutoff hysteresis / no-trade band：买入阈值 top {top_n}，持有阈值 top {top_n * hold_band_mult}。",
         ]
         warnings_en: list[str] = [
             "The universe is reconstructed from current universe / prices history; it is not a fully survivorship-free database.",
@@ -698,6 +723,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "Each factor is cross-sectionally ranked/z-scored before combination to avoid RSI/BETA/ROC scale pollution.",
             "Tunable-period factors are computed on the fly from 1d OHLCV; entering 5,10,20 merges those sibling periods before the total expression.",
             f"Universe is auto-selected from the configured {market} universe ({len(selected)} usable tickers); transaction cost estimate uses {exec_diag.get('cost_model')}.",
+            f"Rank-cutoff hysteresis / no-trade band is applied: buy threshold top {top_n}, hold threshold top {top_n * hold_band_mult}.",
         ]
         if merged_terms:
             names = ", ".join(t.display_name for t in merged_terms[:4])
@@ -718,6 +744,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "avg_cost_pct": exec_diag.get("avg_cost_pct", 0),
             "skipped_cooldown": exec_diag.get("skipped_cooldown", 0),
             "skipped_min_hold": exec_diag.get("skipped_min_hold", 0),
+            "held_by_hysteresis": exec_diag.get("held_by_hysteresis", 0),
         }
         return {
             "status": "ok",
@@ -752,6 +779,8 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
                 "window": window,
                 "rebalance": rebalance,
                 "rebalance_days": rebalance_days,
+                "hold_band_mult": hold_band_mult,
+                "hold_threshold": top_n * hold_band_mult,
                 "cooldown_days": cooldown_days,
                 "min_hold_days": min_hold_days,
                 "cost_model": exec_diag.get("cost_model"),

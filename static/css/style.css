@@ -2151,6 +2151,7 @@ body::after {
   margin: 2px 0 12px;
 }
 .fl-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.fl-field-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 .fl-term-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
 .fl-mini-title { font-size: 16px; margin-bottom: 0; }
 .fl-small-btn { padding: 7px 10px; font-size: 12px; }
