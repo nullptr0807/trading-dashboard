@@ -1,7 +1,9 @@
 // trade.js — main trading overview page
 
-async function renderTradePage() {
+async function renderTradePage(routeToken) {
   const app = document.getElementById('app');
+  const routeOk = () => typeof isRouteCurrent !== 'function' || isRouteCurrent(routeToken, '/trade');
+  if (!routeOk()) return;
   app.innerHTML = createSkeleton();
 
   // Pre-load ticker name map for current market so first paint of trades/holdings
@@ -10,20 +12,25 @@ async function renderTradePage() {
 
   try {
     const summary = await api('/trade/summary');
+    if (!routeOk()) return;
     renderHero(summary);
   } catch (e) {
+    if (!routeOk()) return;
     renderHeroFallback();
   }
 
   try {
     const eqData = await api('/trade/equity-curves');
+    if (!routeOk()) return;
     renderEquityCurves(eqData);
   } catch (e) {
+    if (!routeOk()) return;
     document.querySelector('.chart-section')?.remove();
   }
 
   try {
     const accounts = await api('/trade/accounts');
+    if (!routeOk()) return;
     renderAccountCards(accounts);
   } catch (e) {
     console.warn('Failed to load accounts', e);

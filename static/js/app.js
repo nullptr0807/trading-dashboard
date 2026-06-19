@@ -114,9 +114,27 @@ const routes = {
   '/intro': renderIntroPage,
 };
 
+let _navSeq = 0;
+let _navTimer = null;
+
+function routeKeyFromHash(hash) {
+  if (!hash || hash === '/') return '/trade';
+  if (hash.match(/^\/explore\/(.+)$/)) return '/explore';
+  if (hash.match(/^\/frontier\/(.+)$/)) return '/frontier';
+  if (hash.match(/^\/symbols\/(.+)$/)) return '/symbols';
+  return hash || '/trade';
+}
+
+function isRouteCurrent(token, expectedKey) {
+  const currentHash = location.hash.replace('#', '') || '/trade';
+  return token === _navSeq && routeKeyFromHash(currentHash) === expectedKey;
+}
+
 function navigate() {
   const hash = location.hash.replace('#', '') || '/trade';
   const app = document.getElementById('app');
+  const token = ++_navSeq;
+  window.__activeRouteToken = token;
 
   // Detect explore post: #/explore/<slug>
   const exploreMatch = hash.match(/^\/explore\/(.+)$/);
@@ -124,33 +142,33 @@ function navigate() {
   const frontierMatch = hash.match(/^\/frontier\/(.+)$/);
   // Detect symbol detail: #/symbols/<ticker>
   const symbolMatch = hash.match(/^\/symbols\/(.+)$/);
-  const navKey = exploreMatch ? '/explore'
-    : (frontierMatch ? '/frontier'
-    : (symbolMatch ? '/symbols' : hash));
+  const navKey = routeKeyFromHash(hash);
 
   document.querySelectorAll('.nav-link').forEach(link => {
     link.classList.toggle('active', link.getAttribute('href') === '#' + navKey);
   });
 
+  if (_navTimer) clearTimeout(_navTimer);
   app.classList.add('fade-out');
-  setTimeout(() => {
+  _navTimer = setTimeout(() => {
+    if (token !== _navSeq) return;  // A newer navigation won the race.
     app.classList.remove('fade-out');
     app.classList.add('fade-in');
     if (exploreMatch) {
-      renderExplorePost(decodeURIComponent(exploreMatch[1]));
+      renderExplorePost(decodeURIComponent(exploreMatch[1]), token);
       return;
     }
     if (frontierMatch) {
-      renderFrontierPost(decodeURIComponent(frontierMatch[1]));
+      renderFrontierPost(decodeURIComponent(frontierMatch[1]), token);
       return;
     }
     if (symbolMatch) {
-      renderSymbolDetail(decodeURIComponent(symbolMatch[1]));
+      renderSymbolDetail(decodeURIComponent(symbolMatch[1]), token);
       return;
     }
     const handler = routes[hash];
-    if (handler) handler();
-    else renderTradePage();
+    if (handler) handler(token);
+    else renderTradePage(token);
   }, 200);
 }
 
