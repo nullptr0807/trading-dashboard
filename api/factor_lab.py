@@ -18,6 +18,8 @@ class FactorTermRequest(BaseModel):
     factor: str
     weight: float = Field(1.0, ge=-100, le=100)
     transform: Literal["rank", "zscore"] = "rank"
+    period: int | None = Field(None, ge=1, le=252)
+    periods: list[int] | None = None
 
 
 class FactorExpressionRequest(BaseModel):
@@ -81,10 +83,10 @@ async def factor_lab_catalog(market: str = Query("US")):
             "window": 20,
             "sample_expression": {
                 "terms": [
-                    {"factor": "ROC_20", "weight": 0.4, "transform": "rank"},
-                    {"factor": "MA_RATIO_20", "weight": 0.3, "transform": "rank"},
-                    {"factor": "RSI_14", "weight": -0.2, "transform": "rank"},
-                    {"factor": "VSTD_20", "weight": 0.1, "transform": "rank"},
+                    {"factor": "ROC", "periods": [5, 10, 20], "weight": 0.4, "transform": "rank"},
+                    {"factor": "MA_RATIO", "period": 20, "weight": 0.3, "transform": "rank"},
+                    {"factor": "RSI", "period": 14, "weight": -0.2, "transform": "rank"},
+                    {"factor": "VSTD", "period": 20, "weight": 0.1, "transform": "rank"},
                 ],
                 "final_transform": "rank",
             },

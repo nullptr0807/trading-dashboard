@@ -39,17 +39,38 @@
 
   function defaultTerms() {
     return [
-      { factor: 'ROC_20', weight: 0.4, transform: 'rank' },
-      { factor: 'MA_RATIO_20', weight: 0.3, transform: 'rank' },
-      { factor: 'RSI_14', weight: -0.2, transform: 'rank' },
-      { factor: 'VSTD_20', weight: 0.1, transform: 'rank' },
+      { factor: 'ROC', periods: [5, 10, 20], weight: 0.4, transform: 'rank' },
+      { factor: 'MA_RATIO', periods: [20], weight: 0.3, transform: 'rank' },
+      { factor: 'RSI', periods: [14], weight: -0.2, transform: 'rank' },
+      { factor: 'VSTD', periods: [20], weight: 0.1, transform: 'rank' },
     ];
+  }
+
+  function parseLegacyFactorName(name) {
+    const s = String(name || '').toUpperCase();
+    const bases = ['MA_RATIO', 'BBPOS', 'BETA', 'VMOM', 'VSTD', 'STD', 'ROC', 'RSI', 'RSV'];
+    for (const base of bases) {
+      const p = base + '_';
+      if (s.startsWith(p)) {
+        const n = parseInt(s.slice(p.length), 10);
+        if (Number.isFinite(n)) return { factor: base, periods: [n] };
+      }
+    }
+    return { factor: s, periods: [] };
+  }
+
+  function normalizeTerm(t) {
+    const parsed = parseLegacyFactorName(t.factor);
+    const factor = parsed.factor;
+    let periods = Array.isArray(t.periods) ? t.periods : (t.period != null ? [t.period] : parsed.periods);
+    periods = (periods || []).map(x => parseInt(x, 10)).filter(x => Number.isFinite(x) && x >= 1 && x <= 252);
+    return { factor, periods, weight: Number(t.weight || 0), transform: t.transform || 'rank' };
   }
 
   function loadSavedTerms() {
     try {
       const raw = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
-      if (Array.isArray(raw) && raw.length) return raw;
+      if (Array.isArray(raw) && raw.length) return raw.map(normalizeTerm);
     } catch (e) { /* noop */ }
     return defaultTerms();
   }
@@ -185,7 +206,7 @@
 
   function bindStaticControls() {
     document.getElementById('fl-add-term').addEventListener('click', () => {
-      _state.terms.push({ factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC_20', weight: 1, transform: 'rank' });
+      _state.terms.push({ factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC', periods: [((_state.catalog[0] && _state.catalog[0].default_period) || 20)], weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
     });
@@ -199,32 +220,66 @@
     search.addEventListener('input', paintCatalog);
   }
 
+  function isTunable(factor) {
+    const item = catalogByName()[factor];
+    return item && item.kind === 'tunable';
+  }
+
+  function periodText(term) {
+    return (term.periods && term.periods.length) ? term.periods.join(',') : '';
+  }
+
+  function parsePeriodText(s) {
+    return String(s || '').replace(/;/g, ',').replace(/\s+/g, ',').split(',')
+      .map(x => parseInt(x, 10)).filter(x => Number.isFinite(x) && x >= 1 && x <= 252)
+      .filter((x, i, arr) => arr.indexOf(x) === i);
+  }
+
   function paintTerms() {
     const host = document.getElementById('fl-terms');
-    const opts = (_state.catalog.length ? _state.catalog : defaultTerms().map(t => ({ name: t.factor })))
+    const opts = (_state.catalog.length ? _state.catalog : defaultTerms().map(t => ({ name: t.factor, kind: 'tunable' })))
       .map(f => `<option value="${esc(f.name)}">${esc(f.name)}${f.label_zh ? ' · ' + esc(pickFactorLabel(f)) : ''}</option>`).join('');
-    host.innerHTML = _state.terms.map((term, i) => `
+    host.innerHTML = _state.terms.map((term, i) => {
+      const tunable = isTunable(term.factor) || (term.periods && term.periods.length);
+      return `
       <div class="fl-term-row" data-idx="${i}">
         <select class="bt-input fl-term-factor" data-field="factor">${opts}</select>
+        <input type="text" class="bt-input fl-term-periods" data-field="periods" value="${esc(periodText(term))}" placeholder="${t('fl_periods_ph')}" ${tunable ? '' : 'disabled'}>
         <input type="number" class="bt-input fl-term-weight" data-field="weight" step="0.1" value="${Number(term.weight || 0)}">
         <select class="bt-input fl-term-transform" data-field="transform">
           <option value="rank">rank</option>
           <option value="zscore">zscore</option>
         </select>
         <button class="fl-term-remove" title="${t('fl_remove')}">×</button>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
     host.querySelectorAll('.fl-term-row').forEach(row => {
       const idx = parseInt(row.dataset.idx, 10);
       const f = row.querySelector('[data-field="factor"]');
+      const p = row.querySelector('[data-field="periods"]');
       const w = row.querySelector('[data-field="weight"]');
       const tr = row.querySelector('[data-field="transform"]');
       f.value = _state.terms[idx].factor;
       tr.value = _state.terms[idx].transform || 'rank';
-      [f, w, tr].forEach(el => el.addEventListener('change', () => {
-        _state.terms[idx] = { factor: f.value, weight: parseFloat(w.value) || 0, transform: tr.value };
+      const update = () => {
+        const selected = f.value;
+        const cat = catalogByName()[selected] || {};
+        const periods = cat.kind === 'tunable' ? (parsePeriodText(p.value).length ? parsePeriodText(p.value) : [cat.default_period || 20]) : [];
+        _state.terms[idx] = { factor: selected, periods, weight: parseFloat(w.value) || 0, transform: tr.value };
         saveTerms();
-      }));
+      };
+      f.addEventListener('change', () => {
+        const cat = catalogByName()[f.value] || {};
+        p.disabled = cat.kind !== 'tunable';
+        if (cat.kind === 'tunable' && !p.value) p.value = String(cat.default_period || 20);
+        if (cat.kind !== 'tunable') p.value = '';
+        update();
+        paintTerms();
+      });
+      [p, w, tr].forEach(el => {
+        el.addEventListener('change', update);
+        el.addEventListener('input', update);
+      });
       row.querySelector('.fl-term-remove').addEventListener('click', () => {
         _state.terms.splice(idx, 1);
         saveTerms();
@@ -255,11 +310,12 @@
         <div class="fl-factor-grid">
           ${xs.map(x => {
             const cov = x.coverage || {};
-            return `<button class="fl-factor-chip" data-factor="${esc(x.name)}">
-              <span class="fl-factor-name">${esc(x.name)}</span>
+            const presets = (x.period_presets || []).slice(0, 7).join('/');
+            return `<button class="fl-factor-chip" data-factor="${esc(x.name)}" data-period="${esc(x.default_period || '')}">
+              <span class="fl-factor-name">${esc(x.name)}${x.kind === 'tunable' ? '_N' : ''}</span>
               <span class="fl-factor-label">${esc(pickFactorLabel(x))}</span>
               <span class="fl-factor-desc">${esc(pickFactorDesc(x))}</span>
-              <span class="fl-factor-cov">${esc(cov.min_date || '—')} → ${esc(cov.max_date || '—')}</span>
+              <span class="fl-factor-cov">${x.kind === 'tunable' ? `${t('fl_periods')}: ${esc(presets)}` : `${esc(cov.min_date || '—')} → ${esc(cov.max_date || '—')}`}</span>
             </button>`;
           }).join('')}
         </div>
@@ -267,7 +323,8 @@
     `).join('');
     host.querySelectorAll('.fl-factor-chip').forEach(btn => {
       btn.addEventListener('click', () => {
-        _state.terms.push({ factor: btn.dataset.factor, weight: 1, transform: 'rank' });
+        const item = catalogByName()[btn.dataset.factor] || {};
+        _state.terms.push({ factor: btn.dataset.factor, periods: item.kind === 'tunable' ? [item.default_period || 20] : [], weight: 1, transform: 'rank' });
         saveTerms();
         paintTerms();
       });
@@ -288,7 +345,7 @@
       rebalance: document.getElementById('fl-rebalance').value,
       horizon: parseInt(document.getElementById('fl-horizon').value, 10) || 5,
       window: 20,
-      expression: { terms: _state.terms.filter(t => t.factor && Number(t.weight) !== 0), final_transform: 'rank' },
+      expression: { terms: _state.terms.map(normalizeTerm).filter(t => t.factor && Number(t.weight) !== 0), final_transform: 'rank' },
     };
     if (!body.start_date || !body.end_date) { alert(t('bt_pick_dates')); return; }
     if (!body.expression.terms.length) { alert(t('fl_need_factor')); return; }

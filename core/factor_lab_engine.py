@@ -1,9 +1,9 @@
 """Ad-hoc Alpha158 factor laboratory engine.
 
-This module is deliberately account-free: it reads persisted Alpha158 building
-blocks from the shared trading.db, builds a temporary cross-sectional score, and
-runs cheap vectorized diagnostics/backtests. It never creates accounts and never
-writes to the database.
+Account-free research workbench: read 1d OHLCV from the shared trading.db,
+compute temporary Alpha158-style factors (including arbitrary lookback periods),
+and run look-ahead-safe IC + simplified top-N portfolio diagnostics. It never
+creates accounts and never writes to the database.
 """
 from __future__ import annotations
 
@@ -19,56 +19,56 @@ import pandas as pd
 from core.db import DB_PATH
 
 
-ALPHA158_FACTORS: list[dict[str, str]] = [
-    # KBAR / candlestick shape
-    {"name": "KMID", "family": "kbar", "label_zh": "实体涨跌幅", "label_en": "Candle body return", "description_zh": "收盘价相对开盘价的位置。", "description_en": "Close relative to open."},
-    {"name": "KLEN", "family": "kbar", "label_zh": "全振幅", "label_en": "Full candle range", "description_zh": "最高价到最低价相对开盘价的振幅。", "description_en": "High-low range relative to open."},
-    {"name": "KMID2", "family": "kbar", "label_zh": "实体/振幅", "label_en": "Body over range", "description_zh": "实体长度占当日高低振幅的比例。", "description_en": "Candle body divided by high-low range."},
-    {"name": "KUP", "family": "kbar", "label_zh": "上影线", "label_en": "Upper shadow", "description_zh": "上影线相对开盘价的长度。", "description_en": "Upper shadow relative to open."},
-    {"name": "KUP2", "family": "kbar", "label_zh": "上影线/振幅", "label_en": "Upper shadow over range", "description_zh": "上影线占当日振幅比例。", "description_en": "Upper shadow divided by high-low range."},
-    {"name": "KLOW", "family": "kbar", "label_zh": "下影线", "label_en": "Lower shadow", "description_zh": "下影线相对开盘价的长度。", "description_en": "Lower shadow relative to open."},
-    {"name": "KLOW2", "family": "kbar", "label_zh": "下影线/振幅", "label_en": "Lower shadow over range", "description_zh": "下影线占当日振幅比例。", "description_en": "Lower shadow divided by high-low range."},
-    {"name": "KSFT", "family": "kbar", "label_zh": "价格重心偏移", "label_en": "Candle shift", "description_zh": "收盘价相对高低区间中点的偏移。", "description_en": "Close relative to the high-low midpoint."},
-    {"name": "KSFT2", "family": "kbar", "label_zh": "价格重心偏移/振幅", "label_en": "Shift over range", "description_zh": "价格重心偏移占当日振幅比例。", "description_en": "Candle shift divided by range."},
-    # momentum
-    {"name": "ROC_5", "family": "momentum", "label_zh": "5日动量", "label_en": "5D return momentum", "description_zh": "过去5个交易日涨跌幅。", "description_en": "Return over the past 5 trading days."},
-    {"name": "ROC_10", "family": "momentum", "label_zh": "10日动量", "label_en": "10D return momentum", "description_zh": "过去10个交易日涨跌幅。", "description_en": "Return over the past 10 trading days."},
-    {"name": "ROC_20", "family": "momentum", "label_zh": "20日动量", "label_en": "20D return momentum", "description_zh": "过去20个交易日涨跌幅。", "description_en": "Return over the past 20 trading days."},
-    {"name": "MA_RATIO_5", "family": "trend", "label_zh": "5日均线比", "label_en": "Price / 5D MA", "description_zh": "收盘价相对5日均线的位置。", "description_en": "Close price relative to its 5-day moving average."},
-    {"name": "MA_RATIO_10", "family": "trend", "label_zh": "10日均线比", "label_en": "Price / 10D MA", "description_zh": "收盘价相对10日均线的位置。", "description_en": "Close price relative to its 10-day moving average."},
-    {"name": "MA_RATIO_20", "family": "trend", "label_zh": "20日均线比", "label_en": "Price / 20D MA", "description_zh": "收盘价相对20日均线的位置。", "description_en": "Close price relative to its 20-day moving average."},
-    # volume
-    {"name": "VMOM_5", "family": "volume", "label_zh": "5日量能比", "label_en": "Volume / 5D avg", "description_zh": "成交量相对5日均量。", "description_en": "Volume relative to 5-day average volume."},
-    {"name": "VMOM_10", "family": "volume", "label_zh": "10日量能比", "label_en": "Volume / 10D avg", "description_zh": "成交量相对10日均量。", "description_en": "Volume relative to 10-day average volume."},
-    {"name": "VMOM_20", "family": "volume", "label_zh": "20日量能比", "label_en": "Volume / 20D avg", "description_zh": "成交量相对20日均量。", "description_en": "Volume relative to 20-day average volume."},
-    {"name": "VSTD_5", "family": "volume", "label_zh": "5日成交量波动", "label_en": "5D volume volatility", "description_zh": "5日成交量标准差 / 均量。", "description_en": "5-day volume standard deviation divided by mean volume."},
-    {"name": "VSTD_10", "family": "volume", "label_zh": "10日成交量波动", "label_en": "10D volume volatility", "description_zh": "10日成交量标准差 / 均量。", "description_en": "10-day volume standard deviation divided by mean volume."},
-    {"name": "VSTD_20", "family": "volume", "label_zh": "20日成交量波动", "label_en": "20D volume volatility", "description_zh": "20日成交量标准差 / 均量。", "description_en": "20-day volume standard deviation divided by mean volume."},
-    # volatility
-    {"name": "STD_5", "family": "volatility", "label_zh": "5日价格波动", "label_en": "5D price volatility", "description_zh": "5日收盘价标准差 / 收盘价。", "description_en": "5-day close-price standard deviation divided by close."},
-    {"name": "STD_10", "family": "volatility", "label_zh": "10日价格波动", "label_en": "10D price volatility", "description_zh": "10日收盘价标准差 / 收盘价。", "description_en": "10-day close-price standard deviation divided by close."},
-    {"name": "STD_20", "family": "volatility", "label_zh": "20日价格波动", "label_en": "20D price volatility", "description_zh": "20日收盘价标准差 / 收盘价。", "description_en": "20-day close-price standard deviation divided by close."},
-    {"name": "BBPOS_5", "family": "volatility", "label_zh": "5日布林位置", "label_en": "5D Bollinger position", "description_zh": "价格在5日均线±2倍标准差通道中的位置。", "description_en": "Close location inside the 5-day Bollinger band."},
-    {"name": "BBPOS_10", "family": "volatility", "label_zh": "10日布林位置", "label_en": "10D Bollinger position", "description_zh": "价格在10日均线±2倍标准差通道中的位置。", "description_en": "Close location inside the 10-day Bollinger band."},
-    {"name": "BBPOS_20", "family": "volatility", "label_zh": "20日布林位置", "label_en": "20D Bollinger position", "description_zh": "价格在20日均线±2倍标准差通道中的位置。", "description_en": "Close location inside the 20-day Bollinger band."},
-    # reversion/trend
-    {"name": "RSV", "family": "mean_reversion", "label_zh": "9日随机值", "label_en": "9D stochastic RSV", "description_zh": "收盘价在9日高低区间中的百分位。", "description_en": "Close percentile inside the 9-day high-low range."},
-    {"name": "RSI_14", "family": "mean_reversion", "label_zh": "14日RSI", "label_en": "14D RSI", "description_zh": "经典超买/超卖相对强弱指标。", "description_en": "Classic relative-strength overbought/oversold oscillator."},
-    {"name": "BETA_5", "family": "trend", "label_zh": "5日趋势斜率", "label_en": "5D trend slope", "description_zh": "5日价格滚动回归斜率。", "description_en": "Rolling 5-day price regression slope."},
-    {"name": "BETA_10", "family": "trend", "label_zh": "10日趋势斜率", "label_en": "10D trend slope", "description_zh": "10日价格滚动回归斜率。", "description_en": "Rolling 10-day price regression slope."},
-    {"name": "BETA_20", "family": "trend", "label_zh": "20日趋势斜率", "label_en": "20D trend slope", "description_zh": "20日价格滚动回归斜率。", "description_en": "Rolling 20-day price regression slope."},
+# Catalog is intentionally base-factor oriented. Tunable families (ROC, BETA,
+# etc.) accept arbitrary periods such as 7/11, so we do not enumerate only
+# Alpha158's historical 5/10/20 variants in the UI.
+FACTOR_CATALOG: list[dict[str, Any]] = [
+    {"name": "KMID", "kind": "fixed", "family": "kbar", "label_zh": "实体涨跌幅", "label_en": "Candle body return", "description_zh": "收盘价相对开盘价的位置。", "description_en": "Close relative to open."},
+    {"name": "KLEN", "kind": "fixed", "family": "kbar", "label_zh": "全振幅", "label_en": "Full candle range", "description_zh": "最高价到最低价相对开盘价的振幅。", "description_en": "High-low range relative to open."},
+    {"name": "KMID2", "kind": "fixed", "family": "kbar", "label_zh": "实体/振幅", "label_en": "Body over range", "description_zh": "实体长度占当日高低振幅的比例。", "description_en": "Candle body divided by high-low range."},
+    {"name": "KUP", "kind": "fixed", "family": "kbar", "label_zh": "上影线", "label_en": "Upper shadow", "description_zh": "上影线相对开盘价的长度。", "description_en": "Upper shadow relative to open."},
+    {"name": "KUP2", "kind": "fixed", "family": "kbar", "label_zh": "上影线/振幅", "label_en": "Upper shadow over range", "description_zh": "上影线占当日振幅比例。", "description_en": "Upper shadow divided by high-low range."},
+    {"name": "KLOW", "kind": "fixed", "family": "kbar", "label_zh": "下影线", "label_en": "Lower shadow", "description_zh": "下影线相对开盘价的长度。", "description_en": "Lower shadow relative to open."},
+    {"name": "KLOW2", "kind": "fixed", "family": "kbar", "label_zh": "下影线/振幅", "label_en": "Lower shadow over range", "description_zh": "下影线占当日振幅比例。", "description_en": "Lower shadow divided by high-low range."},
+    {"name": "KSFT", "kind": "fixed", "family": "kbar", "label_zh": "价格重心偏移", "label_en": "Candle shift", "description_zh": "收盘价相对高低区间中点的偏移。", "description_en": "Close relative to the high-low midpoint."},
+    {"name": "KSFT2", "kind": "fixed", "family": "kbar", "label_zh": "价格重心偏移/振幅", "label_en": "Shift over range", "description_zh": "价格重心偏移占当日振幅比例。", "description_en": "Candle shift divided by range."},
+    {"name": "ROC", "kind": "tunable", "family": "momentum", "default_period": 20, "period_presets": [1, 5, 7, 10, 11, 20, 60], "label_zh": "N日动量", "label_en": "N-day return momentum", "description_zh": "过去N个交易日涨跌幅；可输入 7、11 或 5,10,20 合并。", "description_en": "Return over the past N trading days; enter 7/11 or merge 5,10,20."},
+    {"name": "MA_RATIO", "kind": "tunable", "family": "trend", "default_period": 20, "period_presets": [3, 5, 7, 10, 11, 20, 60], "label_zh": "价格/N日均线", "label_en": "Price / N-day MA", "description_zh": "收盘价相对N日均线的位置。", "description_en": "Close price relative to its N-day moving average."},
+    {"name": "VMOM", "kind": "tunable", "family": "volume", "default_period": 20, "period_presets": [3, 5, 7, 10, 20, 60], "label_zh": "N日量能比", "label_en": "Volume / N-day avg", "description_zh": "成交量相对N日均量。", "description_en": "Volume relative to N-day average volume."},
+    {"name": "VSTD", "kind": "tunable", "family": "volume", "default_period": 20, "period_presets": [5, 7, 10, 20, 60], "label_zh": "N日成交量波动", "label_en": "N-day volume volatility", "description_zh": "N日成交量标准差 / 均量。", "description_en": "N-day volume standard deviation divided by mean volume."},
+    {"name": "STD", "kind": "tunable", "family": "volatility", "default_period": 20, "period_presets": [5, 7, 10, 20, 60], "label_zh": "N日价格波动", "label_en": "N-day price volatility", "description_zh": "N日收盘价标准差 / 收盘价。", "description_en": "N-day close-price standard deviation divided by close."},
+    {"name": "BBPOS", "kind": "tunable", "family": "volatility", "default_period": 20, "period_presets": [5, 7, 10, 20, 60], "label_zh": "N日布林位置", "label_en": "N-day Bollinger position", "description_zh": "价格在N日均线±2倍标准差通道中的位置。", "description_en": "Close location inside the N-day Bollinger band."},
+    {"name": "BETA", "kind": "tunable", "family": "trend", "default_period": 20, "period_presets": [5, 7, 10, 11, 20, 60], "label_zh": "N日趋势斜率", "label_en": "N-day trend slope", "description_zh": "N日价格滚动回归斜率。", "description_en": "Rolling N-day price regression slope."},
+    {"name": "RSV", "kind": "tunable", "family": "mean_reversion", "default_period": 9, "period_presets": [5, 7, 9, 14, 20], "label_zh": "N日随机值", "label_en": "N-day stochastic RSV", "description_zh": "收盘价在N日高低区间中的百分位。", "description_en": "Close percentile inside the N-day high-low range."},
+    {"name": "RSI", "kind": "tunable", "family": "mean_reversion", "default_period": 14, "period_presets": [5, 7, 10, 14, 20], "label_zh": "N日RSI", "label_en": "N-day RSI", "description_zh": "经典超买/超卖相对强弱指标，周期可调。", "description_en": "Classic relative-strength oscillator with tunable period."},
 ]
 
-_VALID_FACTORS = {f["name"] for f in ALPHA158_FACTORS}
+ALPHA158_FACTORS = FACTOR_CATALOG  # backwards-compatible import name
+_FIXED_FACTORS = {f["name"] for f in FACTOR_CATALOG if f["kind"] == "fixed"}
+_TUNABLE_FACTORS = {f["name"] for f in FACTOR_CATALOG if f["kind"] == "tunable"}
+_CATALOG_BY_NAME = {f["name"]: f for f in FACTOR_CATALOG}
+_VALID_FACTORS = _FIXED_FACTORS | _TUNABLE_FACTORS
 _VALID_TRANSFORMS = {"rank", "zscore"}
 _VALID_REBALANCE = {"daily", "weekly", "monthly"}
+_MIN_PERIOD = 1
+_MAX_PERIOD = 252
 
 
 @dataclass(frozen=True)
 class FactorTerm:
     factor: str
+    periods: tuple[int, ...]
     weight: float = 1.0
     transform: str = "rank"
+
+    @property
+    def display_name(self) -> str:
+        if not self.periods:
+            return self.factor
+        if len(self.periods) == 1:
+            return f"{self.factor}_{self.periods[0]}"
+        joined = ",".join(str(p) for p in self.periods)
+        return f"{self.factor}[{joined}]"
 
 
 def _round(v: Any, nd: int = 4):
@@ -80,32 +80,83 @@ def _round(v: Any, nd: int = 4):
         return None
 
 
-def _market_mask(s: pd.Series, market: str) -> pd.Series:
-    is_cn = s.astype(str).str.match(r"^\d{6}\.(SH|SZ)$", na=False)
-    return is_cn if market == "CN" else ~is_cn
+def _market_predicate_sql(market: str) -> tuple[str, tuple[str]]:
+    pred = "ticker GLOB ?" if market == "CN" else "ticker NOT GLOB ?"
+    return pred, ('[0-9][0-9][0-9][0-9][0-9][0-9].S[HZ]',)
+
+
+def _parse_factor_name(raw: str) -> tuple[str, int | None]:
+    s = str(raw or "").strip().upper()
+    if s in _VALID_FACTORS:
+        return s, None
+    for base in sorted(_TUNABLE_FACTORS, key=len, reverse=True):
+        prefix = base + "_"
+        if s.startswith(prefix):
+            tail = s[len(prefix):]
+            if tail.isdigit():
+                return base, int(tail)
+    raise ValueError(f"unsupported factor: {s or '?'}")
+
+
+def _parse_periods(item: dict[str, Any], base: str, parsed_period: int | None) -> tuple[int, ...]:
+    if base in _FIXED_FACTORS:
+        return ()
+    raw_periods = item.get("periods")
+    vals: list[int] = []
+    if isinstance(raw_periods, str):
+        for part in raw_periods.replace(";", ",").replace(" ", ",").split(","):
+            if part.strip():
+                vals.append(int(part.strip()))
+    elif isinstance(raw_periods, (list, tuple)):
+        for x in raw_periods:
+            vals.append(int(x))
+    elif raw_periods is not None:
+        vals.append(int(raw_periods))
+    elif item.get("period") is not None:
+        vals.append(int(str(item.get("period"))))
+    elif parsed_period is not None:
+        vals.append(int(parsed_period))
+    else:
+        vals.append(int(_CATALOG_BY_NAME[base].get("default_period") or 20))
+
+    out: list[int] = []
+    for p in vals:
+        if not (_MIN_PERIOD <= p <= _MAX_PERIOD):
+            raise ValueError(f"period for {base} must be {_MIN_PERIOD}..{_MAX_PERIOD}: {p}")
+        if base == "BETA" and p < 2:
+            raise ValueError("BETA period must be >= 2")
+        if p not in out:
+            out.append(p)
+    if not out:
+        raise ValueError(f"{base} needs at least one period")
+    return tuple(out)
 
 
 def _normalise_terms(raw_terms: list[dict[str, Any]]) -> list[FactorTerm]:
     terms: list[FactorTerm] = []
     for item in raw_terms or []:
-        factor = str(item.get("factor") or "").strip().upper()
-        if factor not in _VALID_FACTORS:
-            raise ValueError(f"unsupported Alpha158 factor: {factor or '?'}")
+        base, parsed_period = _parse_factor_name(str(item.get("factor") or ""))
         try:
             weight = float(item.get("weight", 1.0))
         except Exception as exc:
-            raise ValueError(f"invalid weight for {factor}") from exc
+            raise ValueError(f"invalid weight for {base}") from exc
         if not math.isfinite(weight) or abs(weight) > 100:
-            raise ValueError(f"invalid weight for {factor}")
+            raise ValueError(f"invalid weight for {base}")
         if abs(weight) < 1e-12:
             continue
         transform = str(item.get("transform") or "rank").strip().lower()
         if transform not in _VALID_TRANSFORMS:
-            raise ValueError(f"unsupported transform for {factor}: {transform}")
-        terms.append(FactorTerm(factor=factor, weight=weight, transform=transform))
+            raise ValueError(f"unsupported transform for {base}: {transform}")
+        periods = _parse_periods(item, base, parsed_period)
+        terms.append(FactorTerm(factor=base, periods=periods, weight=weight, transform=transform))
     if not terms:
         raise ValueError("expression must contain at least one non-zero factor term")
     return terms
+
+
+def _max_period(terms: list[FactorTerm]) -> int:
+    vals = [p for t in terms for p in t.periods]
+    return max(vals or [1])
 
 
 def _freq_mask(dates: pd.Index, rebalance: str) -> list[str]:
@@ -144,7 +195,6 @@ def _stats(equity_curve: list[dict[str, Any]], returns: list[float], initial_cap
     ret = pd.Series(returns, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
     sharpe = float("nan")
     if len(ret) > 1 and ret.std() > 0:
-        # Rebalance-period Sharpe; good enough for lab diagnostics.
         sharpe = float(ret.mean() / ret.std() * math.sqrt(len(ret) / max(days / 365, 1 / 365))) if days > 0 else float(ret.mean() / ret.std() * math.sqrt(252))
     return {
         "final_equity": _round(final_equity, 2),
@@ -157,93 +207,152 @@ def _stats(equity_curve: list[dict[str, Any]], returns: list[float], initial_cap
     }
 
 
-def _load_data(con: sqlite3.Connection, terms: list[FactorTerm], market: str, start_date: str, end_date: str):
-    names = sorted({t.factor for t in terms})
-    placeholders = ",".join(["?"] * len(names))
-    fv = pd.read_sql_query(
-        f"""
-        SELECT ticker, date, factor_name, value
-        FROM factor_values
-        WHERE factor_group = 'alpha158'
-          AND factor_name IN ({placeholders})
-          AND date BETWEEN ? AND ?
-        ORDER BY date, ticker, factor_name
-        """,
-        con,
-        params=[*names, start_date, end_date],
-    )
-    if fv.empty:
-        raise ValueError("no Alpha158 factor_values in the requested date range")
-    fv = fv[_market_mask(fv["ticker"], market)].dropna(subset=["value"]).copy()
-    if fv.empty:
-        raise ValueError(f"no {market} factor rows in requested date range")
-
-    tickers = sorted(fv["ticker"].unique().tolist())
-    placeholders = ",".join(["?"] * len(tickers))
+def _load_ohlcv(con: sqlite3.Connection, market: str, start_date: str, end_date: str, max_period: int):
+    pred, params = _market_predicate_sql(market)
+    warmup_days = max(120, max_period * 3 + 10)
     prices = pd.read_sql_query(
         f"""
-        SELECT ticker, datetime, close, volume
+        SELECT ticker, datetime, open, high, low, close, volume
         FROM prices
         WHERE interval = '1d'
-          AND ticker IN ({placeholders})
-          AND date(datetime) BETWEEN date(?, '-120 day') AND date(?, '+90 day')
+          AND {pred}
+          AND date(datetime) BETWEEN date(?, '-{warmup_days} day') AND date(?, '+90 day')
         ORDER BY ticker, datetime
         """,
         con,
-        params=[*tickers, start_date, end_date],
+        params=[*params, start_date, end_date],
     )
     if prices.empty:
-        raise ValueError("no 1d prices for selected factor universe")
+        raise ValueError(f"no {market} 1d OHLCV prices in requested date range")
     prices["date"] = pd.to_datetime(prices["datetime"]).dt.strftime("%Y-%m-%d")
     prices = prices.dropna(subset=["close"])
-    close = prices.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
-    volume = prices.pivot_table(index="date", columns="ticker", values="volume", aggfunc="last").sort_index()
-    return fv, close, volume
+    matrices = {
+        col: prices.pivot_table(index="date", columns="ticker", values=col, aggfunc="last").sort_index()
+        for col in ["open", "high", "low", "close", "volume"]
+    }
+    return matrices
 
 
-def _select_universe(fv: pd.DataFrame, close: pd.DataFrame, volume: pd.DataFrame, universe_size: int, start_date: str) -> tuple[list[str], pd.Series]:
-    candidates = sorted(set(fv["ticker"].unique()).intersection(close.columns))
+def _select_universe(close: pd.DataFrame, volume: pd.DataFrame, universe_size: int, start_date: str) -> tuple[list[str], pd.Series]:
+    candidates = sorted(close.columns.tolist())
     if not candidates:
-        raise ValueError("factor rows and prices have no ticker overlap")
-    # Avoid a subtle look-ahead: prices are loaded beyond end_date so IC can
-    # evaluate future returns, but universe selection must not use those future
-    # bars. Rank by ADV over the 60 trading days ending at/before start_date.
+        raise ValueError("price matrix has no tickers")
+    # Avoid look-ahead: prices are loaded beyond end_date for forward-return
+    # evaluation, but universe selection uses only bars at/before start_date.
     hist_close = close.loc[close.index <= start_date, candidates].tail(60)
     hist_volume = volume.reindex(close.index).loc[close.index <= start_date, candidates].tail(60)
-    if hist_close.empty or hist_volume.empty:
-        hist_close = close.loc[close.index <= start_date, candidates]
-        hist_volume = volume.reindex(close.index).loc[close.index <= start_date, candidates]
     dvol = (hist_close * hist_volume).replace([np.inf, -np.inf], np.nan)
     adv = dvol.mean().dropna().sort_values(ascending=False)
     if adv.empty:
-        # Fall back to coverage count if volume is missing.
-        coverage = fv.groupby("ticker")["date"].nunique().sort_values(ascending=False)
+        coverage = close.loc[close.index <= start_date].notna().sum().sort_values(ascending=False)
         selected = coverage.index[:universe_size].tolist()
         return selected, coverage
     n = max(10, min(int(universe_size or len(adv)), len(adv)))
     return adv.index[:n].tolist(), adv
 
 
-def _build_signal(fv: pd.DataFrame, terms: list[FactorTerm]) -> pd.DataFrame:
+def _rolling_slope(close: pd.DataFrame, period: int) -> pd.DataFrame:
+    def slope(y):
+        if len(y) < period or np.isnan(y).any():
+            return np.nan
+        x = np.arange(len(y), dtype=float)
+        x -= x.mean()
+        yy = y - y.mean()
+        denom = (x * x).sum()
+        if denom == 0:
+            return 0.0
+        return (x * yy).sum() / denom / (y.mean() + 1e-12)
+    return close.rolling(period).apply(slope, raw=True)
+
+
+def _rsi(close: pd.DataFrame, period: int) -> pd.DataFrame:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / (loss + 1e-12)
+    return 100 - 100 / (1 + rs)
+
+
+def _compute_factor_matrix(base: str, period: int | None, m: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    openp, high, low, close, volume = m["open"], m["high"], m["low"], m["close"], m["volume"]
+    if base == "KMID":
+        return (close - openp) / openp
+    if base == "KLEN":
+        return (high - low) / openp
+    if base == "KMID2":
+        return (close - openp) / (high - low + 1e-12)
+    if base == "KUP":
+        return (high - pd.concat([openp.stack(), close.stack()], axis=1).max(axis=1).unstack()) / openp
+    if base == "KUP2":
+        return (high - pd.concat([openp.stack(), close.stack()], axis=1).max(axis=1).unstack()) / (high - low + 1e-12)
+    if base == "KLOW":
+        return (pd.concat([openp.stack(), close.stack()], axis=1).min(axis=1).unstack() - low) / openp
+    if base == "KLOW2":
+        return (pd.concat([openp.stack(), close.stack()], axis=1).min(axis=1).unstack() - low) / (high - low + 1e-12)
+    if base == "KSFT":
+        return (2 * close - high - low) / openp
+    if base == "KSFT2":
+        return (2 * close - high - low) / (high - low + 1e-12)
+    if period is None:
+        raise ValueError(f"{base} requires a period")
+    if base == "ROC":
+        return close.pct_change(period)
+    if base == "MA_RATIO":
+        return close / close.rolling(period).mean()
+    if base == "VMOM":
+        return volume / (volume.rolling(period).mean() + 1e-12)
+    if base == "VSTD":
+        return volume.rolling(period).std() / (volume.rolling(period).mean() + 1e-12)
+    if base == "STD":
+        return close.rolling(period).std() / close
+    if base == "BBPOS":
+        ma = close.rolling(period).mean()
+        std = close.rolling(period).std()
+        return (close - ma) / (2 * std + 1e-12)
+    if base == "BETA":
+        return _rolling_slope(close, period)
+    if base == "RSV":
+        low_min = low.rolling(period).min()
+        high_max = high.rolling(period).max()
+        return (close - low_min) / (high_max - low_min + 1e-12)
+    if base == "RSI":
+        return _rsi(close, period)
+    raise ValueError(f"unsupported factor: {base}")
+
+
+def _transform_long(df: pd.DataFrame, transform: str) -> pd.DataFrame:
+    long = df.stack().rename("value").reset_index()
+    long.columns = ["date", "ticker", "value"]
+    long = long.dropna(subset=["value"])
+    if long.empty:
+        return long.assign(x=pd.Series(dtype=float))
+    if transform == "rank":
+        long["x"] = long.groupby("date")["value"].rank(pct=True)
+    elif transform == "zscore":
+        grouped = long.groupby("date")["value"]
+        mu = grouped.transform("mean")
+        sd = grouped.transform("std").replace(0, np.nan)
+        long["x"] = ((long["value"] - mu) / sd).clip(-5, 5)
+    else:
+        raise ValueError(f"unsupported transform: {transform}")
+    return long[["date", "ticker", "x"]]
+
+
+def _build_signal(matrices: dict[str, pd.DataFrame], terms: list[FactorTerm], start_date: str, end_date: str) -> pd.DataFrame:
     pieces = []
     for term in terms:
-        part = fv[fv["factor_name"] == term.factor].copy()
-        if part.empty:
+        period_parts = []
+        for period in (term.periods or (None,)):
+            mat = _compute_factor_matrix(term.factor, period, matrices)
+            mat = mat.loc[(mat.index >= start_date) & (mat.index <= end_date)]
+            long = _transform_long(mat, term.transform)
+            if not long.empty:
+                period_parts.append(long)
+        if not period_parts:
             continue
-        if term.transform == "rank":
-            part["x"] = part.groupby("date")["value"].rank(pct=True)
-        elif term.transform == "zscore":
-            grouped = part.groupby("date")["value"]
-            mu = grouped.transform("mean")
-            sd = grouped.transform("std").replace(0, np.nan)
-            part["x"] = (part["value"] - mu) / sd
-            # Convert z-score back to rank-like scale after winsor-ish clipping so
-            # one wild value cannot dominate the whole composite.
-            part["x"] = part["x"].clip(-5, 5)
-        else:  # guarded earlier
-            raise ValueError(f"unsupported transform: {term.transform}")
-        part["weighted"] = part["x"] * term.weight
-        pieces.append(part[["date", "ticker", "weighted"]])
+        merged_periods = pd.concat(period_parts, ignore_index=True).groupby(["date", "ticker"], as_index=False)["x"].mean()
+        merged_periods["weighted"] = merged_periods["x"] * term.weight
+        pieces.append(merged_periods[["date", "ticker", "weighted"]])
     if not pieces:
         raise ValueError("no usable factor terms after filtering")
     comp = pd.concat(pieces, ignore_index=True).groupby(["date", "ticker"], as_index=False)["weighted"].sum()
@@ -378,7 +487,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("start_date must be <= end_date")
     terms = _normalise_terms(((request.get("expression") or {}).get("terms") or []))
     initial_capital = float(request.get("initial_capital") or (100000 if market == "CN" else 10000))
-    universe_size = int(request.get("universe_size") or (300 if market == "CN" else 300))
+    universe_size = int(request.get("universe_size") or 300)
     top_n = int(request.get("top_n") or 20)
     horizon = int(request.get("horizon") or 5)
     window = int(request.get("window") or 20)
@@ -398,13 +507,13 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     try:
         con.execute("PRAGMA query_only = ON")
-        fv, close, volume = _load_data(con, terms, market, start_date, end_date)
-        selected, ranking = _select_universe(fv, close, volume, universe_size, start_date)
-        fv = fv[fv["ticker"].isin(selected)].copy()
-        close = close.reindex(columns=selected).dropna(axis=1, how="all")
+        matrices = _load_ohlcv(con, market, start_date, end_date, _max_period(terms))
+        selected, ranking = _select_universe(matrices["close"], matrices["volume"], universe_size, start_date)
+        matrices = {k: v.reindex(columns=selected).dropna(axis=1, how="all") for k, v in matrices.items()}
+        close = matrices["close"]
         if close.empty:
             raise ValueError("no price matrix after universe filtering")
-        signal = _build_signal(fv, terms)
+        signal = _build_signal(matrices, terms, start_date, end_date)
         signal = signal[signal["ticker"].isin(close.columns)].copy()
         if signal.empty:
             raise ValueError("no signal after universe filtering")
@@ -412,16 +521,23 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         ic_series, ic_summary, quantile_returns = _compute_ic(signal, close, horizon, window)
         equity_curve, returns, avg_turnover, latest_holdings, sample_trades = _run_portfolio(signal, close, initial_capital, top_n, cost_bps, rebalance)
         st = _stats(equity_curve, returns, initial_capital)
+        merged_terms = [t for t in terms if len(t.periods) > 1]
         warnings: list[str] = [
-            "当前股票池使用现有 universe / factor_values 回看历史，不是完整 survivorship-free 数据库。",
+            "当前股票池使用现有 universe / prices 回看历史，不是完整 survivorship-free 数据库。",
             "默认口径避免前瞻：t日信号从 t+1 close 后才开始计收益；IC 使用 close[t+1+h] / close[t+1] - 1。",
             "因子先做横截面 rank/z-score 后组合，避免 RSI/BETA/ROC 等尺度污染。",
+            "可调周期因子按日线 OHLCV 临时计算；输入 5,10,20 会先合并同族周期，再参与总表达式。",
         ]
         warnings_en: list[str] = [
-            "The universe is reconstructed from current universe / factor_values history; it is not a fully survivorship-free database.",
+            "The universe is reconstructed from current universe / prices history; it is not a fully survivorship-free database.",
             "Look-ahead guard: signal at t only earns returns after t+1 close; IC uses close[t+1+h] / close[t+1] - 1.",
             "Each factor is cross-sectionally ranked/z-scored before combination to avoid RSI/BETA/ROC scale pollution.",
+            "Tunable-period factors are computed on the fly from 1d OHLCV; entering 5,10,20 merges those sibling periods before the total expression.",
         ]
+        if merged_terms:
+            names = ", ".join(t.display_name for t in merged_terms[:4])
+            warnings.append(f"已合并同族周期：{names}。")
+            warnings_en.append(f"Merged sibling periods inside terms: {names}.")
         if (ic_summary.get("n_ic_days") or 0) < 50:
             warnings.append(f"有效 IC 样本仅 {ic_summary.get('n_ic_days') or 0} 天，只能作方向性参考。")
             warnings_en.append(f"Only {ic_summary.get('n_ic_days') or 0} valid IC days; treat this as directional evidence, not a conclusion.")
@@ -439,7 +555,10 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "ok",
             "market": market,
-            "expression": {"terms": [t.__dict__ for t in terms], "aggregation": "weighted_transform_then_rank"},
+            "expression": {
+                "terms": [{"factor": t.factor, "periods": list(t.periods), "weight": t.weight, "transform": t.transform, "display_name": t.display_name} for t in terms],
+                "aggregation": "per_period_transform_then_merge_periods_then_weighted_rank",
+            },
             "summary": summary,
             "equity_curve": equity_curve,
             "drawdown_curve": st["drawdown_curve"],
@@ -448,14 +567,13 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "latest_holdings": latest_holdings,
             "sample_trades": sample_trades,
             "coverage": {
-                "factor_start": str(fv["date"].min()),
-                "factor_end": str(fv["date"].max()),
                 "price_start": str(close.index.min()) if len(close.index) else None,
                 "price_end": str(close.index.max()) if len(close.index) else None,
                 "selected_universe": int(len(selected)),
                 "priced_universe": int(len(close.columns)),
                 "signal_dates": int(signal["date"].nunique()),
-                "ranking_basis": "avg dollar volume" if isinstance(ranking, pd.Series) else "coverage",
+                "ranking_basis": "pre-start avg dollar volume" if isinstance(ranking, pd.Series) else "coverage",
+                "max_factor_period": _max_period(terms),
             },
             "meta": {
                 "start_date": start_date,

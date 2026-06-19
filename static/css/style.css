@@ -2145,8 +2145,9 @@ body::after {
 .fl-mini-title { font-size: 16px; margin-bottom: 0; }
 .fl-small-btn { padding: 7px 10px; font-size: 12px; }
 .fl-terms { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
-.fl-term-row { display: grid; grid-template-columns: minmax(0, 1.45fr) 76px 92px 34px; gap: 8px; align-items: center; }
-.fl-term-factor, .fl-term-transform, .fl-term-weight { min-width: 0; }
+.fl-term-row { display: grid; grid-template-columns: minmax(0, 1.35fr) 108px 70px 88px 34px; gap: 8px; align-items: center; }
+.fl-term-factor, .fl-term-transform, .fl-term-weight, .fl-term-periods { min-width: 0; }
+.fl-term-periods:disabled { opacity: 0.45; background: rgba(0,0,0,0.03); }
 .fl-term-remove {
   height: 34px; border: 1px solid rgba(224,45,45,0.18); color: var(--negative);
   background: rgba(224,45,45,0.07); border-radius: 9px; cursor: pointer; font-size: 18px;
