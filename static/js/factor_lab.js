@@ -109,32 +109,19 @@
             </div>
             <div class="fl-field-row">
               <div class="bt-field">
-                <label>${t('fl_universe_size')}</label>
-                <input type="number" id="fl-universe" class="bt-input" min="10" max="1200" value="300">
-              </div>
-              <div class="bt-field">
-                <label>${t('fl_top_n')}</label>
-                <input type="number" id="fl-topn" class="bt-input" min="1" max="500" value="20">
-              </div>
-            </div>
-            <div class="fl-field-row">
-              <div class="bt-field">
                 <label>${t('bt_initial_capital')}</label>
                 <input type="number" id="fl-capital" class="bt-input" value="${state.market === 'CN' ? 100000 : 10000}">
               </div>
               <div class="bt-field">
-                <label>${t('fl_cost_bps')}</label>
-                <input type="number" id="fl-cost" class="bt-input" min="0" max="100" step="0.5" value="5">
+                <label>${t('fl_top_n')}</label>
+                <input type="number" id="fl-topn" class="bt-input" min="1" max="500" value="5">
               </div>
             </div>
+            <div class="fl-auto-note" id="fl-auto-note"></div>
             <div class="fl-field-row">
               <div class="bt-field">
-                <label>${t('fl_rebalance')}</label>
-                <select id="fl-rebalance" class="bt-input">
-                  <option value="daily">${t('fl_daily')}</option>
-                  <option value="weekly" selected>${t('fl_weekly')}</option>
-                  <option value="monthly">${t('fl_monthly')}</option>
-                </select>
+                <label>${t('fl_rebalance_days')}</label>
+                <input type="number" id="fl-rebalance-days" class="bt-input" min="1" max="60" value="1">
               </div>
               <div class="bt-field">
                 <label>${t('fl_horizon')}</label>
@@ -144,6 +131,16 @@
                   <option value="10">10D</option>
                   <option value="20">20D</option>
                 </select>
+              </div>
+            </div>
+            <div class="fl-field-row">
+              <div class="bt-field">
+                <label>${t('fl_cooldown_days')}</label>
+                <input type="number" id="fl-cooldown" class="bt-input" min="0" max="60" value="0">
+              </div>
+              <div class="bt-field">
+                <label>${t('fl_min_hold_days')}</label>
+                <input type="number" id="fl-min-hold" class="bt-input" min="0" max="60" value="0">
               </div>
             </div>
 
@@ -188,7 +185,15 @@
       _state.catalog = data.factors || [];
       const defaults = data.defaults || {};
       document.getElementById('fl-capital').value = defaults.initial_capital || (state.market === 'CN' ? 100000 : 10000);
-      document.getElementById('fl-universe').value = defaults.universe_size || 300;
+      document.getElementById('fl-topn').value = defaults.top_n || 5;
+      document.getElementById('fl-rebalance-days').value = defaults.rebalance_days || 1;
+      document.getElementById('fl-cooldown').value = defaults.cooldown_days || 0;
+      document.getElementById('fl-min-hold').value = defaults.min_hold_days || 0;
+      const note = document.getElementById('fl-auto-note');
+      if (note) note.textContent = t('fl_auto_note', {
+        market: state.market,
+        cost: state.market === 'CN' ? 'CNCosts' : 'MoomooAUCosts',
+      });
       paintCatalog();
       paintTerms();
     } catch (e) {
@@ -339,10 +344,11 @@
       start_date: document.getElementById('fl-start').value,
       end_date: document.getElementById('fl-end').value,
       initial_capital: parseFloat(document.getElementById('fl-capital').value) || (state.market === 'CN' ? 100000 : 10000),
-      universe_size: parseInt(document.getElementById('fl-universe').value, 10) || 300,
-      top_n: parseInt(document.getElementById('fl-topn').value, 10) || 20,
-      cost_bps: parseFloat(document.getElementById('fl-cost').value) || 0,
-      rebalance: document.getElementById('fl-rebalance').value,
+      top_n: parseInt(document.getElementById('fl-topn').value, 10) || 5,
+      rebalance: 'daily',
+      rebalance_days: parseInt(document.getElementById('fl-rebalance-days').value, 10) || 1,
+      cooldown_days: parseInt(document.getElementById('fl-cooldown').value, 10) || 0,
+      min_hold_days: parseInt(document.getElementById('fl-min-hold').value, 10) || 0,
       horizon: parseInt(document.getElementById('fl-horizon').value, 10) || 5,
       window: 20,
       expression: { terms: _state.terms.map(normalizeTerm).filter(t => t.factor && Number(t.weight) !== 0), final_transform: 'rank' },
@@ -392,7 +398,7 @@
         <div class="section-title-row">
           <div>
             <div class="section-title">${t('fl_result_title')}</div>
-            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${esc(meta.rebalance)} · universe ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n}</div>
+            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
           </div>
         </div>
         <div class="bt-stats-grid fl-stats-grid">
@@ -403,6 +409,7 @@
           ${statBox(t('sq_icir'), num(s.icir, 2), '')}
           ${statBox(t('sq_win_rate'), pct((s.ic_win_rate || 0) * 100), '')}
           ${statBox(t('fl_turnover'), pct(s.avg_turnover_pct), '')}
+          ${statBox(t('fl_avg_cost'), pct(s.avg_cost_pct, 3), '')}
           ${statBox(t('sq_n_days'), String(s.n_ic_days || 0), '')}
         </div>
         <div class="fl-chart-grid">

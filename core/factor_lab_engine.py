@@ -8,7 +8,9 @@ creates accounts and never writes to the database.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -17,6 +19,41 @@ import numpy as np
 import pandas as pd
 
 from core.db import DB_PATH
+
+_QT_ROOT = os.path.expanduser('~/quant-trading')
+if _QT_ROOT not in sys.path:
+    sys.path.insert(0, _QT_ROOT)
+
+try:
+    from config.settings import UNIVERSES as _QT_UNIVERSES
+except Exception:
+    _QT_UNIVERSES = {}
+
+try:
+    from trading.costs import MoomooAUCosts as _MoomooAUCosts, CNCosts as _CNCosts
+except Exception:
+    _MoomooAUCosts = None
+    _CNCosts = None
+
+
+MARKET_DEFAULTS = {
+    "US": {
+        "initial_capital": 10000,
+        "top_n": 5,
+        "rebalance": "daily",
+        "rebalance_days": 1,
+        "cooldown_days": 0,
+        "min_hold_days": 0,
+    },
+    "CN": {
+        "initial_capital": 100000,
+        "top_n": 5,
+        "rebalance": "daily",
+        "rebalance_days": 1,
+        "cooldown_days": 1,
+        "min_hold_days": 1,
+    },
+}
 
 
 # Catalog is intentionally base-factor oriented. Tunable families (ROC, BETA,
@@ -83,6 +120,36 @@ def _round(v: Any, nd: int = 4):
 def _market_predicate_sql(market: str) -> tuple[str, tuple[str]]:
     pred = "ticker GLOB ?" if market == "CN" else "ticker NOT GLOB ?"
     return pred, ('[0-9][0-9][0-9][0-9][0-9][0-9].S[HZ]',)
+
+
+def _configured_universe(market: str) -> list[str]:
+    try:
+        out = list((_QT_UNIVERSES or {}).get(market) or [])
+        return [str(x) for x in out if x]
+    except Exception:
+        return []
+
+
+def _cost_model(market: str):
+    if market == "CN" and _CNCosts is not None:
+        return _CNCosts()
+    if _MoomooAUCosts is not None:
+        return _MoomooAUCosts()
+    return None
+
+
+def _estimate_trade_cost_pct(model, side: str, notional: float, price: float, equity: float) -> float:
+    if model is None or notional <= 0 or price <= 0 or equity <= 0:
+        return 0.0
+    try:
+        shares = notional / price
+        detail = model.calculate(side, shares, price)
+        fees = float(detail.get("total_fees") or 0.0)
+        slippage = notional * float(getattr(model, "slippage_pct", 0.0) or 0.0)
+        return (fees + slippage) / equity
+    except Exception:
+        slip = float(getattr(model, "slippage_pct", 0.0005) or 0.0005)
+        return abs(notional) * slip / equity
 
 
 def _parse_factor_name(raw: str) -> tuple[str, int | None]:
@@ -159,8 +226,13 @@ def _max_period(terms: list[FactorTerm]) -> int:
     return max(vals or [1])
 
 
-def _freq_mask(dates: pd.Index, rebalance: str) -> list[str]:
+def _freq_mask(dates: pd.Index, rebalance: str, rebalance_days: int = 1) -> list[str]:
     dates = pd.Index(sorted(pd.to_datetime(dates)))
+    if dates.empty:
+        return []
+    n = max(1, int(rebalance_days or 1))
+    if n > 1:
+        return [d.strftime("%Y-%m-%d") for d in dates[::n]]
     if rebalance == "daily":
         return [d.strftime("%Y-%m-%d") for d in dates]
     frame = pd.DataFrame({"date": dates})
@@ -233,10 +305,17 @@ def _load_ohlcv(con: sqlite3.Connection, market: str, start_date: str, end_date:
     return matrices
 
 
-def _select_universe(close: pd.DataFrame, volume: pd.DataFrame, universe_size: int, start_date: str) -> tuple[list[str], pd.Series]:
-    candidates = sorted(close.columns.tolist())
+def _select_universe(close: pd.DataFrame, volume: pd.DataFrame, market: str, start_date: str) -> tuple[list[str], str]:
+    configured = _configured_universe(market)
+    available = set(close.columns.tolist())
+    if configured:
+        selected = [t for t in configured if t in available]
+        if selected:
+            return selected, "configured universe"
+    candidates = sorted(available)
     if not candidates:
         raise ValueError("price matrix has no tickers")
+    # Fallback only: if settings universe is unavailable, use pre-start ADV.
     # Avoid look-ahead: prices are loaded beyond end_date for forward-return
     # evaluation, but universe selection uses only bars at/before start_date.
     hist_close = close.loc[close.index <= start_date, candidates].tail(60)
@@ -245,10 +324,8 @@ def _select_universe(close: pd.DataFrame, volume: pd.DataFrame, universe_size: i
     adv = dvol.mean().dropna().sort_values(ascending=False)
     if adv.empty:
         coverage = close.loc[close.index <= start_date].notna().sum().sort_values(ascending=False)
-        selected = coverage.index[:universe_size].tolist()
-        return selected, coverage
-    n = max(10, min(int(universe_size or len(adv)), len(adv)))
-    return adv.index[:n].tolist(), adv
+        return coverage.index.tolist(), "coverage fallback"
+    return adv.index.tolist(), "pre-start avg dollar volume fallback"
 
 
 def _rolling_slope(close: pd.DataFrame, period: int) -> pd.DataFrame:
@@ -412,9 +489,19 @@ def _compute_ic(signal: pd.DataFrame, close: pd.DataFrame, horizon: int, window:
     return series, summary, quantile_returns
 
 
-def _run_portfolio(signal: pd.DataFrame, close: pd.DataFrame, initial_capital: float, top_n: int, cost_bps: float, rebalance: str) -> tuple[list[dict[str, Any]], list[float], float, list[dict[str, Any]], list[dict[str, Any]]]:
+def _run_portfolio(
+    signal: pd.DataFrame,
+    close: pd.DataFrame,
+    initial_capital: float,
+    top_n: int,
+    rebalance: str,
+    rebalance_days: int,
+    cooldown_days: int,
+    min_hold_days: int,
+    market: str,
+) -> tuple[list[dict[str, Any]], list[float], float, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     dates = sorted(set(signal["date"]).intersection(close.index))
-    rb_dates = _freq_mask(pd.Index(dates), rebalance)
+    rb_dates = _freq_mask(pd.Index(dates), rebalance, rebalance_days)
     close_dates = list(close.index)
     close_pos = {d: i for i, d in enumerate(close_dates)}
 
@@ -423,7 +510,13 @@ def _run_portfolio(signal: pd.DataFrame, close: pd.DataFrame, initial_capital: f
     period_returns: list[float] = []
     turnovers: list[float] = []
     prev_w = pd.Series(dtype=float)
+    buy_dates: dict[str, str] = {}
+    cooldown_until: dict[str, str] = {}
     trades: list[dict[str, Any]] = []
+    cost_model = _cost_model(market)
+    cost_pcts: list[float] = []
+    skipped_cooldown = 0
+    skipped_min_hold = 0
 
     sig_by_date = {dt: g.sort_values("signal", ascending=False) for dt, g in signal.groupby("date")}
     for idx, dt in enumerate(rb_dates):
@@ -437,31 +530,84 @@ def _run_portfolio(signal: pd.DataFrame, close: pd.DataFrame, initial_capital: f
             exit_idx = min(entry_idx + 1, len(close_dates) - 1)
         if entry_idx >= len(close_dates) or exit_idx >= len(close_dates) or exit_idx <= entry_idx:
             continue
-        picks = sig_by_date[dt].head(max(1, int(top_n or 20))).copy()
-        picks = picks[picks["ticker"].isin(close.columns)]
-        if picks.empty:
+
+        raw_picks = sig_by_date[dt][sig_by_date[dt]["ticker"].isin(close.columns)].copy()
+        allowed = []
+        for tkr in raw_picks["ticker"].tolist():
+            if cooldown_until.get(tkr) and dt <= cooldown_until[tkr]:
+                skipped_cooldown += 1
+                continue
+            allowed.append(tkr)
+            if len(allowed) >= max(1, int(top_n or 20)):
+                break
+        target = pd.Series(1.0 / len(allowed), index=allowed, dtype=float) if allowed else pd.Series(dtype=float)
+
+        if min_hold_days > 0 and len(prev_w):
+            for tkr in prev_w.index:
+                if tkr not in target.index:
+                    bdt = buy_dates.get(tkr)
+                    if bdt:
+                        try:
+                            age = (pd.Timestamp(dt) - pd.Timestamp(bdt)).days
+                        except Exception:
+                            age = min_hold_days
+                        if age < min_hold_days:
+                            target.loc[tkr] = prev_w.loc[tkr]
+                            skipped_min_hold += 1
+        if len(target):
+            target = target / target.sum()
+
+        all_idx = sorted(set(prev_w.index).union(target.index))
+        turnover = float((target.reindex(all_idx, fill_value=0) - prev_w.reindex(all_idx, fill_value=0)).abs().sum()) if all_idx else 0.0
+        entry_date = close_dates[entry_idx]
+        exit_date = close_dates[exit_idx]
+        if target.empty:
             continue
-        tickers = picks["ticker"].tolist()
-        w = pd.Series(1.0 / len(tickers), index=tickers, dtype=float)
-        all_idx = sorted(set(prev_w.index).union(w.index))
-        turnover = float((w.reindex(all_idx, fill_value=0) - prev_w.reindex(all_idx, fill_value=0)).abs().sum())
-        entry_px = close.loc[close_dates[entry_idx], tickers].replace(0, np.nan)
-        exit_px = close.loc[close_dates[exit_idx], tickers].replace(0, np.nan)
+        entry_px = close.loc[entry_date, target.index].replace(0, np.nan)
+        exit_px = close.loc[exit_date, target.index].replace(0, np.nan)
         sec_ret = (exit_px / entry_px - 1).replace([np.inf, -np.inf], np.nan).dropna()
         if sec_ret.empty:
             continue
-        w2 = w.reindex(sec_ret.index)
-        gross = float((w2 * sec_ret).sum())
-        cost = float(cost_bps) * 1e-4 * turnover
-        net = gross - cost
+        target = target.reindex(sec_ret.index).dropna()
+        target = target / target.sum()
+        gross = float((target * sec_ret).sum())
+
+        cost_pct = 0.0
+        prev_aligned = prev_w.reindex(sorted(set(prev_w.index).union(target.index)), fill_value=0)
+        target_aligned = target.reindex(prev_aligned.index, fill_value=0)
+        delta = target_aligned - prev_aligned
+        for tkr, dw in delta.items():
+            if abs(dw) < 1e-12:
+                continue
+            px = float(entry_px.get(tkr, np.nan)) if tkr in entry_px.index else np.nan
+            if not math.isfinite(px) or px <= 0:
+                px = float(close.loc[entry_date, tkr]) if tkr in close.columns else np.nan
+            if not math.isfinite(px) or px <= 0:
+                continue
+            side = "buy" if dw > 0 else "sell"
+            cost_pct += _estimate_trade_cost_pct(cost_model, side, abs(dw) * equity, px, equity)
+        cost_pcts.append(cost_pct)
+        net = gross - cost_pct
         equity *= (1 + net)
         period_returns.append(net)
         turnovers.append(turnover)
-        out_date = close_dates[exit_idx]
-        curve.append({"date": out_date, "equity": _round(equity, 2), "period_return_pct": _round(net * 100, 4), "turnover": _round(turnover, 4)})
-        for tkr, score in zip(picks["ticker"].head(10), picks["signal"].head(10)):
-            trades.append({"signal_date": dt, "entry_date": close_dates[entry_idx], "exit_date": out_date, "ticker": tkr, "score": _round(score, 5)})
-        prev_w = w
+        curve.append({"date": exit_date, "equity": _round(equity, 2), "period_return_pct": _round(net * 100, 4), "turnover": _round(turnover, 4), "cost_pct": _round(cost_pct * 100, 4)})
+
+        sold = set(prev_w.index) - set(target.index)
+        for tkr in sold:
+            buy_dates.pop(tkr, None)
+            if cooldown_days > 0:
+                try:
+                    cooldown_until[tkr] = close_dates[min(len(close_dates) - 1, close_pos[dt] + cooldown_days)]
+                except Exception:
+                    cooldown_until[tkr] = dt
+        for tkr in target.index:
+            if tkr not in prev_w.index:
+                buy_dates[tkr] = dt
+        ranked = sig_by_date[dt].set_index("ticker")
+        for tkr in target.index[:10]:
+            trades.append({"signal_date": dt, "entry_date": entry_date, "exit_date": exit_date, "ticker": str(tkr), "score": _round(ranked.loc[tkr, "signal"] if tkr in ranked.index else None, 5)})
+        prev_w = target
     avg_turnover = float(np.mean(turnovers)) if turnovers else 0.0
 
     latest_holdings: list[dict[str, Any]] = []
@@ -472,7 +618,13 @@ def _run_portfolio(signal: pd.DataFrame, close: pd.DataFrame, initial_capital: f
             {"ticker": str(r["ticker"]), "score": _round(r["signal"], 5), "weight_pct": _round(100 / max(len(latest), 1), 2)}
             for _, r in latest.iterrows()
         ]
-    return curve, period_returns, avg_turnover, latest_holdings, trades[-100:]
+    diagnostics = {
+        "avg_cost_pct": _round(float(np.mean(cost_pcts)) * 100, 4) if cost_pcts else 0,
+        "skipped_cooldown": skipped_cooldown,
+        "skipped_min_hold": skipped_min_hold,
+        "cost_model": "CNCosts" if market == "CN" else "MoomooAUCosts",
+    }
+    return curve, period_returns, avg_turnover, latest_holdings, trades[-100:], diagnostics
 
 
 def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
@@ -486,13 +638,15 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     if start_date > end_date:
         raise ValueError("start_date must be <= end_date")
     terms = _normalise_terms(((request.get("expression") or {}).get("terms") or []))
-    initial_capital = float(request.get("initial_capital") or (100000 if market == "CN" else 10000))
-    universe_size = int(request.get("universe_size") or 300)
-    top_n = int(request.get("top_n") or 20)
+    defaults = MARKET_DEFAULTS[market]
+    initial_capital = float(request.get("initial_capital") or defaults["initial_capital"])
+    top_n = int(request.get("top_n") or defaults["top_n"])
     horizon = int(request.get("horizon") or 5)
     window = int(request.get("window") or 20)
-    cost_bps = float(request.get("cost_bps") or 5)
-    rebalance = str(request.get("rebalance") or "weekly").lower()
+    rebalance_days = int(request.get("rebalance_days") or defaults["rebalance_days"])
+    cooldown_days = int(request.get("cooldown_days") or defaults["cooldown_days"])
+    min_hold_days = int(request.get("min_hold_days") or defaults["min_hold_days"])
+    rebalance = str(request.get("rebalance") or defaults["rebalance"]).lower()
     if rebalance not in _VALID_REBALANCE:
         raise ValueError("rebalance must be daily, weekly, or monthly")
     if not (1 <= horizon <= 60):
@@ -501,6 +655,12 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("window must be 5..120")
     if top_n < 1 or top_n > 500:
         raise ValueError("top_n must be 1..500")
+    if not (1 <= rebalance_days <= 60):
+        raise ValueError("rebalance_days must be 1..60")
+    if not (0 <= cooldown_days <= 60):
+        raise ValueError("cooldown_days must be 0..60")
+    if not (0 <= min_hold_days <= 60):
+        raise ValueError("min_hold_days must be 0..60")
     if initial_capital <= 0:
         raise ValueError("initial_capital must be positive")
 
@@ -508,7 +668,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     try:
         con.execute("PRAGMA query_only = ON")
         matrices = _load_ohlcv(con, market, start_date, end_date, _max_period(terms))
-        selected, ranking = _select_universe(matrices["close"], matrices["volume"], universe_size, start_date)
+        selected, ranking_basis = _select_universe(matrices["close"], matrices["volume"], market, start_date)
         matrices = {k: v.reindex(columns=selected).dropna(axis=1, how="all") for k, v in matrices.items()}
         close = matrices["close"]
         if close.empty:
@@ -519,7 +679,10 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("no signal after universe filtering")
 
         ic_series, ic_summary, quantile_returns = _compute_ic(signal, close, horizon, window)
-        equity_curve, returns, avg_turnover, latest_holdings, sample_trades = _run_portfolio(signal, close, initial_capital, top_n, cost_bps, rebalance)
+        equity_curve, returns, avg_turnover, latest_holdings, sample_trades, exec_diag = _run_portfolio(
+            signal, close, initial_capital, top_n, rebalance, rebalance_days,
+            cooldown_days, min_hold_days, market,
+        )
         st = _stats(equity_curve, returns, initial_capital)
         merged_terms = [t for t in terms if len(t.periods) > 1]
         warnings: list[str] = [
@@ -527,12 +690,14 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "默认口径避免前瞻：t日信号从 t+1 close 后才开始计收益；IC 使用 close[t+1+h] / close[t+1] - 1。",
             "因子先做横截面 rank/z-score 后组合，避免 RSI/BETA/ROC 等尺度污染。",
             "可调周期因子按日线 OHLCV 临时计算；输入 5,10,20 会先合并同族周期，再参与总表达式。",
+            f"股票池自动使用 {market} 配置宇宙（可用 {len(selected)} 支）；交易成本使用 {exec_diag.get('cost_model')} 估算。",
         ]
         warnings_en: list[str] = [
             "The universe is reconstructed from current universe / prices history; it is not a fully survivorship-free database.",
             "Look-ahead guard: signal at t only earns returns after t+1 close; IC uses close[t+1+h] / close[t+1] - 1.",
             "Each factor is cross-sectionally ranked/z-scored before combination to avoid RSI/BETA/ROC scale pollution.",
             "Tunable-period factors are computed on the fly from 1d OHLCV; entering 5,10,20 merges those sibling periods before the total expression.",
+            f"Universe is auto-selected from the configured {market} universe ({len(selected)} usable tickers); transaction cost estimate uses {exec_diag.get('cost_model')}.",
         ]
         if merged_terms:
             names = ", ".join(t.display_name for t in merged_terms[:4])
@@ -550,7 +715,9 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             **ic_summary,
             "avg_turnover": _round(avg_turnover, 4),
             "avg_turnover_pct": _round(avg_turnover * 100, 2),
-            "cost_bps": _round(cost_bps, 2),
+            "avg_cost_pct": exec_diag.get("avg_cost_pct", 0),
+            "skipped_cooldown": exec_diag.get("skipped_cooldown", 0),
+            "skipped_min_hold": exec_diag.get("skipped_min_hold", 0),
         }
         return {
             "status": "ok",
@@ -572,7 +739,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
                 "selected_universe": int(len(selected)),
                 "priced_universe": int(len(close.columns)),
                 "signal_dates": int(signal["date"].nunique()),
-                "ranking_basis": "pre-start avg dollar volume" if isinstance(ranking, pd.Series) else "coverage",
+                "ranking_basis": ranking_basis,
                 "max_factor_period": _max_period(terms),
             },
             "meta": {
@@ -580,11 +747,14 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
                 "end_date": end_date,
                 "initial_capital": _round(initial_capital, 2),
                 "universe_size": int(len(selected)),
-                "requested_universe_size": universe_size,
                 "top_n": top_n,
                 "horizon": horizon,
                 "window": window,
                 "rebalance": rebalance,
+                "rebalance_days": rebalance_days,
+                "cooldown_days": cooldown_days,
+                "min_hold_days": min_hold_days,
+                "cost_model": exec_diag.get("cost_model"),
             },
             "warnings": warnings,
             "warnings_en": warnings_en,

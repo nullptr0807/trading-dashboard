@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from api.backtest import _validate_market
 from core.db import DB_PATH
-from core.factor_lab_engine import ALPHA158_FACTORS, run_factor_lab
+from core.factor_lab_engine import ALPHA158_FACTORS, MARKET_DEFAULTS, run_factor_lab
 
 router = APIRouter(prefix="/api/factor-lab", tags=["factor_lab"])
 
@@ -31,11 +31,12 @@ class FactorLabRunRequest(BaseModel):
     market: Literal["US", "CN"] = "US"
     start_date: str
     end_date: str
-    initial_capital: float = Field(10000, gt=0)
-    universe_size: int = Field(300, ge=10, le=1200)
-    top_n: int = Field(20, ge=1, le=500)
-    cost_bps: float = Field(5, ge=0, le=100)
-    rebalance: Literal["daily", "weekly", "monthly"] = "weekly"
+    initial_capital: float | None = Field(None, gt=0)
+    top_n: int | None = Field(None, ge=1, le=500)
+    rebalance: Literal["daily", "weekly", "monthly"] | None = None
+    rebalance_days: int | None = Field(None, ge=1, le=60)
+    cooldown_days: int | None = Field(None, ge=0, le=60)
+    min_hold_days: int | None = Field(None, ge=0, le=60)
     horizon: int = Field(5, ge=1, le=60)
     window: int = Field(20, ge=5, le=120)
     expression: FactorExpressionRequest
@@ -74,11 +75,7 @@ async def factor_lab_catalog(market: str = Query("US")):
             for f in ALPHA158_FACTORS
         ],
         "defaults": {
-            "initial_capital": 100000 if market == "CN" else 10000,
-            "universe_size": 300,
-            "top_n": 20,
-            "cost_bps": 5,
-            "rebalance": "weekly",
+            **MARKET_DEFAULTS.get(market, MARKET_DEFAULTS["US"]),
             "horizon": 5,
             "window": 20,
             "sample_expression": {

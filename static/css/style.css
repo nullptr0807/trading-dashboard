@@ -2140,6 +2140,16 @@ body::after {
   border: 1px solid rgba(0,113,227,0.12);
   margin-bottom: 18px;
 }
+.fl-auto-note {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0,0,0,0.035);
+  border: 1px solid rgba(0,0,0,0.055);
+  margin: 2px 0 12px;
+}
 .fl-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .fl-term-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
 .fl-mini-title { font-size: 16px; margin-bottom: 0; }
