@@ -19,6 +19,11 @@ router = APIRouter(prefix='/api/factor_ai', tags=['factor_ai'])
 CACHE_TTL = 2 * 3600  # 2 hours
 HERMES_BIN = shutil.which('hermes') or os.path.expanduser('~/.local/bin/hermes')
 SUBPROC_TIMEOUT = 180  # seconds — LLM call cap
+# Keep the spawned Hermes run on an explicit, valid minimal toolset.
+# Passing `-t ''` is treated by Hermes as "use configured CLI toolsets"; this
+# can inherit stale/legacy entries such as `messaging`, causing
+# `Warning: Unknown toolsets: messaging` to leak into the markdown response.
+HERMES_TOOLSETS = 'search'
 
 # In-process cache: { (account_id, lang): {markdown, created_at} }
 _CACHE: dict[tuple[str, str], dict[str, Any]] = {}
@@ -184,11 +189,11 @@ Rules:
 
 
 async def _run_hermes(prompt: str) -> str:
-    """Call `hermes chat -q PROMPT -Q -t ''` and return stdout (stripped of the leading session_id line)."""
+    """Call Hermes in quiet one-shot mode and return stdout (without the session_id line)."""
     if not HERMES_BIN or not os.path.exists(HERMES_BIN):
         raise RuntimeError(f'hermes binary not found at {HERMES_BIN}')
     proc = await asyncio.create_subprocess_exec(
-        HERMES_BIN, 'chat', '-q', prompt, '-Q', '-t', '',
+        HERMES_BIN, 'chat', '-q', prompt, '-Q', '-t', HERMES_TOOLSETS,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env={**os.environ},
