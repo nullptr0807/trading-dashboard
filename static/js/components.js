@@ -431,6 +431,7 @@ async function loadFactorAi(accountId, accData, factorsResp, opts = {}) {
   const lang = (typeof getLang === 'function' && getLang() === 'en') ? 'en' : 'zh';
   const payload = {
     account_id: accountId,
+    market: (window.state && state.market) || undefined,
     group: factorsResp.group,
     strategy_name: factorsResp.strategy_name || accData?.strategy_name || '',
     gp_info: factorsResp.gp_info || '',

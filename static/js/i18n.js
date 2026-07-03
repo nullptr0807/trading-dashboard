@@ -304,7 +304,7 @@ const I18N_DICT = {
 
     // AI factor interpretation
     factor_ai_title: '🤖 AI Interpretation · LLM Subagent',
-    factor_ai_loading: 'Generating…',
+    factor_ai_loading: 'Generating… keep this row open or retry in a minute',
     factor_ai_fresh: 'fresh · cached {ttl}',
     factor_ai_cached: 'cached · expires in {ttl}',
     factor_ai_error: 'AI generation failed',
@@ -633,7 +633,7 @@ const I18N_DICT = {
 
     // AI factor interpretation
     factor_ai_title: '🤖 AI 解读 · LLM Subagent',
-    factor_ai_loading: '生成中…',
+    factor_ai_loading: '生成中… 保持这一行展开；若断网/切后台，稍后点重试会读取缓存',
     factor_ai_fresh: '新生成 · 缓存 {ttl}',
     factor_ai_cached: '已缓存 · {ttl} 后过期',
     factor_ai_error: 'AI 生成失败',

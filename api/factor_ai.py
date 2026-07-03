@@ -8,7 +8,9 @@ for 2 hours.
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
+import subprocess
 import time
 import shutil
 from typing import Any
@@ -18,7 +20,7 @@ router = APIRouter(prefix='/api/factor_ai', tags=['factor_ai'])
 
 CACHE_TTL = 2 * 3600  # 2 hours
 HERMES_BIN = shutil.which('hermes') or os.path.expanduser('~/.local/bin/hermes')
-SUBPROC_TIMEOUT = 180  # seconds — LLM call cap
+SUBPROC_TIMEOUT = 260  # seconds — below nginx's 300s proxy_read_timeout
 # Keep the spawned Hermes run on an explicit, valid minimal toolset.
 # Passing `-t ''` is treated by Hermes as "use configured CLI toolsets"; this
 # can inherit stale/legacy entries such as `messaging`, causing
@@ -29,12 +31,14 @@ HERMES_TOOLSETS = 'search'
 _CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 # Per-key inflight lock so concurrent expands don't fire two subprocesses
 _INFLIGHT: dict[tuple[str, str], asyncio.Task] = {}
+_LOG = logging.getLogger(__name__)
 
 
 def _build_prompt(payload: dict, lang: str) -> str:
     account_id = payload.get('account_id', '?')
     group = payload.get('group', '?')
     strategy_name = payload.get('strategy_name', '')
+    market = (payload.get('market') or ('CN' if str(account_id).startswith('C') else 'US')).upper()
     factors = payload.get('factors') or []
     composite = payload.get('composite') or {}
     positions = payload.get('positions') or []
@@ -42,12 +46,20 @@ def _build_prompt(payload: dict, lang: str) -> str:
     gp_info = payload.get('gp_info') or ''
     signal_quality = payload.get('signal_quality') or {}
 
-    # Trim payload — LLMs choke on huge JSON
+    # Trim payload — LLM/provider subprocesses are fragile with large JSON,
+    # especially Chinese payloads through the CLI. Keep only what affects the
+    # explanation; the rendered dashboard tables remain the detailed source.
+    def _clip(value: Any, limit: int = 220) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        return value if len(value) <= limit else value[:limit].rstrip() + '…'
+
     factors_min = []
-    for f in factors[:20]:
-        item = {k: f.get(k) for k in (
+    for f in factors[:8]:
+        item = {k: _clip(f.get(k)) for k in (
             'name', 'formula', 'latex', 's_expression',
-            'physics', 'intuition', 'motivation', 'alpha_source',
+            'physics', 'intuition',
             'ic', 'fitness',
         ) if f.get(k)}
         factors_min.append(item)
@@ -58,7 +70,7 @@ def _build_prompt(payload: dict, lang: str) -> str:
             'avg_cost': p.get('avg_cost') or p.get('cost'),
             'current_price': p.get('current_price') or p.get('price'),
         }
-        for p in positions[:30]
+        for p in positions[:8]
     ]
     trades_min = [
         {
@@ -68,11 +80,12 @@ def _build_prompt(payload: dict, lang: str) -> str:
             'shares': t.get('shares') or t.get('qty'),
             'price': t.get('price'),
         }
-        for t in (trades[-30:] if isinstance(trades, list) else [])
+        for t in (trades[-8:] if isinstance(trades, list) else [])
     ]
 
     data_json = json.dumps({
         'account_id': account_id,
+        'market': market,
         'group': group,
         'strategy_name': strategy_name,
         'gp_info': gp_info,
@@ -116,7 +129,13 @@ def _build_prompt(payload: dict, lang: str) -> str:
         )
 
     if lang == 'en':
-        prompt = f"""You are a senior quantitative trader and factor researcher. Below is a real production account from a US-equity systematic trading system. Write a professional, opinionated analysis in **English Markdown**.
+        market_note = (
+            "This is a China A-share account (CN market, CNY, SH/SZ tickers). Interpret price limits, liquidity, retail flows, and policy/sector regimes accordingly."
+            if market == 'CN'
+            else "This is a US-equity account (USD, US tickers). Interpret it in that market context."
+        )
+        prompt = f"""You are a senior quantitative trader and factor researcher. Below is a real production account from a systematic trading system. Write a professional, opinionated analysis in **English Markdown**.
+Market context: {market_note}
 
 Account data (JSON):
 ```json
@@ -151,7 +170,13 @@ Rules:
 - If data is missing for a section, say so briefly and move on.
 """
     else:
-        prompt = f"""你是一位资深量化交易员和因子研究员。下面是某美股量化交易系统中一个真实生产账户的快照。请用**中文 Markdown** 写一份专业的、有观点的解读。
+        market_note = (
+            "这是中国 A 股账户（CN 市场、人民币、沪深股票代码）。请按 A 股语境解读：涨跌停、流动性、散户订单流、政策/行业轮动等；不要说它是美股。"
+            if market == 'CN'
+            else "这是美股账户（US 市场、美元、美股代码）。请按美股市场语境解读。"
+        )
+        prompt = f"""你是一位资深量化交易员和因子研究员。下面是某量化交易系统中一个真实生产账户的快照。请用**中文 Markdown** 写一份专业的、有观点的解读。
+市场语境：{market_note}
 
 账户数据（JSON）：
 ```json
@@ -192,22 +217,38 @@ async def _run_hermes(prompt: str) -> str:
     """Call Hermes in quiet one-shot mode and return stdout (without the session_id line)."""
     if not HERMES_BIN or not os.path.exists(HERMES_BIN):
         raise RuntimeError(f'hermes binary not found at {HERMES_BIN}')
-    proc = await asyncio.create_subprocess_exec(
-        HERMES_BIN, 'chat', '-q', prompt, '-Q', '-t', HERMES_TOOLSETS,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ},
-    )
+    env = {
+        **os.environ,
+        'PATH': ':'.join([
+            os.path.expanduser('~/.local/bin'),
+            os.path.expanduser('~/.hermes/hermes-agent/venv/bin'),
+            os.path.expanduser('~/.hermes/node/bin'),
+            os.environ.get('PATH', ''),
+        ]),
+    }
+
+    def _call() -> tuple[int, str, str]:
+        proc = subprocess.run(
+            [HERMES_BIN, 'chat', '-q', prompt, '-Q', '-t', HERMES_TOOLSETS],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            env=env,
+            timeout=SUBPROC_TIMEOUT,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SUBPROC_TIMEOUT)
-    except asyncio.TimeoutError:
-        proc.kill()
+        returncode, stdout, stderr = await asyncio.to_thread(_call)
+    except subprocess.TimeoutExpired:
         raise RuntimeError(f'hermes call timed out after {SUBPROC_TIMEOUT}s')
-    if proc.returncode != 0:
-        raise RuntimeError(f'hermes exited {proc.returncode}: {stderr.decode("utf-8", "replace")[:500]}')
-    text = stdout.decode('utf-8', 'replace')
+    if returncode != 0:
+        combined = ((stderr or '') + '\n' + (stdout or '')).strip()
+        raise RuntimeError(f'hermes exited {returncode}: {combined[:500]}')
     # Strip the leading "session_id: ..." line that -Q still emits
-    lines = text.splitlines()
+    lines = stdout.splitlines()
     out_lines = [ln for ln in lines if not ln.startswith('session_id:')]
     return '\n'.join(out_lines).strip()
 
@@ -218,6 +259,27 @@ async def _generate(key: tuple[str, str], payload: dict, lang: str) -> dict:
     entry = {'markdown': md, 'created_at': time.time()}
     _CACHE[key] = entry
     return entry
+
+
+def _forget_inflight_when_done(key: tuple[str, str], task: asyncio.Task) -> None:
+    """Drop the inflight handle when generation finishes without cancelling it.
+
+    Mobile Safari / Chrome often closes long-lived fetches when the tab is
+    backgrounded, the row is collapsed, or the network changes. FastAPI then
+    cancels the request coroutine. Without shielding, that cancellation
+    propagates into `_generate`, killing the Hermes subprocess and leaving the
+    user with `Load failed`. The task itself should outlive that particular
+    HTTP connection and populate the 2h cache for the retry.
+    """
+    if _INFLIGHT.get(key) is task:
+        _INFLIGHT.pop(key, None)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        _LOG.warning('factor_ai generation cancelled for %s', key)
+        return
+    if exc:
+        _LOG.warning('factor_ai generation failed for %s: %s', key, exc)
 
 
 @router.post('/{account_id}')
@@ -242,13 +304,14 @@ async def get_factor_ai(account_id: str, payload: dict, lang: str = Query('zh'))
     if task is None or task.done():
         task = asyncio.create_task(_generate(key, payload, lang))
         _INFLIGHT[key] = task
+        task.add_done_callback(lambda t, k=key: _forget_inflight_when_done(k, t))
 
     try:
-        entry = await task
+        # Shield the generation task from client disconnects / browser aborts.
+        # A later retry can await the same task or hit the freshly populated cache.
+        entry = await asyncio.shield(task)
     except Exception as e:
-        _INFLIGHT.pop(key, None)
         raise HTTPException(status_code=502, detail=f'AI generation failed: {e}')
-    _INFLIGHT.pop(key, None)
     return {
         'markdown': entry['markdown'],
         'cached': False,
