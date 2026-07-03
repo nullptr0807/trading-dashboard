@@ -482,7 +482,12 @@ async def run_backtest_job(job_id: str, account_ids: list[str], start_date: str,
         # CN uses static UNIVERSES['CN'] (沪深300 already curated).
         from core.universe import load_liquid_universe
         from core.price_cache import get_history, estimate_fetch_cost
-        universe = load_liquid_universe(top_n=universe_size, market=market)
+        # load_liquid_universe may refresh the 60d liquidity ranking via
+        # yfinance.  Keep that off the FastAPI event loop; otherwise the UI can
+        # sit at “启动 0%” because /run or /job polling cannot be served.
+        universe = await asyncio.to_thread(
+            load_liquid_universe, top_n=universe_size, market=market,
+        )
         if not universe:
             _set(job_id, status="error", error=f"market={market} 选股池为空", progress=100)
             return

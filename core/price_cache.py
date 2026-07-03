@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import sys
 import logging
+import sqlite3
+import time
 from typing import Callable
 
 import pandas as pd
@@ -33,6 +35,68 @@ from data.store import DataStore            # noqa: E402
 from data.fetcher import DataFetcher        # noqa: E402
 
 log = logging.getLogger("dashboard.price_cache")
+
+
+_PRICE_WRITE_LOCK_PATH = os.path.expanduser("~/quant-trading/data/.price_write.lock")
+
+
+class _FileLock:
+    """Small cross-process advisory lock for shared SQLite price-cache writes."""
+
+    def __init__(self, path: str, timeout: float = 45.0):
+        self.path = path
+        self.timeout = timeout
+        self._fh = None
+
+    def __enter__(self):
+        import fcntl
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fh = open(self.path, "a+")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"price cache write lock timeout: {self.path}")
+                time.sleep(0.1)
+
+    def __exit__(self, exc_type, exc, tb):
+        import fcntl
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
+def _save_prices_bulk_with_retry(store: DataStore, df: pd.DataFrame, interval: str,
+                                 attempts: int = 4) -> None:
+    """Serialize + retry bulk writes to the shared SQLite price cache.
+
+    Backtest jobs can overlap with each other and with live update_prices.py.
+    Without this, one writer fails after SQLite's busy timeout and the frontend
+    looks stuck until the poll finally surfaces `database is locked`.
+    """
+    if df is None or df.empty:
+        return
+    last_exc = None
+    for i in range(attempts):
+        try:
+            with _FileLock(_PRICE_WRITE_LOCK_PATH, timeout=45):
+                store.save_prices_bulk(df, interval=interval)
+            return
+        except (sqlite3.OperationalError, TimeoutError) as exc:
+            msg = str(exc).lower()
+            if "locked" not in msg and "lock timeout" not in msg:
+                raise
+            last_exc = exc
+            time.sleep(min(1.5 * (2 ** i), 8.0))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("price cache write failed without an exception")
 
 
 # ── Fetch-attempt log (prevents re-download of windows where yfinance has no data) ──
@@ -360,13 +424,13 @@ def get_history(tickers: list[str], start: str, end: str,
                 merged = pd.concat(frames, ignore_index=True)
                 dl_rows = len(merged)
                 dl_tickers = merged["ticker"].nunique()
-                store.save_prices_bulk(merged, interval=interval)
+                _save_prices_bulk_with_retry(store, merged, interval=interval)
         else:
             fetched = fetcher._fetch_yf_batch(need_net, start_str, end_exclusive, interval)
             if not fetched.empty:
                 dl_rows = len(fetched)
                 dl_tickers = fetched["ticker"].nunique()
-                store.save_prices_bulk(fetched, interval=interval)
+                _save_prices_bulk_with_retry(store, fetched, interval=interval)
         # Record the attempt for ALL tickers we tried — even ones the upstream
         # returned nothing for. This prevents re-downloading the same empty
         # head-window next run.

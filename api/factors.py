@@ -14,7 +14,7 @@ def _validate_market(market: str) -> str:
     return m
 from core.factor_formulas import (
     FACTOR_FORMULAS, FACTOR_LATEX, FACTOR_EXPLANATIONS,
-    FEATURE_COLS, GP_VAR_MATH,
+    FEATURE_COLS, GP_VAR_MATH, GP_FUNC_MATH,
     gp_expr_to_math,
 )
 from core.factor_formulas_en import (
@@ -38,6 +38,9 @@ router = APIRouter(prefix='/api/factors', tags=['factors'])
 MINED_ALPHAS_PATH = os.path.expanduser(
     '~/quant-trading/factors/mined_alphas_per_account.json'
 )
+FMGP_ALPHAS_PATH = os.path.expanduser(
+    '~/quant-trading/factors/factor_miner_gp/mined_alphas_f.json'
+)
 
 GP_VAR_DESC_ZH = {
     'o_c':     '开盘/收盘比',
@@ -55,25 +58,223 @@ GP_VAR_DESC_ZH = {
     'ret_10':  '10日收益率',
 }
 
+FACTORMINER_FEATURE_COLS = FEATURE_COLS + [
+    'range_pos', 'upper_pos', 'lower_shadow', 'upper_shadow', 'gap_1',
+    'dvol_vma20', 'ret_1_dvol', 'absret_1_dvol', 'vol_of_vol_20',
+    'skew_20', 'kurt_20', 'pv_corr_20',
+    'slope_20', 'trend_r2_20', 'trend_resi_20',
+]
 
-def _load_gp_alphas(account_id: str) -> list[dict]:
+FM_GP_VAR_MATH = {
+    **GP_VAR_MATH,
+    'range_pos': r'\frac{C-L}{H-L}',
+    'upper_pos': r'\frac{H-C}{H-L}',
+    'lower_shadow': r'\frac{\min(O,C)-L}{H-L}',
+    'upper_shadow': r'\frac{H-\max(O,C)}{H-L}',
+    'gap_1': r'\frac{O_t}{C_{t-1}}-1',
+    'dvol_vma20': r'\frac{C\times V}{\overline{C\times V}_{20}}',
+    'ret_1_dvol': r'\frac{r_1}{(C\times V)/10^9}',
+    'absret_1_dvol': r'\frac{|r_1|}{(C\times V)/10^9}',
+    'vol_of_vol_20': r'\sigma_{20}\left(\frac{V}{\bar V_{20}}\right)',
+    'skew_20': r'\operatorname{Skew}_{20}(r_1)',
+    'kurt_20': r'\operatorname{Kurt}_{20}(r_1)',
+    'pv_corr_20': r'\operatorname{Corr}_{20}(r_1, \Delta V)',
+    'slope_20': r'\operatorname{Slope}_{20}(C)/C',
+    'trend_r2_20': r'R^2_{20}(C \sim t)',
+    'trend_resi_20': r'\operatorname{Resid}_{20}(C \sim t)/C',
+}
+
+FM_GP_VAR_DESC_ZH = {
+    **GP_VAR_DESC_ZH,
+    'range_pos': '收盘在当日高低区间的位置',
+    'upper_pos': '最高价到收盘的区间占比',
+    'lower_shadow': '下影线长度占当日区间比例',
+    'upper_shadow': '上影线长度占当日区间比例',
+    'gap_1': '隔夜跳空幅度',
+    'dvol_vma20': '成交额相对20日均成交额',
+    'ret_1_dvol': '1日收益相对成交额强度',
+    'absret_1_dvol': '绝对1日波动相对成交额强度',
+    'vol_of_vol_20': '量能相对均量的20日波动率',
+    'skew_20': '20日收益偏度',
+    'kurt_20': '20日收益峰度',
+    'pv_corr_20': '20日价格变化与成交量变化相关性',
+    'slope_20': '20日价格趋势斜率',
+    'trend_r2_20': '20日线性趋势解释度',
+    'trend_resi_20': '当前价格相对20日趋势线残差',
+}
+
+FM_GP_VAR_DESC_EN = {
+    **GP_VAR_DESC_EN,
+    'range_pos': 'close location within the daily high-low range',
+    'upper_pos': 'distance from high to close as a share of daily range',
+    'lower_shadow': 'lower shadow as a share of daily range',
+    'upper_shadow': 'upper shadow as a share of daily range',
+    'gap_1': 'overnight open-vs-previous-close gap',
+    'dvol_vma20': 'dollar volume relative to 20-day average dollar volume',
+    'ret_1_dvol': '1-day return scaled by dollar volume',
+    'absret_1_dvol': 'absolute 1-day move scaled by dollar volume',
+    'vol_of_vol_20': '20-day volatility of relative volume',
+    'skew_20': '20-day return skewness',
+    'kurt_20': '20-day return kurtosis',
+    'pv_corr_20': '20-day correlation between price change and volume change',
+    'slope_20': '20-day price trend slope',
+    'trend_r2_20': '20-day linear trend R-squared',
+    'trend_resi_20': 'current price residual versus 20-day trend line',
+}
+
+
+def _load_gp_alphas(account_id: str, backend: str = 'gplearn') -> list[dict]:
+    path = FMGP_ALPHAS_PATH if backend == 'factor_miner_gp' else MINED_ALPHAS_PATH
     try:
-        with open(MINED_ALPHAS_PATH) as f:
+        with open(path) as f:
             data = json.load(f)
         return data.get(account_id, []) or []
     except Exception:
         return []
 
 
-def _expr_vars_used(expr: str) -> list[str]:
+def _expr_vars_used(expr: str, feature_cols: list[str] | None = None) -> list[str]:
+    cols = feature_cols or FEATURE_COLS
     seen = []
-    for m in re.finditer(r'\bX(\d+)\b', expr):
+    for m in re.finditer(r'\bX(\d+)\b', expr or ''):
         idx = int(m.group(1))
-        if idx < len(FEATURE_COLS):
-            v = FEATURE_COLS[idx]
+        if idx < len(cols):
+            v = cols[idx]
             if v not in seen:
                 seen.append(v)
     return seen
+
+
+def _gp_expr_to_math(expr_str: str, feature_cols: list[str] | None = None) -> str:
+    """Convert gplearn expression to LaTeX using the factor's own X-column map."""
+    if not expr_str:
+        return ''
+    cols = feature_cols or FEATURE_COLS
+    tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*|-?\d+\.?\d*|[(),]', expr_str)
+    pos = 0
+
+    def parse():
+        nonlocal pos
+        if pos >= len(tokens):
+            return '?'
+        tok = tokens[pos]
+        pos += 1
+        if re.match(r'[A-Za-z_]', tok):
+            if pos < len(tokens) and tokens[pos] == '(':
+                pos += 1
+                args = []
+                if pos < len(tokens) and tokens[pos] != ')':
+                    args.append(parse())
+                    while pos < len(tokens) and tokens[pos] == ',':
+                        pos += 1
+                        args.append(parse())
+                if pos < len(tokens) and tokens[pos] == ')':
+                    pos += 1
+                fmt = GP_FUNC_MATH.get(tok)
+                if fmt:
+                    try:
+                        return fmt.format(*args)
+                    except Exception:
+                        return tok + '(' + ', '.join(args) + ')'
+                return tok + '(' + ', '.join(args) + ')'
+            if tok.startswith('X'):
+                try:
+                    idx = int(tok[1:])
+                    if idx < len(cols):
+                        return FM_GP_VAR_MATH.get(cols[idx], cols[idx])
+                except ValueError:
+                    pass
+            return FM_GP_VAR_MATH.get(tok, tok)
+        try:
+            return f'{float(tok):.3g}'
+        except ValueError:
+            return tok
+
+    try:
+        return parse()
+    except Exception:
+        return gp_expr_to_math(expr_str)
+
+
+def _active_gp_factors(mined: list[dict]) -> list[dict]:
+    return [f for f in mined if f.get('active', True) is not False and f.get('expression')]
+
+
+def _gp_factor_status(account_id: str, group: str, mined: list[dict], fv: dict | None, lang: str) -> dict:
+    active = _active_gp_factors(mined)
+    failures = [f for f in mined if f.get('status') == 'mining_failed']
+    inactive = [f for f in mined if f.get('active') is False and f.get('status') != 'mining_failed']
+    if active:
+        rows = (fv or {}).get('rows') or 0
+        tickers = (fv or {}).get('tickers') or 0
+        maxd = (fv or {}).get('max_date')
+        status = 'ready' if rows else 'ready_not_persisted'
+        if lang == 'en':
+            detail = (f'{len(active)} active GP expression(s). '
+                      f'Latest persisted factor_values: {tickers} tickers on {maxd or "—"}.')
+            if not rows:
+                detail = f'{len(active)} active GP expression(s). Runtime can compute them, but no persisted factor_values rows yet.'
+        else:
+            detail = (f'{len(active)} 个活跃 GP 表达式。'
+                      f'最新持久化 factor_values：{maxd or "—"}，覆盖 {tickers} 只标的。')
+            if not rows:
+                detail = f'{len(active)} 个活跃 GP 表达式。运行时可计算，但 factor_values 暂无持久化记录。'
+        return {
+            'status': status,
+            'severity': 'ok' if rows else 'warn',
+            'active_factors': len(active),
+            'inactive_factors': len(inactive),
+            'failure_markers': len(failures),
+            'latest_factor_date': maxd,
+            'persisted_rows': rows,
+            'persisted_tickers': tickers,
+            'detail': detail,
+        }
+    if failures:
+        reason = failures[-1].get('reason') or 'mining_failed'
+        retry_after = failures[-1].get('retry_after')
+        detail = (
+            f'No admissible factor under strict FactorMiner red-sea screening. Reason: {reason}.'
+            if lang == 'en' else
+            f'严格 FactorMiner 红海筛选下暂无可入库因子。原因：{reason}。'
+        )
+        return {
+            'status': 'mining_failed',
+            'severity': 'blocked',
+            'active_factors': 0,
+            'inactive_factors': len(inactive),
+            'failure_markers': len(failures),
+            'failure_reason': reason,
+            'retry_after': retry_after,
+            'detail': detail,
+        }
+    if inactive:
+        detail = (
+            f'All mined records are inactive/replaced ({len(inactive)} record(s)); no factor is currently tradeable.'
+            if lang == 'en' else
+            f'已有挖矿记录但全部 inactive/replaced（{len(inactive)} 条）；当前没有可交易活跃因子。'
+        )
+        return {
+            'status': 'inactive_replaced',
+            'severity': 'blocked',
+            'active_factors': 0,
+            'inactive_factors': len(inactive),
+            'failure_markers': 0,
+            'detail': detail,
+        }
+    detail = (
+        'No mined factor record found yet. Mining may not have run or results were not persisted.'
+        if lang == 'en' else
+        '尚未找到挖矿记录。可能是挖矿尚未运行，或结果未持久化。'
+    )
+    return {
+        'status': 'not_mined',
+        'severity': 'warn',
+        'active_factors': 0,
+        'inactive_factors': len(inactive),
+        'failure_markers': 0,
+        'detail': detail,
+    }
 
 
 _GP_PARAM_TEXT = {
@@ -280,25 +481,47 @@ async def get_factors(account_id: str, lang: str = 'zh', market: str = Query('US
             },
         }
 
-    # ==================== B group ====================
+    # ==================== B/F group (GP / FactorMiner-style GP) ====================
+    is_fmgp = (group == 'F') or factors_str.startswith('FMGP')
+    gp_backend = 'factor_miner_gp' if is_fmgp else 'gplearn'
     gp_params = _gp_param_breakdown(factors_str, lang=lang)
-    mined = _load_gp_alphas(account_id)
+    mined = _load_gp_alphas(account_id, backend=gp_backend)
+    active_mined = _active_gp_factors(mined)
 
-    VAR_DESC = GP_VAR_DESC_EN if lang == 'en' else GP_VAR_DESC_ZH
+    factor_group = f"{'fmgp' if is_fmgp else 'gp'}_{account_id}"
+    fv = await fetch_one(
+        'SELECT COUNT(*) as rows, COUNT(DISTINCT ticker) as tickers, '
+        'COUNT(DISTINCT factor_name) as n_factors, MAX(date) as max_date '
+        'FROM factor_values WHERE factor_group = :g',
+        {'g': factor_group},
+    )
+    factor_status = _gp_factor_status(account_id, group, mined, fv, lang)
+
+    VAR_DESC = FM_GP_VAR_DESC_EN if lang == 'en' else FM_GP_VAR_DESC_ZH
 
     factors = []
-    for alpha in mined:
+    for alpha in active_mined:
         expr = alpha.get('expression', '')
-        latex = gp_expr_to_math(expr)
-        vars_used = _expr_vars_used(expr)
+        feature_cols = alpha.get('feature_cols') or FEATURE_COLS
+        latex = _gp_expr_to_math(expr, feature_cols)
+        vars_used = _expr_vars_used(expr, feature_cols)
         vars_desc = [
-            {'name': v, 'latex': GP_VAR_MATH.get(v, v), 'desc': VAR_DESC.get(v, v)}
+            {'name': v, 'latex': FM_GP_VAR_MATH.get(v, v), 'desc': VAR_DESC.get(v, v)}
             for v in vars_used
         ]
-        expl = gp_explain(expr, lang=lang)
+        # Pass a variable-named expression to the explainer so X0 means the
+        # factor's own feature_cols[0] (critical for F/CF subset expressions).
+        named_expr = expr
+        for i, col in sorted(enumerate(feature_cols), key=lambda x: -x[0]):
+            named_expr = re.sub(rf'\bX{i}\b', col, named_expr)
+        expl = gp_explain(named_expr, lang=lang)
         factors.append({
             'name': alpha.get('name', ''),
             's_expression': expr,
+            'feature_cols': feature_cols,
+            'y_target': alpha.get('y_target'),
+            'backend': alpha.get('backend') or gp_backend,
+            'family': alpha.get('family') or ('F' if is_fmgp else 'B'),
             'latex': latex,
             'fitness': alpha.get('fitness'),
             'ic': alpha.get('ic'),
@@ -321,7 +544,7 @@ async def get_factors(account_id: str, lang: str = 'zh', market: str = Query('US
             r'\text{score}(i) = f^{GP}(i)'
             r',\qquad \text{signal}(i) = \text{CrossSectionRank}(\text{score})'
         )
-        n_factors_note = 1
+        n_factors_note = 1 if n_mined == 1 else 0
 
     B = _B_MOTIVATION[lang]
     if n_mined >= 2:
@@ -330,16 +553,30 @@ async def get_factors(account_id: str, lang: str = 'zh', market: str = Query('US
         motivation = B['single']
     else:
         motivation = B['none']
+        if factor_status.get('status') == 'mining_failed':
+            motivation = factor_status.get('detail') or motivation
+
+    note = (
+        'FactorMiner-style GP expressions come from factors/factor_miner_gp/mined_alphas_f.json. '
+        'Inactive/replaced/failed records are kept for audit but are not traded.'
+        if is_fmgp else B['note']
+    )
+    if lang == 'zh' and is_fmgp:
+        note = 'FactorMiner-style GP 表达式来自 factors/factor_miner_gp/mined_alphas_f.json。inactive/replaced/failed 记录会保留审计，但不会参与交易。'
 
     return {
-        'account_id': account_id, 'group': 'B',
+        'account_id': account_id, 'group': 'F' if is_fmgp else 'B',
+        'strategy_name': strategy_name,
         'gp_info': factors_str,
+        'gp_backend': gp_backend,
         'gp_params': gp_params,
         'factors': factors,
-        'note': B['note'],
+        'factor_status': factor_status,
+        'raw_mined_records': mined,
+        'note': note,
         'composite': {
             'latex': composite_latex,
-            'weights': 'equal' if n_mined >= 2 else 'single_expression',
+            'weights': 'equal' if n_mined >= 2 else ('single_expression' if n_mined == 1 else 'none'),
             'aggregation': 'gp_expression_then_rank',
             'n_factors': n_factors_note,
             'motivation': motivation,
