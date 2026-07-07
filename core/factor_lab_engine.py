@@ -7,8 +7,10 @@ creates accounts and never writes to the database.
 """
 from __future__ import annotations
 
+import ast
 import math
 import os
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -91,6 +93,19 @@ _VALID_TRANSFORMS = {"rank", "zscore"}
 _VALID_REBALANCE = {"daily", "weekly", "monthly"}
 _MIN_PERIOD = 1
 _MAX_PERIOD = 252
+_LATEX_MAX_LEN = 6000
+_LATEX_ALLOWED_FUNCS = {
+    "rank", "zscore", "rho", "corr", "cov", "delta", "lag", "mean", "sum",
+    "std", "min", "max", "abs", "log", "sqrt", "sign", "clip",
+}
+_LATEX_FUNC_ALIASES = {"correlation": "rho"}
+_LATEX_FACTOR_SYMBOLS = {
+    f["name"]: f["name"] for f in FACTOR_CATALOG
+}
+_LATEX_FACTOR_SYMBOLS.update({
+    "open": "OPEN", "high": "HIGH", "low": "LOW", "close": "CLOSE", "volume": "VOLUME", "vol": "VOLUME",
+    "OPEN": "OPEN", "HIGH": "HIGH", "LOW": "LOW", "CLOSE": "CLOSE", "VOLUME": "VOLUME", "VOL": "VOLUME",
+})
 
 
 @dataclass(frozen=True)
@@ -108,6 +123,30 @@ class FactorTerm:
             return f"{self.factor}_{self.periods[0]}"
         joined = ",".join(str(p) for p in self.periods)
         return f"{self.factor}[{joined}]"
+
+
+@dataclass(frozen=True)
+class FormulaTerm:
+    latex: str
+    weight: float = 1.0
+    transform: str = "rank"
+
+    @property
+    def display_name(self) -> str:
+        compact = re.sub(r"\s+", " ", self.latex).strip()
+        if len(compact) > 80:
+            compact = compact[:77] + "…"
+        return compact or "LaTeX formula"
+
+
+ExpressionTerm = FactorTerm | FormulaTerm
+
+
+@dataclass(frozen=True)
+class _FormulaNode:
+    kind: str
+    value: Any = None
+    args: tuple["_FormulaNode", ...] = ()
 
 
 def _round(v: Any, nd: int = 4):
@@ -201,9 +240,33 @@ def _parse_periods(item: dict[str, Any], base: str, parsed_period: int | None) -
     return tuple(out)
 
 
-def _normalise_terms(raw_terms: list[dict[str, Any]]) -> list[FactorTerm]:
-    terms: list[FactorTerm] = []
+def _normalise_terms(raw_terms: list[dict[str, Any]]) -> list[ExpressionTerm]:
+    terms: list[ExpressionTerm] = []
     for item in raw_terms or []:
+        mode = str(item.get("mode") or item.get("type") or "").strip().lower()
+        latex = str(item.get("latex") or "").strip()
+        if mode in {"latex", "formula"} or latex:
+            if not latex:
+                raise ValueError("LaTeX formula term needs a latex field")
+            if len(latex) > _LATEX_MAX_LEN:
+                raise ValueError(f"LaTeX formula is too long (max {_LATEX_MAX_LEN} chars)")
+            try:
+                weight = float(item.get("weight", 1.0))
+            except Exception as exc:
+                raise ValueError("invalid weight for LaTeX formula") from exc
+            if not math.isfinite(weight) or abs(weight) > 100:
+                raise ValueError("invalid weight for LaTeX formula")
+            if abs(weight) < 1e-12:
+                continue
+            transform = str(item.get("transform") or "rank").strip().lower()
+            if transform not in _VALID_TRANSFORMS:
+                raise ValueError(f"unsupported transform for LaTeX formula: {transform}")
+            # Parse now so validation errors are reported before the expensive
+            # OHLCV load. Evaluation reparses from the stored latex string.
+            _parse_latex_formula(latex)
+            terms.append(FormulaTerm(latex=latex, weight=weight, transform=transform))
+            continue
+
         base, parsed_period = _parse_factor_name(str(item.get("factor") or ""))
         try:
             weight = float(item.get("weight", 1.0))
@@ -223,8 +286,34 @@ def _normalise_terms(raw_terms: list[dict[str, Any]]) -> list[FactorTerm]:
     return terms
 
 
-def _max_period(terms: list[FactorTerm]) -> int:
-    vals = [p for t in terms for p in t.periods]
+def _latex_base_max_period(latex: str) -> int:
+    try:
+        node = _parse_latex_formula(latex)
+    except Exception:
+        return 1
+    max_period = 1
+
+    def walk(n: _FormulaNode):
+        nonlocal max_period
+        if n.kind == "base" and isinstance(n.value, tuple) and n.value[1] is not None:
+            try:
+                max_period = max(max_period, int(n.value[1]))
+            except Exception:
+                pass
+        for child in n.args:
+            walk(child)
+
+    walk(node)
+    return max_period
+
+
+def _max_period(terms: list[ExpressionTerm]) -> int:
+    vals: list[int] = []
+    for t in terms:
+        if isinstance(t, FactorTerm):
+            vals.extend(t.periods)
+        elif isinstance(t, FormulaTerm):
+            vals.append(_latex_base_max_period(t.latex))
     return max(vals or [1])
 
 
@@ -354,6 +443,8 @@ def _rsi(close: pd.DataFrame, period: int) -> pd.DataFrame:
 
 def _compute_factor_matrix(base: str, period: int | None, m: dict[str, pd.DataFrame]) -> pd.DataFrame:
     openp, high, low, close, volume = m["open"], m["high"], m["low"], m["close"], m["volume"]
+    if base in {"OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}:
+        return {"OPEN": openp, "HIGH": high, "LOW": low, "CLOSE": close, "VOLUME": volume}[base]
     if base == "KMID":
         return (close - openp) / openp
     if base == "KLEN":
@@ -417,12 +508,298 @@ def _transform_long(df: pd.DataFrame, transform: str) -> pd.DataFrame:
     return long[["date", "ticker", "x"]]
 
 
-def _build_signal(matrices: dict[str, pd.DataFrame], terms: list[FactorTerm], start_date: str, end_date: str) -> pd.DataFrame:
+def _transform_matrix(df: pd.DataFrame, transform: str) -> pd.DataFrame:
+    if transform == "rank":
+        return df.rank(axis=1, pct=True)
+    if transform == "zscore":
+        mu = df.mean(axis=1)
+        sd = df.std(axis=1).replace(0, np.nan)
+        return df.sub(mu, axis=0).div(sd, axis=0).clip(-5, 5)
+    raise ValueError(f"unsupported transform: {transform}")
+
+
+def _extract_braced(s: str, open_idx: int) -> tuple[str, int]:
+    if open_idx >= len(s) or s[open_idx] != "{":
+        raise ValueError("invalid LaTeX command: expected {...}")
+    depth = 0
+    start = open_idx + 1
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i], i + 1
+    raise ValueError("unbalanced braces in LaTeX formula")
+
+
+def _replace_braced_command(s: str, command: str, nargs: int, repl) -> str:
+    needle = "\\" + command
+    while True:
+        i = s.find(needle)
+        if i < 0:
+            return s
+        pos = i + len(needle)
+        args = []
+        for _ in range(nargs):
+            while pos < len(s) and s[pos].isspace():
+                pos += 1
+            if pos >= len(s) or s[pos] != "{":
+                break
+            arg, pos = _extract_braced(s, pos)
+            args.append(arg)
+        if len(args) != nargs:
+            # Not the command form we handle; leave it for the generic command
+            # mapper to produce a readable validation error if needed.
+            return s
+        s = s[:i] + repl(*args) + s[pos:]
+
+
+def _normalise_latex_to_expr(latex: str) -> str:
+    s = str(latex or "").strip()
+    # Friendly typo support from mobile keyboards / chat: /rho_5 -> \rho_5.
+    s = re.sub(r"/(?=(?:rho|corr|cov|Delta|delta|rank|zscore|sqrt|log|frac)(?:\b|_))", r"\\", s)
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2]
+    elif s.startswith("$") and s.endswith("$"):
+        s = s[1:-1]
+    s = s.replace("\\[", "").replace("\\]", "").replace("\\(", "").replace("\\)", "")
+    s = s.replace("ρ", "rho")
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = re.sub(r"\\operatorname\s*\{([^{}]+)\}", r"\1", s)
+    s = re.sub(r"\\(?:mathrm|mathbf|mathit|text)\s*\{([^{}]+)\}", r"\1", s)
+    s = _replace_braced_command(s, "frac", 2, lambda a, b: f"(({_normalise_latex_to_expr(a)})/({_normalise_latex_to_expr(b)}))")
+    s = _replace_braced_command(s, "sqrt", 1, lambda a: f"sqrt({_normalise_latex_to_expr(a)})")
+    s = _replace_braced_command(s, "log", 1, lambda a: f"log({_normalise_latex_to_expr(a)})")
+    # Commands with optional numeric subscript: \rho_5, \rho_{5}, \Delta_{10}.
+    def cmd_sub(m):
+        cmd = _LATEX_FUNC_ALIASES.get(m.group(1), m.group(1))
+        return f"{cmd}_{m.group(2)}"
+    s = re.sub(r"\\([A-Za-z]+)_\{(\d+)\}", cmd_sub, s)
+    s = re.sub(r"\\([A-Za-z]+)_(\d+)", cmd_sub, s)
+    def cmd_plain(m):
+        cmd = _LATEX_FUNC_ALIASES.get(m.group(1), m.group(1)) or m.group(1)
+        if cmd == "Delta":
+            cmd = "delta"
+        return str(cmd)
+    s = re.sub(r"\\([A-Za-z]+)", cmd_plain, s)
+    # Factor/fn subscripts: ROC_{5}, CLOSE_{t} (the latter is intentionally
+    # not supported as a time index, but this keeps numeric factor syntax nice).
+    s = re.sub(r"([A-Za-z][A-Za-z0-9]*)_\{(\d+)\}", r"\1_\2", s)
+    s = re.sub(r"\^\{([^{}]+)\}", r"**(\1)", s)
+    s = re.sub(r"\^(\d+(?:\.\d+)?)", r"**\1", s)
+    s = s.replace("\u2212", "-").replace("×", "*").replace("·", "*")
+    s = re.sub(r"\\[,;! ]", "", s)
+    s = re.sub(r"(\d+(?:\.\d+)?|\))\s+(?=[A-Za-z_(])", r"\1*", s)
+    return s.strip()
+
+
+def _parse_latex_formula(latex: str) -> _FormulaNode:
+    expr = _normalise_latex_to_expr(latex)
+    if not expr:
+        raise ValueError("empty LaTeX formula")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"unsupported LaTeX formula syntax near: {expr[:120]}") from exc
+
+    def parse_node(node: ast.AST) -> _FormulaNode:
+        if isinstance(node, ast.Expression):
+            return parse_node(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            v = float(node.value)
+            if not math.isfinite(v):
+                raise ValueError("non-finite number in LaTeX formula")
+            return _FormulaNode("number", v)
+        if isinstance(node, ast.Name):
+            return _FormulaNode("base", _parse_formula_symbol(node.id))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            op = "neg" if isinstance(node.op, ast.USub) else "pos"
+            return _FormulaNode("unary", op, (parse_node(node.operand),))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+            op = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Pow: "pow"}[type(node.op)]
+            return _FormulaNode("op", op, (parse_node(node.left), parse_node(node.right)))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            base, period = _split_func_period(fname)
+            if base not in _LATEX_ALLOWED_FUNCS:
+                raise ValueError(f"unsupported LaTeX function: {fname}")
+            if node.keywords:
+                raise ValueError("keyword arguments are not supported in LaTeX formulas")
+            return _FormulaNode("call", (base, period), tuple(parse_node(a) for a in node.args))
+        raise ValueError("unsupported LaTeX formula syntax; use arithmetic, factor names, and whitelisted functions only")
+
+    return parse_node(tree)
+
+
+def _parse_formula_symbol(name: str) -> tuple[str, int | None]:
+    raw = str(name or "").strip()
+    if raw in _LATEX_FACTOR_SYMBOLS:
+        mapped = _LATEX_FACTOR_SYMBOLS[raw]
+        if mapped in {"OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}:
+            return mapped, None
+        return _parse_factor_name(mapped)
+    upper = raw.upper()
+    if upper in _LATEX_FACTOR_SYMBOLS:
+        mapped = _LATEX_FACTOR_SYMBOLS[upper]
+        if mapped in {"OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"}:
+            return mapped, None
+        return _parse_factor_name(mapped)
+    try:
+        return _parse_factor_name(upper)
+    except Exception as exc:
+        raise ValueError(f"unsupported symbol in LaTeX formula: {raw}") from exc
+
+
+def _split_func_period(name: str) -> tuple[str, int | None]:
+    raw = str(name or "").strip()
+    m = re.fullmatch(r"([A-Za-z][A-Za-z0-9]*?)_(\d+)", raw)
+    if m:
+        base = _LATEX_FUNC_ALIASES.get(m.group(1), m.group(1)).lower()
+        if base == "delta":
+            base = "delta"
+        p = int(m.group(2))
+        if not (_MIN_PERIOD <= p <= _MAX_PERIOD):
+            raise ValueError(f"function period must be {_MIN_PERIOD}..{_MAX_PERIOD}: {p}")
+        return base, p
+    base = _LATEX_FUNC_ALIASES.get(raw, raw).lower()
+    if base == "delta":
+        base = "delta"
+    return base, None
+
+
+def _number_node_value(node: _FormulaNode) -> float | None:
+    if node.kind == "number":
+        return float(node.value)
+    if node.kind == "unary" and node.args and node.args[0].kind == "number":
+        v = float(node.args[0].value)
+        return -v if node.value == "neg" else v
+    return None
+
+
+def _period_from_call(func: str, period: int | None, args: tuple[_FormulaNode, ...], pos: int, default: int | None = None) -> int:
+    p = period
+    if p is None and len(args) > pos:
+        v = _number_node_value(args[pos])
+        if v is not None and float(v).is_integer():
+            p = int(v)
+    if p is None:
+        if default is None:
+            raise ValueError(f"{func} needs a numeric period, e.g. {func}_5(...)")
+        p = default
+    if not (_MIN_PERIOD <= int(p) <= _MAX_PERIOD):
+        raise ValueError(f"{func} period must be {_MIN_PERIOD}..{_MAX_PERIOD}: {p}")
+    return int(p)
+
+
+def _eval_formula_node(node: _FormulaNode, matrices: dict[str, pd.DataFrame]):
+    if node.kind == "number":
+        return float(node.value)
+    if node.kind == "base":
+        base, period = node.value
+        if base in _TUNABLE_FACTORS and period is None:
+            period = int(_CATALOG_BY_NAME[base].get("default_period") or 20)
+        return _compute_factor_matrix(base, period, matrices)
+    if node.kind == "unary":
+        v = _eval_formula_node(node.args[0], matrices)
+        return -v if node.value == "neg" else v
+    if node.kind == "op":
+        a = _eval_formula_node(node.args[0], matrices)
+        b = _eval_formula_node(node.args[1], matrices)
+        if node.value == "add":
+            return a + b
+        if node.value == "sub":
+            return a - b
+        if node.value == "mul":
+            return a * b
+        if node.value == "div":
+            return a / (b + 1e-12 if isinstance(b, pd.DataFrame) else b)
+        if node.value == "pow":
+            return a ** b
+    if node.kind == "call":
+        func, period = node.value
+        args = node.args
+        if func in {"rank", "zscore"}:
+            if len(args) != 1:
+                raise ValueError(f"{func}() takes one argument")
+            return _transform_matrix(_eval_formula_node(args[0], matrices), func)
+        if func in {"rho", "corr"}:
+            if len(args) not in {2, 3}:
+                raise ValueError("rho/corr takes two series plus optional period")
+            p = _period_from_call("rho", period, args, 2)
+            a = _eval_formula_node(args[0], matrices)
+            b = _eval_formula_node(args[1], matrices)
+            return a.rolling(p).corr(b)
+        if func == "cov":
+            if len(args) not in {2, 3}:
+                raise ValueError("cov takes two series plus optional period")
+            p = _period_from_call("cov", period, args, 2)
+            return _eval_formula_node(args[0], matrices).rolling(p).cov(_eval_formula_node(args[1], matrices))
+        if func in {"delta", "lag", "mean", "sum", "std", "min", "max"}:
+            if len(args) not in {1, 2}:
+                raise ValueError(f"{func} takes one series plus optional period")
+            p = _period_from_call(func, period, args, 1)
+            x = _eval_formula_node(args[0], matrices)
+            if func == "delta":
+                return x - x.shift(p)
+            if func == "lag":
+                return x.shift(p)
+            if func == "mean":
+                return x.rolling(p).mean()
+            if func == "sum":
+                return x.rolling(p).sum()
+            if func == "std":
+                return x.rolling(p).std()
+            if func == "min":
+                return x.rolling(p).min()
+            if func == "max":
+                return x.rolling(p).max()
+        if func in {"abs", "log", "sqrt", "sign"}:
+            if len(args) != 1:
+                raise ValueError(f"{func} takes one argument")
+            x = _eval_formula_node(args[0], matrices)
+            if func == "abs":
+                return x.abs() if isinstance(x, pd.DataFrame) else abs(x)
+            if func == "log":
+                return np.log(x.replace(0, np.nan).abs() + 1e-12) if isinstance(x, pd.DataFrame) else math.log(abs(float(x)) + 1e-12)
+            if func == "sqrt":
+                return np.sqrt(x.clip(lower=0)) if isinstance(x, pd.DataFrame) else math.sqrt(max(float(x), 0.0))
+            if func == "sign":
+                return np.sign(x)
+        if func == "clip":
+            if len(args) != 3:
+                raise ValueError("clip takes x, low, high")
+            x = _eval_formula_node(args[0], matrices)
+            lo = _number_node_value(args[1])
+            hi = _number_node_value(args[2])
+            if lo is None or hi is None:
+                raise ValueError("clip bounds must be numeric constants")
+            return x.clip(lower=lo, upper=hi) if isinstance(x, pd.DataFrame) else min(max(float(x), lo), hi)
+    raise ValueError("could not evaluate LaTeX formula")
+
+
+def _compute_formula_matrix(latex: str, matrices: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    node = _parse_latex_formula(latex)
+    out = _eval_formula_node(node, matrices)
+    if not isinstance(out, pd.DataFrame):
+        raise ValueError("LaTeX formula must evaluate to a ticker×date matrix, not a scalar")
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _build_signal(matrices: dict[str, pd.DataFrame], terms: list[ExpressionTerm], start_date: str, end_date: str) -> pd.DataFrame:
     pieces = []
     for term in terms:
         period_parts = []
-        for period in (term.periods or (None,)):
-            mat = _compute_factor_matrix(term.factor, period, matrices)
+        if isinstance(term, FactorTerm):
+            for period in (term.periods or (None,)):
+                mat = _compute_factor_matrix(term.factor, period, matrices)
+                mat = mat.loc[(mat.index >= start_date) & (mat.index <= end_date)]
+                long = _transform_long(mat, term.transform)
+                if not long.empty:
+                    period_parts.append(long)
+        elif isinstance(term, FormulaTerm):
+            mat = _compute_formula_matrix(term.latex, matrices)
             mat = mat.loc[(mat.index >= start_date) & (mat.index <= end_date)]
             long = _transform_long(mat, term.transform)
             if not long.empty:
@@ -648,6 +1025,13 @@ def _run_portfolio(
     return curve, period_returns, avg_turnover, latest_holdings, trades[-100:], diagnostics
 
 
+def _term_payload(t: ExpressionTerm) -> dict[str, Any]:
+    base = {"weight": t.weight, "transform": t.transform, "display_name": t.display_name}
+    if isinstance(t, FactorTerm):
+        return {**base, "mode": "factor", "factor": t.factor, "periods": list(t.periods)}
+    return {**base, "mode": "latex", "latex": t.latex}
+
+
 def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     market = str(request.get("market") or "US").upper()
     if market not in {"US", "CN"}:
@@ -708,7 +1092,8 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             hold_band_mult, cooldown_days, min_hold_days, market,
         )
         st = _stats(equity_curve, returns, initial_capital)
-        merged_terms = [t for t in terms if len(t.periods) > 1]
+        merged_terms = [t for t in terms if isinstance(t, FactorTerm) and len(t.periods) > 1]
+        formula_terms = [t for t in terms if isinstance(t, FormulaTerm)]
         warnings: list[str] = [
             "当前股票池使用现有 universe / prices 回看历史，不是完整 survivorship-free 数据库。",
             "默认口径避免前瞻：t日信号从 t+1 close 后才开始计收益；IC 使用 close[t+1+h] / close[t+1] - 1。",
@@ -725,6 +1110,9 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             f"Universe is auto-selected from the configured {market} universe ({len(selected)} usable tickers); transaction cost estimate uses {exec_diag.get('cost_model')}.",
             f"Rank-cutoff hysteresis / no-trade band is applied: buy threshold top {top_n}, hold threshold top {top_n * hold_band_mult}.",
         ]
+        if formula_terms:
+            warnings.append("LaTeX 公式会先被解析成白名单计算图（如 \\rho_N、rolling mean/std、rank/zscore），不会执行任意 Python/JS。")
+            warnings_en.append("LaTeX formulas are parsed into a whitelisted compute graph (e.g. \\rho_N, rolling mean/std, rank/zscore); arbitrary Python/JS is never executed.")
         if merged_terms:
             names = ", ".join(t.display_name for t in merged_terms[:4])
             warnings.append(f"已合并同族周期：{names}。")
@@ -750,7 +1138,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "status": "ok",
             "market": market,
             "expression": {
-                "terms": [{"factor": t.factor, "periods": list(t.periods), "weight": t.weight, "transform": t.transform, "display_name": t.display_name} for t in terms],
+                "terms": [_term_payload(t) for t in terms],
                 "aggregation": "per_period_transform_then_merge_periods_then_weighted_rank",
             },
             "summary": summary,

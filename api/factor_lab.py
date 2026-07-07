@@ -15,7 +15,9 @@ router = APIRouter(prefix="/api/factor-lab", tags=["factor_lab"])
 
 
 class FactorTermRequest(BaseModel):
-    factor: str
+    mode: Literal["factor", "latex"] = "factor"
+    factor: str | None = None
+    latex: str | None = Field(None, max_length=6000)
     weight: float = Field(1.0, ge=-100, le=100)
     transform: Literal["rank", "zscore"] = "rank"
     period: int | None = Field(None, ge=1, le=252)

@@ -2153,10 +2153,47 @@ body::after {
 .fl-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .fl-field-row-3 { grid-template-columns: 1fr 1fr 1fr; }
 .fl-term-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
+.fl-term-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.fl-latex-help {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(172,57,255,0.07);
+  border: 1px solid rgba(172,57,255,0.14);
+  margin-top: 10px;
+}
 .fl-mini-title { font-size: 16px; margin-bottom: 0; }
 .fl-small-btn { padding: 7px 10px; font-size: 12px; }
 .fl-terms { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .fl-term-row { display: grid; grid-template-columns: minmax(0, 1.35fr) 108px 70px 88px 34px; gap: 8px; align-items: center; }
+.fl-term-row-latex { grid-template-columns: 58px minmax(0, 1fr) 70px 88px 34px; align-items: stretch; }
+.fl-term-mode {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9px;
+  border: 1px solid rgba(172,57,255,0.18);
+  background: rgba(172,57,255,0.08);
+  color: var(--accent-purple);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.fl-term-latex { min-height: 64px; resize: vertical; font-family: var(--font-mono); line-height: 1.35; }
+.fl-latex-preview {
+  grid-column: 2 / -1;
+  min-height: 38px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.52);
+  border: 1px solid rgba(0,0,0,0.055);
+  color: var(--text-primary);
+}
+.fl-latex-preview .katex { color: var(--accent-blue); }
 .fl-term-factor, .fl-term-transform, .fl-term-weight, .fl-term-periods { min-width: 0; }
 .fl-term-periods:disabled { opacity: 0.45; background: rgba(0,0,0,0.03); }
 .fl-term-remove {
@@ -2215,6 +2252,7 @@ body::after {
   .factor-lab-config { position: static; }
 }
 @media (max-width: 560px) {
-  .fl-field-row, .fl-term-row { grid-template-columns: 1fr; }
+  .fl-field-row, .fl-term-row, .fl-term-row-latex { grid-template-columns: 1fr; }
+  .fl-latex-preview { grid-column: 1; }
   .fl-term-remove { width: 100%; }
 }

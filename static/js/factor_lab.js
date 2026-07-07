@@ -4,7 +4,7 @@
 // building blocks, run look-ahead-safe IC + simple top-N portfolio diagnostics.
 
 (function () {
-  const STORE_KEY = 'cqa_factor_lab_terms_v1';
+  const STORE_KEY = 'cqa_factor_lab_terms_v2';
   const _state = {
     catalog: [],
     terms: [],
@@ -39,10 +39,11 @@
 
   function defaultTerms() {
     return [
-      { factor: 'ROC', periods: [5, 10, 20], weight: 0.4, transform: 'rank' },
-      { factor: 'MA_RATIO', periods: [20], weight: 0.3, transform: 'rank' },
-      { factor: 'RSI', periods: [14], weight: -0.2, transform: 'rank' },
-      { factor: 'VSTD', periods: [20], weight: 0.1, transform: 'rank' },
+      { mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20) + 0.5 \\Delta_3(RSI_14)', weight: 0.5, transform: 'rank' },
+      { mode: 'factor', factor: 'ROC', periods: [5, 10, 20], weight: 0.4, transform: 'rank' },
+      { mode: 'factor', factor: 'MA_RATIO', periods: [20], weight: 0.3, transform: 'rank' },
+      { mode: 'factor', factor: 'RSI', periods: [14], weight: -0.2, transform: 'rank' },
+      { mode: 'factor', factor: 'VSTD', periods: [20], weight: 0.1, transform: 'rank' },
     ];
   }
 
@@ -60,11 +61,15 @@
   }
 
   function normalizeTerm(t) {
+    const mode = (t.mode === 'latex' || t.latex != null) ? 'latex' : 'factor';
+    if (mode === 'latex') {
+      return { mode: 'latex', latex: String(t.latex || '').trim(), weight: Number(t.weight || 0), transform: t.transform || 'rank' };
+    }
     const parsed = parseLegacyFactorName(t.factor);
     const factor = parsed.factor;
     let periods = Array.isArray(t.periods) ? t.periods : (t.period != null ? [t.period] : parsed.periods);
     periods = (periods || []).map(x => parseInt(x, 10)).filter(x => Number.isFinite(x) && x >= 1 && x <= 252);
-    return { factor, periods, weight: Number(t.weight || 0), transform: t.transform || 'rank' };
+    return { mode: 'factor', factor, periods, weight: Number(t.weight || 0), transform: t.transform || 'rank' };
   }
 
   function loadSavedTerms() {
@@ -150,8 +155,12 @@
 
             <div class="fl-term-header">
               <div class="section-title fl-mini-title">${t('fl_expression')}</div>
-              <button class="btn btn-secondary fl-small-btn" id="fl-reset">${t('fl_reset_sample')}</button>
+              <div class="fl-term-actions">
+                <button class="btn btn-secondary fl-small-btn" id="fl-add-latex">＋ ${t('fl_add_latex')}</button>
+                <button class="btn btn-secondary fl-small-btn" id="fl-reset">${t('fl_reset_sample')}</button>
+              </div>
             </div>
+            <div class="fl-latex-help">${t('fl_latex_help')}</div>
             <div id="fl-terms" class="fl-terms"></div>
             <button class="btn btn-secondary fl-add-term" id="fl-add-term">＋ ${t('fl_add_factor')}</button>
             <button class="btn btn-accent bt-run-btn fl-run" id="fl-run">${t('fl_run')}</button>
@@ -216,7 +225,12 @@
 
   function bindStaticControls() {
     document.getElementById('fl-add-term').addEventListener('click', () => {
-      _state.terms.push({ factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC', periods: [((_state.catalog[0] && _state.catalog[0].default_period) || 20)], weight: 1, transform: 'rank' });
+      _state.terms.push({ mode: 'factor', factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC', periods: [((_state.catalog[0] && _state.catalog[0].default_period) || 20)], weight: 1, transform: 'rank' });
+      saveTerms();
+      paintTerms();
+    });
+    document.getElementById('fl-add-latex').addEventListener('click', () => {
+      _state.terms.push({ mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20)', weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
     });
@@ -245,14 +259,44 @@
       .filter((x, i, arr) => arr.indexOf(x) === i);
   }
 
+  function renderLatexPreview(el, latex) {
+    if (!el) return;
+    const raw = normalizeLatexInput(latex || '');
+    if (!raw) { el.textContent = '—'; return; }
+    if (window.katex) {
+      try { katex.render(raw, el, { throwOnError: false, displayMode: false }); return; }
+      catch (e) { /* fallback below */ }
+    }
+    el.textContent = raw;
+  }
+
+  function normalizeLatexInput(s) {
+    return String(s || '').replace(/\/(rho|corr|cov|Delta|delta|rank|zscore|sqrt|log|frac)(?=\b|_)/g, '\\$1').trim();
+  }
+
   function paintTerms() {
     const host = document.getElementById('fl-terms');
-    const opts = (_state.catalog.length ? _state.catalog : defaultTerms().map(t => ({ name: t.factor, kind: 'tunable' })))
+    const opts = (_state.catalog.length ? _state.catalog : defaultTerms().filter(t => t.mode !== 'latex').map(t => ({ name: t.factor, kind: 'tunable' })))
       .map(f => `<option value="${esc(f.name)}">${esc(f.name)}${f.label_zh ? ' · ' + esc(pickFactorLabel(f)) : ''}</option>`).join('');
     host.innerHTML = _state.terms.map((term, i) => {
+      term = normalizeTerm(term);
+      if (term.mode === 'latex') {
+        return `
+      <div class="fl-term-row fl-term-row-latex" data-idx="${i}" data-mode="latex">
+        <div class="fl-term-mode">LaTeX</div>
+        <textarea class="bt-input fl-term-latex" data-field="latex" rows="3" placeholder="${t('fl_latex_ph')}">${esc(term.latex || '')}</textarea>
+        <input type="number" class="bt-input fl-term-weight" data-field="weight" step="0.1" value="${Number(term.weight || 0)}">
+        <select class="bt-input fl-term-transform" data-field="transform">
+          <option value="rank">rank</option>
+          <option value="zscore">zscore</option>
+        </select>
+        <button class="fl-term-remove" title="${t('fl_remove')}">×</button>
+        <div class="fl-latex-preview" data-preview="latex"></div>
+      </div>`;
+      }
       const tunable = isTunable(term.factor) || (term.periods && term.periods.length);
       return `
-      <div class="fl-term-row" data-idx="${i}">
+      <div class="fl-term-row" data-idx="${i}" data-mode="factor">
         <select class="bt-input fl-term-factor" data-field="factor">${opts}</select>
         <input type="text" class="bt-input fl-term-periods" data-field="periods" value="${esc(periodText(term))}" placeholder="${t('fl_periods_ph')}" ${tunable ? '' : 'disabled'}>
         <input type="number" class="bt-input fl-term-weight" data-field="weight" step="0.1" value="${Number(term.weight || 0)}">
@@ -265,6 +309,31 @@
     }).join('');
     host.querySelectorAll('.fl-term-row').forEach(row => {
       const idx = parseInt(row.dataset.idx, 10);
+      if (row.dataset.mode === 'latex') {
+        const latex = row.querySelector('[data-field="latex"]');
+        const w = row.querySelector('[data-field="weight"]');
+        const tr = row.querySelector('[data-field="transform"]');
+        const preview = row.querySelector('[data-preview="latex"]');
+        tr.value = _state.terms[idx].transform || 'rank';
+        const update = () => {
+          const val = normalizeLatexInput(latex.value);
+          if (latex.value !== val && latex.value.startsWith('/')) latex.value = val;
+          _state.terms[idx] = { mode: 'latex', latex: val, weight: parseFloat(w.value) || 0, transform: tr.value };
+          renderLatexPreview(preview, val);
+          saveTerms();
+        };
+        [latex, w, tr].forEach(el => {
+          el.addEventListener('change', update);
+          el.addEventListener('input', update);
+        });
+        renderLatexPreview(preview, latex.value);
+        row.querySelector('.fl-term-remove').addEventListener('click', () => {
+          _state.terms.splice(idx, 1);
+          saveTerms();
+          paintTerms();
+        });
+        return;
+      }
       const f = row.querySelector('[data-field="factor"]');
       const p = row.querySelector('[data-field="periods"]');
       const w = row.querySelector('[data-field="weight"]');
@@ -275,7 +344,7 @@
         const selected = f.value;
         const cat = catalogByName()[selected] || {};
         const periods = cat.kind === 'tunable' ? (parsePeriodText(p.value).length ? parsePeriodText(p.value) : [cat.default_period || 20]) : [];
-        _state.terms[idx] = { factor: selected, periods, weight: parseFloat(w.value) || 0, transform: tr.value };
+        _state.terms[idx] = { mode: 'factor', factor: selected, periods, weight: parseFloat(w.value) || 0, transform: tr.value };
         saveTerms();
       };
       f.addEventListener('change', () => {
@@ -334,7 +403,7 @@
     host.querySelectorAll('.fl-factor-chip').forEach(btn => {
       btn.addEventListener('click', () => {
         const item = catalogByName()[btn.dataset.factor] || {};
-        _state.terms.push({ factor: btn.dataset.factor, periods: item.kind === 'tunable' ? [item.default_period || 20] : [], weight: 1, transform: 'rank' });
+        _state.terms.push({ mode: 'factor', factor: btn.dataset.factor, periods: item.kind === 'tunable' ? [item.default_period || 20] : [], weight: 1, transform: 'rank' });
         saveTerms();
         paintTerms();
       });
@@ -357,7 +426,7 @@
       min_hold_days: parseInt(document.getElementById('fl-min-hold').value, 10) || 0,
       horizon: parseInt(document.getElementById('fl-horizon').value, 10) || 5,
       window: 20,
-      expression: { terms: _state.terms.map(normalizeTerm).filter(t => t.factor && Number(t.weight) !== 0), final_transform: 'rank' },
+      expression: { terms: _state.terms.map(normalizeTerm).filter(t => (t.mode === 'latex' ? t.latex : t.factor) && Number(t.weight) !== 0), final_transform: 'rank' },
     };
     if (!body.start_date || !body.end_date) { alert(t('bt_pick_dates')); return; }
     if (!body.expression.terms.length) { alert(t('fl_need_factor')); return; }
