@@ -150,6 +150,16 @@
           <p class="page-subtitle">${t('fl_subtitle')}</p>
         </div>
         <div class="factor-lab-layout">
+          <div class="factor-lab-library">
+            <div class="glass-card section factor-catalog-card">
+              <div class="section-title-row">
+                <div class="section-title">${t('fl_catalog')}</div>
+                <input id="fl-factor-search" class="sym-search-input fl-search" placeholder="${t('fl_search_factor')}" autocomplete="off">
+              </div>
+              <div id="fl-catalog-host" class="fl-catalog-host"><p class="fl-muted">${t('bt_loading')}</p></div>
+            </div>
+          </div>
+
           <div class="glass-card section factor-lab-config">
             <div class="fl-step-title"><span>1</span><div><b>${t('fl_choose_recipe')}</b><em>${t('fl_choose_recipe_desc')}</em></div></div>
             <div id="fl-presets" class="fl-presets"></div>
@@ -230,13 +240,6 @@
           </div>
 
           <div class="factor-lab-main">
-            <div class="glass-card section factor-catalog-card">
-              <div class="section-title-row">
-                <div class="section-title">${t('fl_catalog')}</div>
-                <input id="fl-factor-search" class="sym-search-input fl-search" placeholder="${t('fl_search_factor')}" autocomplete="off">
-              </div>
-              <div id="fl-catalog-host" class="fl-catalog-host"><p class="fl-muted">${t('bt_loading')}</p></div>
-            </div>
             <div id="fl-result-host" class="factor-lab-results">
               <div class="glass-card section fl-empty">
                 <div class="fl-empty-icon">🧪</div>
@@ -448,7 +451,7 @@
     const raw = normalizeLatexInput(latex || '');
     if (!raw) { el.textContent = '—'; return; }
     if (window.katex) {
-      try { katex.render(raw, el, { throwOnError: false, displayMode: false }); return; }
+      try { katex.render(raw, el, { throwOnError: false, displayMode: el.classList.contains('fl-formula-katex') || el.classList.contains('fl-gp-latex') }); return; }
       catch (e) { /* fallback below */ }
     }
     el.textContent = raw;
