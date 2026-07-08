@@ -38,13 +38,62 @@
   }
 
   function defaultTerms() {
-    return [
-      { mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20) + 0.5 \\Delta_3(RSI_14)', weight: 0.5, transform: 'rank' },
-      { mode: 'factor', factor: 'ROC', periods: [5, 10, 20], weight: 0.4, transform: 'rank' },
-      { mode: 'factor', factor: 'MA_RATIO', periods: [20], weight: 0.3, transform: 'rank' },
-      { mode: 'factor', factor: 'RSI', periods: [14], weight: -0.2, transform: 'rank' },
-      { mode: 'factor', factor: 'VSTD', periods: [20], weight: 0.1, transform: 'rank' },
-    ];
+    return presetConfigs().momentum.terms.map(t => ({ ...t }));
+  }
+
+  function presetConfigs() {
+    return {
+      momentum: {
+        icon: '🚀',
+        title: t('fl_preset_momentum'),
+        desc: t('fl_preset_momentum_desc'),
+        terms: [
+          { mode: 'factor', factor: 'ROC', periods: [20], weight: 0.55, transform: 'rank' },
+          { mode: 'factor', factor: 'MA_RATIO', periods: [20], weight: 0.30, transform: 'rank' },
+          { mode: 'factor', factor: 'VMOM', periods: [20], weight: 0.15, transform: 'rank' },
+        ],
+        topN: 5,
+        horizon: 5,
+        holdBand: 3,
+      },
+      reversal: {
+        icon: '↩️',
+        title: t('fl_preset_reversal'),
+        desc: t('fl_preset_reversal_desc'),
+        terms: [
+          { mode: 'factor', factor: 'RSI', periods: [14], weight: -0.45, transform: 'rank' },
+          { mode: 'factor', factor: 'RSV', periods: [9], weight: -0.30, transform: 'rank' },
+          { mode: 'factor', factor: 'BBPOS', periods: [20], weight: -0.25, transform: 'rank' },
+        ],
+        topN: 5,
+        horizon: 5,
+        holdBand: 3,
+      },
+      defensive: {
+        icon: '🛡️',
+        title: t('fl_preset_defensive'),
+        desc: t('fl_preset_defensive_desc'),
+        terms: [
+          { mode: 'factor', factor: 'STD', periods: [20], weight: -0.40, transform: 'rank' },
+          { mode: 'factor', factor: 'VSTD', periods: [20], weight: -0.25, transform: 'rank' },
+          { mode: 'factor', factor: 'MA_RATIO', periods: [20], weight: 0.35, transform: 'rank' },
+        ],
+        topN: 8,
+        horizon: 10,
+        holdBand: 4,
+      },
+      custom: {
+        icon: 'ƒ',
+        title: t('fl_preset_custom'),
+        desc: t('fl_preset_custom_desc'),
+        terms: [
+          { mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20) + 0.5 \\Delta_3(RSI_14)', weight: 1, transform: 'rank' },
+        ],
+        topN: 5,
+        horizon: 5,
+        holdBand: 3,
+      },
+    };
   }
 
   function parseLegacyFactorName(name) {
@@ -100,8 +149,10 @@
         </div>
         <div class="factor-lab-layout">
           <div class="glass-card section factor-lab-config">
-            <div class="section-title">${t('fl_builder')}</div>
-            <div class="fl-method-note">${t('fl_method_note')}</div>
+            <div class="fl-step-title"><span>1</span><div><b>${t('fl_choose_recipe')}</b><em>${t('fl_choose_recipe_desc')}</em></div></div>
+            <div id="fl-presets" class="fl-presets"></div>
+
+            <div class="fl-step-title"><span>2</span><div><b>${t('fl_quick_settings')}</b><em>${t('fl_quick_settings_desc')}</em></div></div>
             <div class="fl-field-row">
               <div class="bt-field">
                 <label>${t('bt_start_date')}</label>
@@ -112,25 +163,10 @@
                 <input type="date" id="fl-end" class="bt-input">
               </div>
             </div>
-            <div class="fl-field-row">
-              <div class="bt-field">
-                <label>${t('bt_initial_capital')}</label>
-                <input type="number" id="fl-capital" class="bt-input" value="${state.market === 'CN' ? 100000 : 10000}">
-              </div>
+            <div class="fl-field-row fl-field-row-3 fl-quick-row">
               <div class="bt-field">
                 <label>${t('fl_top_n')}</label>
                 <input type="number" id="fl-topn" class="bt-input" min="1" max="500" value="5">
-              </div>
-            </div>
-            <div class="fl-auto-note" id="fl-auto-note"></div>
-            <div class="fl-field-row fl-field-row-3">
-              <div class="bt-field">
-                <label>${t('fl_rebalance_days')}</label>
-                <input type="number" id="fl-rebalance-days" class="bt-input" min="1" max="60" value="1">
-              </div>
-              <div class="bt-field">
-                <label>${t('fl_hold_band_mult')}</label>
-                <input type="number" id="fl-hold-band" class="bt-input" min="1" max="10" value="3">
               </div>
               <div class="bt-field">
                 <label>${t('fl_horizon')}</label>
@@ -141,28 +177,53 @@
                   <option value="20">20D</option>
                 </select>
               </div>
-            </div>
-            <div class="fl-field-row">
               <div class="bt-field">
-                <label>${t('fl_cooldown_days')}</label>
-                <input type="number" id="fl-cooldown" class="bt-input" min="0" max="60" value="0">
-              </div>
-              <div class="bt-field">
-                <label>${t('fl_min_hold_days')}</label>
-                <input type="number" id="fl-min-hold" class="bt-input" min="0" max="60" value="0">
+                <label>${t('bt_initial_capital')}</label>
+                <input type="number" id="fl-capital" class="bt-input" value="${state.market === 'CN' ? 100000 : 10000}">
               </div>
             </div>
+            <div class="fl-auto-note" id="fl-auto-note"></div>
 
-            <div class="fl-term-header">
-              <div class="section-title fl-mini-title">${t('fl_expression')}</div>
-              <div class="fl-term-actions">
-                <button class="btn btn-secondary fl-small-btn" id="fl-add-latex">＋ ${t('fl_add_latex')}</button>
-                <button class="btn btn-secondary fl-small-btn" id="fl-reset">${t('fl_reset_sample')}</button>
+            <details class="fl-advanced">
+              <summary>${t('fl_advanced_settings')}</summary>
+              <div class="fl-field-row fl-field-row-3">
+                <div class="bt-field">
+                  <label>${t('fl_rebalance_days')}</label>
+                  <input type="number" id="fl-rebalance-days" class="bt-input" min="1" max="60" value="1">
+                </div>
+                <div class="bt-field">
+                  <label>${t('fl_hold_band_mult')}</label>
+                  <input type="number" id="fl-hold-band" class="bt-input" min="1" max="10" value="3">
+                </div>
+                <div class="bt-field">
+                  <label>${t('fl_cooldown_days')}</label>
+                  <input type="number" id="fl-cooldown" class="bt-input" min="0" max="60" value="0">
+                </div>
               </div>
-            </div>
-            <div class="fl-latex-help">${t('fl_latex_help')}</div>
-            <div id="fl-terms" class="fl-terms"></div>
-            <button class="btn btn-secondary fl-add-term" id="fl-add-term">＋ ${t('fl_add_factor')}</button>
+              <div class="fl-field-row">
+                <div class="bt-field">
+                  <label>${t('fl_min_hold_days')}</label>
+                  <input type="number" id="fl-min-hold" class="bt-input" min="0" max="60" value="0">
+                </div>
+                <div class="fl-method-note">${t('fl_method_note')}</div>
+              </div>
+            </details>
+
+            <div class="fl-step-title"><span>3</span><div><b>${t('fl_expression')}</b><em>${t('fl_expression_desc')}</em></div></div>
+            <div id="fl-recipe-summary" class="fl-recipe-summary"></div>
+            <details class="fl-expression-editor">
+              <summary>${t('fl_edit_formula')}</summary>
+              <div class="fl-term-header">
+                <div class="section-title fl-mini-title">${t('fl_terms')}</div>
+                <div class="fl-term-actions">
+                  <button class="btn btn-secondary fl-small-btn" id="fl-add-latex">＋ ${t('fl_add_latex')}</button>
+                  <button class="btn btn-secondary fl-small-btn" id="fl-reset">${t('fl_reset_sample')}</button>
+                </div>
+              </div>
+              <div class="fl-latex-help">${t('fl_latex_help')}</div>
+              <div id="fl-terms" class="fl-terms"></div>
+              <button class="btn btn-secondary fl-add-term" id="fl-add-term">＋ ${t('fl_add_factor')}</button>
+            </details>
             <button class="btn btn-accent bt-run-btn fl-run" id="fl-run">${t('fl_run')}</button>
           </div>
 
@@ -189,6 +250,8 @@
     _state.terms = loadSavedTerms();
     setDefaultDates();
     bindStaticControls();
+    paintPresets('momentum');
+    paintRecipeSummary();
     paintTerms();
 
     try {
@@ -228,20 +291,72 @@
       _state.terms.push({ mode: 'factor', factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC', periods: [((_state.catalog[0] && _state.catalog[0].default_period) || 20)], weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
+      paintRecipeSummary();
     });
     document.getElementById('fl-add-latex').addEventListener('click', () => {
       _state.terms.push({ mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20)', weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
+      paintRecipeSummary();
     });
     document.getElementById('fl-reset').addEventListener('click', () => {
-      _state.terms = defaultTerms();
-      saveTerms();
-      paintTerms();
+      applyPreset('momentum');
     });
     document.getElementById('fl-run').addEventListener('click', runFactorLab);
     const search = document.getElementById('fl-factor-search');
     search.addEventListener('input', paintCatalog);
+  }
+
+  function applyPreset(key) {
+    const preset = presetConfigs()[key] || presetConfigs().momentum;
+    _state.terms = preset.terms.map(t => ({ ...t, periods: t.periods ? [...t.periods] : [] }));
+    const topn = document.getElementById('fl-topn');
+    const horizon = document.getElementById('fl-horizon');
+    const hold = document.getElementById('fl-hold-band');
+    if (topn && preset.topN) topn.value = preset.topN;
+    if (horizon && preset.horizon) horizon.value = preset.horizon;
+    if (hold && preset.holdBand) hold.value = preset.holdBand;
+    saveTerms();
+    paintPresets(key);
+    paintRecipeSummary();
+    paintTerms();
+  }
+
+  function paintPresets(activeKey) {
+    const host = document.getElementById('fl-presets');
+    if (!host) return;
+    const presets = presetConfigs();
+    host.innerHTML = Object.entries(presets).map(([key, p]) => `
+      <button class="fl-preset-card ${key === activeKey ? 'active' : ''}" data-preset="${esc(key)}">
+        <span class="fl-preset-icon">${esc(p.icon)}</span>
+        <b>${esc(p.title)}</b>
+        <em>${esc(p.desc)}</em>
+      </button>
+    `).join('');
+    host.querySelectorAll('[data-preset]').forEach(btn => btn.addEventListener('click', () => applyPreset(btn.dataset.preset)));
+  }
+
+  function describeTerm(term) {
+    term = normalizeTerm(term);
+    const weight = Number(term.weight || 0);
+    const sign = weight >= 0 ? '+' : '−';
+    const absW = Math.abs(weight).toFixed(2).replace(/\.00$/, '');
+    if (term.mode === 'latex') return `${sign}${absW} ${term.latex || 'formula'}`;
+    return `${sign}${absW} ${term.factor}${term.periods && term.periods.length ? '_' + term.periods.join('/') : ''}`;
+  }
+
+  function paintRecipeSummary() {
+    const host = document.getElementById('fl-recipe-summary');
+    if (!host) return;
+    const terms = (_state.terms || []).map(normalizeTerm).filter(t => Number(t.weight) !== 0 && (t.mode === 'latex' ? t.latex : t.factor));
+    if (!terms.length) {
+      host.innerHTML = `<div class="fl-recipe-empty">${t('fl_need_factor')}</div>`;
+      return;
+    }
+    host.innerHTML = `
+      <div class="fl-recipe-line">${terms.map(x => `<span>${esc(describeTerm(x))}</span>`).join('')}</div>
+      <div class="fl-recipe-caption">${t('fl_recipe_caption')}</div>
+    `;
   }
 
   function isTunable(factor) {
@@ -321,6 +436,7 @@
           _state.terms[idx] = { mode: 'latex', latex: val, weight: parseFloat(w.value) || 0, transform: tr.value };
           renderLatexPreview(preview, val);
           saveTerms();
+          paintRecipeSummary();
         };
         [latex, w, tr].forEach(el => {
           el.addEventListener('change', update);
@@ -331,6 +447,7 @@
           _state.terms.splice(idx, 1);
           saveTerms();
           paintTerms();
+          paintRecipeSummary();
         });
         return;
       }
@@ -346,6 +463,7 @@
         const periods = cat.kind === 'tunable' ? (parsePeriodText(p.value).length ? parsePeriodText(p.value) : [cat.default_period || 20]) : [];
         _state.terms[idx] = { mode: 'factor', factor: selected, periods, weight: parseFloat(w.value) || 0, transform: tr.value };
         saveTerms();
+        paintRecipeSummary();
       };
       f.addEventListener('change', () => {
         const cat = catalogByName()[f.value] || {};
@@ -363,6 +481,7 @@
         _state.terms.splice(idx, 1);
         saveTerms();
         paintTerms();
+        paintRecipeSummary();
       });
     });
   }
@@ -406,6 +525,7 @@
         _state.terms.push({ mode: 'factor', factor: btn.dataset.factor, periods: item.kind === 'tunable' ? [item.default_period || 20] : [], weight: 1, transform: 'rank' });
         saveTerms();
         paintTerms();
+        paintRecipeSummary();
       });
     });
   }
@@ -476,6 +596,7 @@
             <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('fl_hold_band_mult')}: ${esc(meta.hold_band_mult || 1)} (hold top ${esc(meta.hold_threshold || (meta.top_n || 0))}) · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
           </div>
         </div>
+        ${renderVerdict(s)}
         <div class="bt-stats-grid fl-stats-grid">
           ${statBox(t('m_total_return'), pct(s.total_return_pct), retCls)}
           ${statBox(t('m_max_dd'), pct(s.max_drawdown_pct), 'negative')}
@@ -517,6 +638,34 @@
       renderEquity(data.equity_curve || []);
       renderIC(data.ic_series || []);
     });
+  }
+
+  function renderVerdict(s) {
+    const meanIc = Number(s.mean_ic || 0);
+    const icir = Number(s.icir || 0);
+    const ret = Number(s.total_return_pct || 0);
+    const turnover = Number(s.avg_turnover_pct || 0);
+    let level = 'weak';
+    let title = t('fl_verdict_weak');
+    let advice = t('fl_verdict_weak_desc');
+    if (meanIc > 0.02 && icir > 0.5 && ret > 0) {
+      level = 'good';
+      title = t('fl_verdict_good');
+      advice = t('fl_verdict_good_desc');
+    } else if (meanIc > 0 && ret > 0) {
+      level = 'watch';
+      title = t('fl_verdict_watch');
+      advice = t('fl_verdict_watch_desc');
+    }
+    const bullets = [];
+    bullets.push(meanIc > 0 ? t('fl_check_ic_positive') : t('fl_check_ic_negative'));
+    bullets.push(icir > 0.5 ? t('fl_check_icir_stable') : t('fl_check_icir_unstable'));
+    bullets.push(turnover <= 60 ? t('fl_check_turnover_ok') : t('fl_check_turnover_high'));
+    return `
+      <div class="fl-verdict fl-verdict-${level}">
+        <div><b>${esc(title)}</b><p>${esc(advice)}</p></div>
+        <ul>${bullets.map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+      </div>`;
   }
 
   function statBox(label, value, cls) {

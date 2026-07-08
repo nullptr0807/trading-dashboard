@@ -2128,6 +2128,35 @@ body::after {
   align-items: start;
 }
 .factor-lab-config { margin-top: 0; padding: 24px 26px; position: sticky; top: 76px; }
+.fl-step-title { display:flex; align-items:flex-start; gap:10px; margin: 2px 0 12px; }
+.fl-step-title span { flex:0 0 24px; width:24px; height:24px; border-radius:999px; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg, rgba(0,113,227,.16), rgba(172,57,255,.14)); color:var(--accent-blue); font-size:12px; font-weight:800; }
+.fl-step-title b { display:block; color:var(--text-primary); font-size:15px; line-height:1.2; }
+.fl-step-title em { display:block; color:var(--text-secondary); font-style:normal; font-size:11.5px; line-height:1.4; margin-top:3px; }
+.fl-presets { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:9px; margin-bottom:18px; }
+.fl-preset-card { text-align:left; border:1px solid var(--border-card); background:rgba(255,255,255,.58); border-radius:14px; padding:10px 11px; cursor:pointer; transition:transform .15s, border-color .15s, box-shadow .15s, background .15s; min-height:92px; }
+.fl-preset-card:hover { transform:translateY(-1px); border-color:rgba(0,113,227,.26); box-shadow:0 8px 22px rgba(31,38,72,.08); }
+.fl-preset-card.active { border-color:rgba(0,113,227,.55); background:linear-gradient(180deg, rgba(0,113,227,.10), rgba(255,255,255,.68)); box-shadow:0 10px 28px rgba(0,113,227,.10); }
+.fl-preset-icon { display:block; font-size:18px; margin-bottom:5px; }
+.fl-preset-card b { display:block; color:var(--text-primary); font-size:12.5px; margin-bottom:3px; }
+.fl-preset-card em { display:block; color:var(--text-secondary); font-size:11px; line-height:1.35; font-style:normal; }
+.fl-quick-row { margin-bottom:2px; }
+.fl-advanced, .fl-expression-editor { border:1px solid rgba(0,0,0,.07); border-radius:14px; background:rgba(255,255,255,.42); padding:0 12px; margin:14px 0 18px; }
+.fl-expression-editor { margin-top:10px; margin-bottom:0; }
+.fl-advanced > summary, .fl-expression-editor > summary { cursor:pointer; list-style:none; padding:12px 0; color:var(--accent-blue); font-size:12px; font-weight:700; }
+.fl-advanced > summary::-webkit-details-marker, .fl-expression-editor > summary::-webkit-details-marker { display:none; }
+.fl-advanced > summary::before, .fl-expression-editor > summary::before { content:'▸'; display:inline-block; margin-right:6px; transition:transform .15s; }
+.fl-advanced[open] > summary::before, .fl-expression-editor[open] > summary::before { transform:rotate(90deg); }
+.fl-recipe-summary { border:1px solid rgba(0,113,227,.14); background:rgba(0,113,227,.055); border-radius:14px; padding:11px 12px; }
+.fl-recipe-line { display:flex; flex-wrap:wrap; gap:6px; }
+.fl-recipe-line span { display:inline-flex; align-items:center; max-width:100%; padding:5px 8px; border-radius:999px; background:rgba(255,255,255,.78); border:1px solid rgba(0,0,0,.06); color:var(--text-primary); font-family:var(--font-mono); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.fl-recipe-caption, .fl-recipe-empty { color:var(--text-secondary); font-size:11.5px; line-height:1.45; margin-top:8px; }
+.fl-verdict { display:grid; grid-template-columns:minmax(0,1.1fr) minmax(240px,.9fr); gap:12px; align-items:start; border-radius:16px; padding:14px 16px; margin:10px 0 18px; border:1px solid rgba(0,0,0,.06); }
+.fl-verdict b { display:block; font-size:15px; color:var(--text-primary); margin-bottom:4px; }
+.fl-verdict p { margin:0; color:var(--text-secondary); font-size:12.5px; line-height:1.45; }
+.fl-verdict ul { margin:0; padding-left:18px; color:var(--text-secondary); font-size:12px; line-height:1.55; }
+.fl-verdict-good { background:rgba(31,157,85,.10); border-color:rgba(31,157,85,.22); }
+.fl-verdict-watch { background:rgba(255,193,7,.12); border-color:rgba(255,193,7,.24); }
+.fl-verdict-weak { background:rgba(224,45,45,.08); border-color:rgba(224,45,45,.16); }
 .factor-lab-main { min-width: 0; }
 .factor-catalog-card, .fl-result-card, .fl-empty { margin-top: 0; padding: 24px 26px; }
 .fl-method-note {
