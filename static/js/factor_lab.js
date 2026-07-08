@@ -384,6 +384,23 @@
     return `\\mathrm{score}(i)=\\operatorname{Rank}\\left(${usable.map(termLatex).join(' ')}\\right)`;
   }
 
+  function termText(term, idx) {
+    term = normalizeTerm(term);
+    const weight = Number(term.weight || 0);
+    const sign = weight < 0 ? '-' : (idx === 0 ? '' : '+');
+    const coeff = Math.abs(weight) === 1 ? '' : Math.abs(weight).toFixed(2).replace(/0+$/, '').replace(/\.$/, '') + ' * ';
+    const body = term.mode === 'latex'
+      ? (term.latex || 'formula')
+      : `${term.factor}${term.periods && term.periods.length ? '_' + term.periods.join('/') : ''}`;
+    return `${sign}${coeff}${body}`;
+  }
+
+  function compositeText(terms) {
+    const usable = terms.map(normalizeTerm).filter(t => Number(t.weight) !== 0 && (t.mode === 'latex' ? t.latex : t.factor));
+    if (!usable.length) return '';
+    return `score(i) = rank(${usable.map(termText).join(' ')})`;
+  }
+
   function paintRecipeSummary() {
     const host = document.getElementById('fl-recipe-summary');
     if (!host) return;
@@ -393,24 +410,18 @@
       host.innerHTML = `
         <div class="fl-formula-hero">
           <div class="fl-formula-label">${esc(t('fl_current_formula'))} · ${esc(selected.label || selected.account_id)}</div>
-          <div class="fl-formula-katex" data-fl-formula></div>
+          <pre class="fl-formula-code">${esc(selected.latex_text || selected.latex || '')}</pre>
         </div>
         <div class="fl-gp-factor-list">
           ${factors.map((g, i) => `<div class="fl-gp-factor-card">
             <b>${esc(g.name || ('GP ' + (i + 1)))}</b>
-            <div class="fl-gp-latex" data-gp-latex="${i}"></div>
+            <pre class="fl-formula-code fl-gp-code">${esc(g.runnable_formula || g.latex || '')}</pre>
             <code>${esc(g.s_expression || '')}</code>
             <span>${esc((g.vars_used || []).join(', '))}</span>
           </div>`).join('')}
         </div>
-        <div class="fl-recipe-caption">${esc(t('fl_gp_preview_note'))}</div>
+        <div class="fl-recipe-caption">${esc(selected.runnable === false ? t('fl_gp_preview_note') : t('fl_gp_runnable_note'))}</div>
       `;
-      const formulaEl = host.querySelector('[data-fl-formula]');
-      if (formulaEl) renderLatexPreview(formulaEl, selected.latex || '');
-      factors.forEach((g, i) => {
-        const el = host.querySelector(`[data-gp-latex="${i}"]`);
-        if (el) renderLatexPreview(el, g.latex || '');
-      });
       return;
     }
     const terms = (_state.terms || []).map(normalizeTerm).filter(t => Number(t.weight) !== 0 && (t.mode === 'latex' ? t.latex : t.factor));
@@ -418,17 +429,15 @@
       host.innerHTML = `<div class="fl-recipe-empty">${t('fl_need_factor')}</div>`;
       return;
     }
-    const latex = compositeLatex(terms);
+    const formula = compositeText(terms);
     host.innerHTML = `
       <div class="fl-formula-hero">
         <div class="fl-formula-label">${esc(t('fl_current_formula'))}</div>
-        <div class="fl-formula-katex" data-fl-formula></div>
+        <pre class="fl-formula-code">${esc(formula)}</pre>
       </div>
       <div class="fl-recipe-line">${terms.map(x => `<span>${esc(describeTerm(x))}</span>`).join('')}</div>
       <div class="fl-recipe-caption">${t('fl_recipe_caption')}</div>
     `;
-    const formulaEl = host.querySelector('[data-fl-formula]');
-    if (formulaEl) renderLatexPreview(formulaEl, latex);
   }
 
   function isTunable(factor) {

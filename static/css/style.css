@@ -2153,7 +2153,9 @@ body::after {
 .fl-formula-label { color:var(--text-secondary); font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; margin-bottom:8px; }
 .fl-formula-katex { overflow-x:auto; overflow-y:hidden; color:var(--accent-blue); font-size:18px; line-height:1.35; padding:4px 0 6px; white-space:nowrap; }
 .fl-formula-katex .katex, .fl-formula-katex .katex-display { color:var(--accent-blue); white-space:nowrap; margin:0; min-width:max-content; }
-.fl-formula-katex .katex-html { white-space:nowrap; }
+.fl-formula-code { margin:0; padding:10px 12px; border-radius:10px; background:rgba(0,113,227,.06); color:var(--accent-blue); font-family:var(--font-mono); font-size:13px; line-height:1.5; white-space:pre; overflow:auto; max-width:100%; }
+.fl-formula-katex .katex-mathml, .fl-gp-latex .katex-mathml { display:none !important; }
+.fl-formula-katex .katex-html, .fl-formula-katex .katex .base, .fl-gp-latex .katex-html, .fl-gp-latex .katex .base { white-space:nowrap !important; word-break:normal !important; overflow-wrap:normal !important; }
 .fl-gp-latex .katex, .fl-gp-latex .katex-display { white-space:nowrap; margin:0; min-width:max-content; }
 .fl-recipe-line { display:flex; flex-wrap:wrap; gap:6px; }
 .fl-recipe-line span { display:inline-flex; align-items:center; max-width:100%; padding:5px 8px; border-radius:999px; background:rgba(255,255,255,.78); border:1px solid rgba(0,0,0,.06); color:var(--text-primary); font-family:var(--font-mono); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
