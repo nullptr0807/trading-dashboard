@@ -24,6 +24,29 @@ _ROOT = Path(__file__).resolve().parent.parent / 'static' / 'frontier'
 _INDEX = _ROOT / 'index.json'
 _ID_RE = re.compile(r'^[\w.\-]+$')
 
+_HIGH_VALUES = {'高相关', 'high', 'medium-high', '中高相关'}
+_MEDIUM_VALUES = {'中等相关', 'medium'}
+_LOW_VALUES = {'低相关', 'low', 'low-medium'}
+
+
+def _visible_frontier_paper(p: dict) -> bool:
+    """Server-side guard: never show low-relevance papers on Frontier.
+
+    The generation cron should already filter, but this endpoint is the last
+    line of defense for historical manifests or a bad future write.  Medium
+    papers stay visible only when the digest/card says the idea is validate-able
+    or has explicit system hooks.
+    """
+    rel = str(p.get('relevance_score') or '').strip().lower()
+    if rel in _LOW_VALUES:
+        return False
+    if rel in _HIGH_VALUES:
+        return True
+    if rel in _MEDIUM_VALUES:
+        return bool(p.get('can_validate') or p.get('system_hooks'))
+    # Unknown old labels: keep only if there is concrete system-fit metadata.
+    return bool(p.get('can_validate') or p.get('system_hooks'))
+
 
 @router.get('')
 async def list_papers():
@@ -34,6 +57,7 @@ async def list_papers():
         papers = json.loads(_INDEX.read_text(encoding='utf-8'))
     except Exception as e:
         return JSONResponse({'papers': [], 'error': str(e)}, status_code=500)
+    papers = [p for p in papers if _visible_frontier_paper(p)]
     papers = sorted(papers, key=lambda p: p.get('date', ''), reverse=True)
     return JSONResponse({'papers': papers})
 

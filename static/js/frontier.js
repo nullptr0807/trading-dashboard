@@ -34,6 +34,8 @@ async function renderFrontierPage() {
       const summary = lang === 'zh' ? (p.summary_zh || p.summary_en) : (p.summary_en || p.summary_zh);
       const cat = (p.categories || []).slice(0, 2).join(' · ');
       const tags = (p.tags || []).map(t => `<span class="explore-tag">#${escapeHtml(t)}</span>`).join('');
+      const hooks = (p.system_hooks || []).slice(0, 3).map(h => `<span class="explore-tag">${escapeHtml(h)}</span>`).join('');
+      const score = (p.filter_score != null) ? `<span class="explore-card-cat">fit ${escapeHtml(String(p.filter_score))}</span>` : '';
       const verdict = p.relevance_score
         ? `<span class="explore-card-cat" style="background:rgba(80,200,120,0.15);">${escapeHtml(p.relevance_score)}</span>`
         : '';
@@ -47,11 +49,12 @@ async function renderFrontierPage() {
             <div class="explore-card-meta">
               <span class="explore-card-cat">${escapeHtml(cat || '')}</span>
               ${verdict}
+              ${score}
               <span class="explore-card-date">${escapeHtml(p.date || '')}</span>
             </div>
             <h2 class="explore-card-title">${escapeHtml(title || '')}</h2>
             <p class="explore-card-summary">${escapeHtml(summary || '')}</p>
-            <div class="explore-card-tags">${tags}</div>
+            <div class="explore-card-tags">${tags}${hooks}</div>
           </div>
         </a>
       `;
