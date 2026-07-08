@@ -10,6 +10,13 @@ from pydantic import BaseModel, Field
 from api.backtest import _validate_market
 from core.db import DB_PATH
 from core.factor_lab_engine import ALPHA158_FACTORS, MARKET_DEFAULTS, run_factor_lab
+try:
+    from api.factors import _active_gp_factors, _expr_vars_used, _gp_expr_to_math, _load_gp_alphas
+except Exception:  # pragma: no cover - catalog can still serve base factors
+    _active_gp_factors = None
+    _expr_vars_used = None
+    _gp_expr_to_math = None
+    _load_gp_alphas = None
 
 _CATALOG_BY_NAME = {str(f.get("name", "")).upper(): f for f in ALPHA158_FACTORS}
 
@@ -30,6 +37,45 @@ def _parse_account_factor_token(token: str) -> dict | None:
     return None
 
 
+def _gp_account_item(account_id: str, group: str, strategy_name: str, factors_raw: str) -> dict | None:
+    if _load_gp_alphas is None or _active_gp_factors is None or _gp_expr_to_math is None:
+        return None
+    backend = 'factor_miner_gp' if group == 'F' or factors_raw.startswith('FMGP') else 'gplearn'
+    mined = _load_gp_alphas(account_id, backend=backend)
+    active = _active_gp_factors(mined)
+    factor_cards = []
+    for alpha in active:
+        expr = alpha.get('expression') or ''
+        feature_cols = alpha.get('feature_cols')
+        factor_cards.append({
+            "name": alpha.get('name') or 'gp_factor',
+            "latex": _gp_expr_to_math(expr, feature_cols),
+            "s_expression": expr,
+            "vars_used": (_expr_vars_used(expr, feature_cols) if _expr_vars_used is not None else []),
+            "ic": alpha.get('ic'),
+            "fitness": alpha.get('fitness'),
+        })
+    if not factor_cards:
+        return None
+    composite_latex = (
+        r'\mathrm{score}(i)=\frac{1}{' + str(len(factor_cards)) + r'}\sum_{k=1}^{' + str(len(factor_cards)) + r'} f^{GP}_k(i)'
+        if len(factor_cards) > 1 else
+        r'\mathrm{score}(i)=f^{GP}(i)'
+    )
+    return {
+        "account_id": account_id,
+        "group": group,
+        "strategy_name": strategy_name or account_id,
+        "label": f'{account_id} · {strategy_name or ""}'.strip(),
+        "factors": factors_raw,
+        "runnable": False,
+        "kind": "gp",
+        "n_terms": len(factor_cards),
+        "latex": composite_latex,
+        "gp_factors": factor_cards,
+    }
+
+
 def _account_composite_rows(con: sqlite3.Connection, market: str) -> list[dict]:
     rows = con.execute(
         """
@@ -45,7 +91,15 @@ def _account_composite_rows(con: sqlite3.Connection, market: str) -> list[dict]:
     seen: set[tuple] = set()
     for r in rows:
         raw = str(r["factors"] or "").strip()
-        if not raw or raw.startswith(("GP(", "FMGP(", "qlib_")) or r["group_name"] == "IDX":
+        group = str(r["group_name"] or "")
+        account_id = str(r["account_id"] or "")
+        strategy_name = str(r["strategy_name"] or "")
+        if not raw or group == "IDX" or raw.startswith("qlib_"):
+            continue
+        if raw.startswith(("GP(", "FMGP(")) or group in {"B", "F"}:
+            item = _gp_account_item(account_id, group, strategy_name, raw)
+            if item:
+                out.append(item)
             continue
         terms = []
         for tok in raw.split(','):
@@ -62,11 +116,13 @@ def _account_composite_rows(con: sqlite3.Connection, market: str) -> list[dict]:
         for t in terms:
             t["weight"] = w
         out.append({
-            "account_id": r["account_id"],
-            "group": r["group_name"],
-            "strategy_name": r["strategy_name"] or r["account_id"],
-            "label": f'{r["account_id"]} · {r["strategy_name"] or ""}'.strip(),
+            "account_id": account_id,
+            "group": group,
+            "strategy_name": strategy_name or account_id,
+            "label": f'{account_id} · {strategy_name or ""}'.strip(),
             "factors": raw,
+            "runnable": True,
+            "kind": "factor_combo",
             "terms": terms,
             "n_terms": len(terms),
         })

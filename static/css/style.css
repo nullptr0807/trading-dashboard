@@ -2250,6 +2250,14 @@ body::after {
 .fl-account-chip b { display:block; color:var(--text-primary); font-size:12.5px; margin-bottom:4px; }
 .fl-account-chip span { display:block; color:var(--text-secondary); font-family:var(--font-mono); font-size:10.5px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .fl-account-chip em { display:block; color:#7c3aed; font-style:normal; font-size:10.5px; font-weight:700; margin-top:7px; }
+.fl-account-chip-view { border-color:rgba(14,165,233,.20); background:linear-gradient(180deg, rgba(14,165,233,.08), rgba(255,255,255,.62)); }
+.fl-account-chip-view em { color:#0284c7; }
+.fl-gp-factor-list { display:grid; grid-template-columns:1fr; gap:8px; margin-top:10px; }
+.fl-gp-factor-card { border:1px solid rgba(0,0,0,.07); background:rgba(255,255,255,.72); border-radius:12px; padding:10px 11px; }
+.fl-gp-factor-card b { display:block; color:var(--text-primary); font-size:12px; margin-bottom:6px; }
+.fl-gp-latex { color:var(--accent-blue); overflow:auto; padding:2px 0 6px; }
+.fl-gp-factor-card code { display:block; background:rgba(0,0,0,.045); border-radius:8px; padding:6px 8px; color:var(--text-primary); font-size:11px; overflow:auto; }
+.fl-gp-factor-card span { display:block; color:var(--text-secondary); font-size:11px; margin-top:6px; }
 .fl-factor-chip {
   text-align: left; border: 1px solid var(--border-card); border-radius: 12px;
   background: rgba(255,255,255,0.55); padding: 10px 11px; cursor: pointer;

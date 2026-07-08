@@ -8,6 +8,7 @@
   const _state = {
     catalog: [],
     accountComposites: [],
+    selectedAccountItem: null,
     terms: [],
     lastResult: null,
   };
@@ -290,12 +291,14 @@
 
   function bindStaticControls() {
     document.getElementById('fl-add-term').addEventListener('click', () => {
+      _state.selectedAccountItem = null;
       _state.terms.push({ mode: 'factor', factor: (_state.catalog[0] && _state.catalog[0].name) || 'ROC', periods: [((_state.catalog[0] && _state.catalog[0].default_period) || 20)], weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
       paintRecipeSummary();
     });
     document.getElementById('fl-add-latex').addEventListener('click', () => {
+      _state.selectedAccountItem = null;
       _state.terms.push({ mode: 'latex', latex: '\\rho_5(ROC_5, VMOM_20)', weight: 1, transform: 'rank' });
       saveTerms();
       paintTerms();
@@ -311,6 +314,7 @@
 
   function applyPreset(key) {
     const preset = presetConfigs()[key] || presetConfigs().momentum;
+    _state.selectedAccountItem = null;
     _state.terms = preset.terms.map(t => ({ ...t, periods: t.periods ? [...t.periods] : [] }));
     const topn = document.getElementById('fl-topn');
     const horizon = document.getElementById('fl-horizon');
@@ -340,12 +344,15 @@
 
   function applyAccountComposite(idx) {
     const item = _state.accountComposites[Number(idx)];
-    if (!item || !Array.isArray(item.terms)) return;
-    _state.terms = item.terms.map(t => ({ ...t, periods: t.periods ? [...t.periods] : [] }));
-    saveTerms();
+    if (!item) return;
+    _state.selectedAccountItem = item;
+    if (item.runnable !== false && Array.isArray(item.terms)) {
+      _state.terms = item.terms.map(t => ({ ...t, periods: t.periods ? [...t.periods] : [] }));
+      saveTerms();
+      paintTerms();
+    }
     paintPresets('');
     paintRecipeSummary();
-    paintTerms();
   }
 
   function describeTerm(term) {
@@ -377,6 +384,32 @@
   function paintRecipeSummary() {
     const host = document.getElementById('fl-recipe-summary');
     if (!host) return;
+    const selected = _state.selectedAccountItem;
+    if (selected && selected.runnable === false) {
+      const factors = selected.gp_factors || [];
+      host.innerHTML = `
+        <div class="fl-formula-hero">
+          <div class="fl-formula-label">${esc(t('fl_current_formula'))} · ${esc(selected.label || selected.account_id)}</div>
+          <div class="fl-formula-katex" data-fl-formula></div>
+        </div>
+        <div class="fl-gp-factor-list">
+          ${factors.map((g, i) => `<div class="fl-gp-factor-card">
+            <b>${esc(g.name || ('GP ' + (i + 1)))}</b>
+            <div class="fl-gp-latex" data-gp-latex="${i}"></div>
+            <code>${esc(g.s_expression || '')}</code>
+            <span>${esc((g.vars_used || []).join(', '))}</span>
+          </div>`).join('')}
+        </div>
+        <div class="fl-recipe-caption">${esc(t('fl_gp_preview_note'))}</div>
+      `;
+      const formulaEl = host.querySelector('[data-fl-formula]');
+      if (formulaEl) renderLatexPreview(formulaEl, selected.latex || '');
+      factors.forEach((g, i) => {
+        const el = host.querySelector(`[data-gp-latex="${i}"]`);
+        if (el) renderLatexPreview(el, g.latex || '');
+      });
+      return;
+    }
     const terms = (_state.terms || []).map(normalizeTerm).filter(t => Number(t.weight) !== 0 && (t.mode === 'latex' ? t.latex : t.factor));
     if (!terms.length) {
       host.innerHTML = `<div class="fl-recipe-empty">${t('fl_need_factor')}</div>`;
@@ -532,21 +565,28 @@
         || (x.label_zh || '').toLowerCase().includes(f)
         || (x.label_en || '').toLowerCase().includes(f);
     });
-    if (!rows.length) {
+    const accountRows = (_state.accountComposites || []).filter(x => {
+      if (!f) return true;
+      return (x.account_id || '').toLowerCase().includes(f)
+        || (x.strategy_name || '').toLowerCase().includes(f)
+        || (x.factors || '').toLowerCase().includes(f)
+        || (x.group || '').toLowerCase().includes(f);
+    });
+    if (!rows.length && !accountRows.length) {
       host.innerHTML = `<p class="fl-muted">${t('fl_no_factor')}</p>`;
       return;
     }
     const fams = {};
     rows.forEach(x => { if (!fams[x.family]) fams[x.family] = []; fams[x.family].push(x); });
-    const accountHtml = (_state.accountComposites || []).length ? `
+    const accountHtml = accountRows.length ? `
       <div class="fl-family fl-account-composites">
         <div class="fl-family-title">${esc(t('fl_running_account_composites'))}</div>
         <div class="fl-account-grid">
-          ${_state.accountComposites.map((x, i) => `<button class="fl-account-chip" data-account-composite="${i}">
+          ${accountRows.map((x) => { const i = _state.accountComposites.indexOf(x); return `<button class="fl-account-chip ${x.runnable === false ? 'fl-account-chip-view' : ''}" data-account-composite="${i}">
             <b>${esc(x.label || x.account_id)}</b>
             <span>${esc(x.factors || '')}</span>
-            <em>${esc(t('fl_load_into_lab'))}</em>
-          </button>`).join('')}
+            <em>${esc(x.runnable === false ? t('fl_view_formula') : t('fl_load_into_lab'))}</em>
+          </button>`; }).join('')}
         </div>
       </div>
     ` : '';
@@ -573,6 +613,7 @@
     host.querySelectorAll('.fl-factor-chip').forEach(btn => {
       btn.addEventListener('click', () => {
         const item = catalogByName()[btn.dataset.factor] || {};
+        _state.selectedAccountItem = null;
         _state.terms.push({ mode: 'factor', factor: btn.dataset.factor, periods: item.kind === 'tunable' ? [item.default_period || 20] : [], weight: 1, transform: 'rank' });
         saveTerms();
         paintTerms();
@@ -582,6 +623,10 @@
   }
 
   async function runFactorLab() {
+    if (_state.selectedAccountItem && _state.selectedAccountItem.runnable === false) {
+      alert(t('fl_gp_not_runnable'));
+      return;
+    }
     const btn = document.getElementById('fl-run');
     const host = document.getElementById('fl-result-host');
     const body = {
