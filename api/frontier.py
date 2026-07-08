@@ -43,6 +43,15 @@ def _visible_frontier_paper(p: dict) -> bool:
     if rel in _HIGH_VALUES:
         return True
     if rel in _MEDIUM_VALUES:
+        score = p.get('filter_score')
+        # Medium relevance is visible only when the system-fit scorer says the
+        # paper clears the stricter "worth a digest" bar.  If score is absent
+        # (older hand-curated rows), fall back to concrete hooks/can_validate.
+        if score is not None:
+            try:
+                return int(score) >= 11
+            except Exception:
+                return False
         return bool(p.get('can_validate') or p.get('system_hooks'))
     # Unknown old labels: keep only if there is concrete system-fit metadata.
     return bool(p.get('can_validate') or p.get('system_hooks'))
