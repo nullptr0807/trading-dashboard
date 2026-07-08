@@ -1,12 +1,13 @@
-// factor_lab.js — ad-hoc Alpha158 factor research workbench
+// factor_lab.js — ad-hoc factor research workbench
 //
-// Account-free by design: build a temporary factor composite from Alpha158
-// building blocks, run look-ahead-safe IC + simple top-N portfolio diagnostics.
+// Account-free by design: build a temporary factor composite from factor
+// families or live account templates, then run look-ahead-safe IC + simple top-N portfolio diagnostics.
 
 (function () {
   const STORE_KEY = 'cqa_factor_lab_terms_v2';
   const _state = {
     catalog: [],
+    accountComposites: [],
     terms: [],
     lastResult: null,
   };
@@ -259,6 +260,7 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       _state.catalog = data.factors || [];
+      _state.accountComposites = data.account_composites || [];
       const defaults = data.defaults || {};
       document.getElementById('fl-capital').value = defaults.initial_capital || (state.market === 'CN' ? 100000 : 10000);
       document.getElementById('fl-topn').value = defaults.top_n || 5;
@@ -336,6 +338,16 @@
     host.querySelectorAll('[data-preset]').forEach(btn => btn.addEventListener('click', () => applyPreset(btn.dataset.preset)));
   }
 
+  function applyAccountComposite(idx) {
+    const item = _state.accountComposites[Number(idx)];
+    if (!item || !Array.isArray(item.terms)) return;
+    _state.terms = item.terms.map(t => ({ ...t, periods: t.periods ? [...t.periods] : [] }));
+    saveTerms();
+    paintPresets('');
+    paintRecipeSummary();
+    paintTerms();
+  }
+
   function describeTerm(term) {
     term = normalizeTerm(term);
     const weight = Number(term.weight || 0);
@@ -343,6 +355,23 @@
     const absW = Math.abs(weight).toFixed(2).replace(/\.00$/, '');
     if (term.mode === 'latex') return `${sign}${absW} ${term.latex || 'formula'}`;
     return `${sign}${absW} ${term.factor}${term.periods && term.periods.length ? '_' + term.periods.join('/') : ''}`;
+  }
+
+  function termLatex(term, idx) {
+    term = normalizeTerm(term);
+    const weight = Number(term.weight || 0);
+    const sign = weight < 0 ? '-' : (idx === 0 ? '' : '+');
+    const coeff = Math.abs(weight) === 1 ? '' : Math.abs(weight).toFixed(2).replace(/0+$/, '').replace(/\.$/, '') + '\\cdot ';
+    if (term.mode === 'latex') return `${sign}${coeff}(${term.latex || '?'})`;
+    const sub = term.periods && term.periods.length ? `_{${term.periods.join(',')}}` : '';
+    const name = String(term.factor || '').replace(/_/g, '\\_');
+    return `${sign}${coeff}\\mathrm{${name}}${sub}`;
+  }
+
+  function compositeLatex(terms) {
+    const usable = terms.map(normalizeTerm).filter(t => Number(t.weight) !== 0 && (t.mode === 'latex' ? t.latex : t.factor));
+    if (!usable.length) return '';
+    return `\\mathrm{score}(i)=\\operatorname{Rank}\\left(${usable.map(termLatex).join(' ')}\\right)`;
   }
 
   function paintRecipeSummary() {
@@ -353,10 +382,17 @@
       host.innerHTML = `<div class="fl-recipe-empty">${t('fl_need_factor')}</div>`;
       return;
     }
+    const latex = compositeLatex(terms);
     host.innerHTML = `
+      <div class="fl-formula-hero">
+        <div class="fl-formula-label">${esc(t('fl_current_formula'))}</div>
+        <div class="fl-formula-katex" data-fl-formula></div>
+      </div>
       <div class="fl-recipe-line">${terms.map(x => `<span>${esc(describeTerm(x))}</span>`).join('')}</div>
       <div class="fl-recipe-caption">${t('fl_recipe_caption')}</div>
     `;
+    const formulaEl = host.querySelector('[data-fl-formula]');
+    if (formulaEl) renderLatexPreview(formulaEl, latex);
   }
 
   function isTunable(factor) {
@@ -502,7 +538,19 @@
     }
     const fams = {};
     rows.forEach(x => { if (!fams[x.family]) fams[x.family] = []; fams[x.family].push(x); });
-    host.innerHTML = Object.entries(fams).map(([family, xs]) => `
+    const accountHtml = (_state.accountComposites || []).length ? `
+      <div class="fl-family fl-account-composites">
+        <div class="fl-family-title">${esc(t('fl_running_account_composites'))}</div>
+        <div class="fl-account-grid">
+          ${_state.accountComposites.map((x, i) => `<button class="fl-account-chip" data-account-composite="${i}">
+            <b>${esc(x.label || x.account_id)}</b>
+            <span>${esc(x.factors || '')}</span>
+            <em>${esc(t('fl_load_into_lab'))}</em>
+          </button>`).join('')}
+        </div>
+      </div>
+    ` : '';
+    host.innerHTML = accountHtml + Object.entries(fams).map(([family, xs]) => `
       <div class="fl-family">
         <div class="fl-family-title">${esc(family)}</div>
         <div class="fl-factor-grid">
@@ -519,6 +567,9 @@
         </div>
       </div>
     `).join('');
+    host.querySelectorAll('[data-account-composite]').forEach(btn => {
+      btn.addEventListener('click', () => applyAccountComposite(btn.dataset.accountComposite));
+    });
     host.querySelectorAll('.fl-factor-chip').forEach(btn => {
       btn.addEventListener('click', () => {
         const item = catalogByName()[btn.dataset.factor] || {};

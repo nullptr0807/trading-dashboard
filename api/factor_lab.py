@@ -11,6 +11,67 @@ from api.backtest import _validate_market
 from core.db import DB_PATH
 from core.factor_lab_engine import ALPHA158_FACTORS, MARKET_DEFAULTS, run_factor_lab
 
+_CATALOG_BY_NAME = {str(f.get("name", "")).upper(): f for f in ALPHA158_FACTORS}
+
+
+def _parse_account_factor_token(token: str) -> dict | None:
+    """Convert a live account factor token like ROC_20 into a lab term."""
+    s = str(token or "").strip().upper()
+    if not s:
+        return None
+    if s in _CATALOG_BY_NAME:
+        return {"mode": "factor", "factor": s, "periods": [], "weight": 1.0, "transform": "rank"}
+    for base in sorted(_CATALOG_BY_NAME, key=len, reverse=True):
+        prefix = base + "_"
+        if s.startswith(prefix):
+            tail = s[len(prefix):]
+            if tail.isdigit():
+                return {"mode": "factor", "factor": base, "periods": [int(tail)], "weight": 1.0, "transform": "rank"}
+    return None
+
+
+def _account_composite_rows(con: sqlite3.Connection, market: str) -> list[dict]:
+    rows = con.execute(
+        """
+        SELECT account_id, "group" AS group_name, strategy_name, factors
+        FROM account_meta
+        WHERE market = ?
+          AND COALESCE(status, 'active') != 'retired'
+        ORDER BY account_id
+        """,
+        (market,),
+    ).fetchall()
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for r in rows:
+        raw = str(r["factors"] or "").strip()
+        if not raw or raw.startswith(("GP(", "FMGP(", "qlib_")) or r["group_name"] == "IDX":
+            continue
+        terms = []
+        for tok in raw.split(','):
+            term = _parse_account_factor_token(tok)
+            if term:
+                terms.append(term)
+        if not terms:
+            continue
+        key = tuple((t["factor"], tuple(t.get("periods") or [])) for t in terms)
+        if key in seen:
+            continue
+        seen.add(key)
+        w = round(1.0 / len(terms), 4)
+        for t in terms:
+            t["weight"] = w
+        out.append({
+            "account_id": r["account_id"],
+            "group": r["group_name"],
+            "strategy_name": r["strategy_name"] or r["account_id"],
+            "label": f'{r["account_id"]} · {r["strategy_name"] or ""}'.strip(),
+            "factors": raw,
+            "terms": terms,
+            "n_terms": len(terms),
+        })
+    return out
+
 router = APIRouter(prefix="/api/factor-lab", tags=["factor_lab"])
 
 
@@ -65,6 +126,7 @@ async def factor_lab_catalog(market: str = Query("US")):
             ('[0-9][0-9][0-9][0-9][0-9][0-9].S[HZ]',),
         ).fetchall()
         coverage = {r["factor_name"]: dict(r) for r in rows}
+        account_composites = _account_composite_rows(con, market)
     finally:
         con.close()
 
@@ -77,6 +139,7 @@ async def factor_lab_catalog(market: str = Query("US")):
             }
             for f in ALPHA158_FACTORS
         ],
+        "account_composites": account_composites,
         "defaults": {
             **MARKET_DEFAULTS.get(market, MARKET_DEFAULTS["US"]),
             "horizon": 5,
