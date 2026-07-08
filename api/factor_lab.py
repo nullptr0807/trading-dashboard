@@ -257,6 +257,7 @@ class FactorExpressionRequest(BaseModel):
 
 class FactorLabRunRequest(BaseModel):
     market: Literal["US", "CN"] = "US"
+    dataset_scope: Literal["configured", "factor_coverage", "priced"] = "configured"
     start_date: str
     end_date: str
     initial_capital: float | None = Field(None, gt=0)
@@ -307,6 +308,7 @@ async def factor_lab_catalog(market: str = Query("US")):
         "account_composites": account_composites,
         "defaults": {
             **MARKET_DEFAULTS.get(market, MARKET_DEFAULTS["US"]),
+            "dataset_scope": "configured",
             "horizon": 5,
             "window": 20,
             "sample_expression": {

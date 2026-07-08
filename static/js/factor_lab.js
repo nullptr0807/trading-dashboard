@@ -195,6 +195,15 @@
                 <input type="number" id="fl-capital" class="bt-input" value="${state.market === 'CN' ? 100000 : 10000}">
               </div>
             </div>
+            <div class="bt-field fl-scope-field">
+              <label>${t('fl_dataset_scope')}</label>
+              <select id="fl-dataset-scope" class="bt-input">
+                <option value="configured">${t('fl_scope_configured')}</option>
+                <option value="factor_coverage">${t('fl_scope_factor_coverage')}</option>
+                <option value="priced">${t('fl_scope_priced')}</option>
+              </select>
+              <small class="fl-field-hint" id="fl-scope-hint"></small>
+            </div>
             <div class="fl-auto-note" id="fl-auto-note"></div>
 
             <details class="fl-advanced">
@@ -274,6 +283,11 @@
       document.getElementById('fl-hold-band').value = defaults.hold_band_mult || 3;
       document.getElementById('fl-cooldown').value = defaults.cooldown_days || 0;
       document.getElementById('fl-min-hold').value = defaults.min_hold_days || 0;
+      const scopeSel = document.getElementById('fl-dataset-scope');
+      if (scopeSel) {
+        scopeSel.value = defaults.dataset_scope || 'configured';
+        paintScopeHint();
+      }
       const note = document.getElementById('fl-auto-note');
       if (note) note.textContent = t('fl_auto_note', {
         market: state.market,
@@ -313,8 +327,32 @@
       applyPreset('momentum');
     });
     document.getElementById('fl-run').addEventListener('click', runFactorLab);
+    const scopeSel = document.getElementById('fl-dataset-scope');
+    if (scopeSel) scopeSel.addEventListener('change', paintScopeHint);
+    paintScopeHint();
     const search = document.getElementById('fl-factor-search');
     search.addEventListener('input', paintCatalog);
+  }
+
+  function datasetScopeLabel(scope) {
+    const v = String(scope || 'configured');
+    if (v === 'factor_coverage') return t('fl_scope_factor_coverage');
+    if (v === 'priced') return t('fl_scope_priced');
+    return t('fl_scope_configured');
+  }
+
+  function datasetScopeHint(scope) {
+    const v = String(scope || 'configured');
+    if (v === 'factor_coverage') return t('fl_scope_factor_coverage_desc');
+    if (v === 'priced') return t('fl_scope_priced_desc');
+    return t('fl_scope_configured_desc');
+  }
+
+  function paintScopeHint() {
+    const sel = document.getElementById('fl-dataset-scope');
+    const hint = document.getElementById('fl-scope-hint');
+    if (!hint) return;
+    hint.textContent = datasetScopeHint(sel ? sel.value : 'configured');
   }
 
   function applyPreset(key) {
@@ -645,6 +683,7 @@
     const host = document.getElementById('fl-result-host');
     const body = {
       market: state.market,
+      dataset_scope: document.getElementById('fl-dataset-scope')?.value || 'configured',
       start_date: document.getElementById('fl-start').value,
       end_date: document.getElementById('fl-end').value,
       initial_capital: parseFloat(document.getElementById('fl-capital').value) || (state.market === 'CN' ? 100000 : 10000),
@@ -703,7 +742,8 @@
         <div class="section-title-row">
           <div>
             <div class="section-title">${t('fl_result_title')}</div>
-            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('fl_hold_band_mult')}: ${esc(meta.hold_band_mult || 1)} (hold top ${esc(meta.hold_threshold || (meta.top_n || 0))}) · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
+            <div class="fl-result-meta">${esc(meta.start_date)} → ${esc(meta.end_date)} · ${t('fl_dataset_scope')}: ${esc(datasetScopeLabel(meta.dataset_scope || cov.dataset_scope))} · ${t('fl_rebalance_days')}: ${esc(meta.rebalance_days || 1)} · ${t('fl_hold_band_mult')}: ${esc(meta.hold_band_mult || 1)} (hold top ${esc(meta.hold_threshold || (meta.top_n || 0))}) · ${t('sq_universe')} ${cov.priced_universe || cov.selected_universe || '—'} · top ${meta.top_n} · ${esc(meta.cost_model || '')}</div>
+            <div class="fl-result-meta fl-result-scope">${esc(cov.ranking_basis || '')}</div>
           </div>
         </div>
         ${renderVerdict(s)}

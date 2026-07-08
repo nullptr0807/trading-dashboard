@@ -91,6 +91,7 @@ _CATALOG_BY_NAME = {f["name"]: f for f in FACTOR_CATALOG}
 _VALID_FACTORS = _FIXED_FACTORS | _TUNABLE_FACTORS
 _VALID_TRANSFORMS = {"rank", "zscore"}
 _VALID_REBALANCE = {"daily", "weekly", "monthly"}
+_VALID_DATASET_SCOPES = {"configured", "factor_coverage", "priced"}
 _MIN_PERIOD = 1
 _MAX_PERIOD = 252
 _LATEX_MAX_LEN = 6000
@@ -396,13 +397,81 @@ def _load_ohlcv(con: sqlite3.Connection, market: str, start_date: str, end_date:
     return matrices
 
 
-def _select_universe(close: pd.DataFrame, volume: pd.DataFrame, market: str, start_date: str) -> tuple[list[str], str]:
+def _factor_coverage_universe(
+    con: sqlite3.Connection,
+    market: str,
+    end_date: str,
+    configured: list[str],
+    available: set[str],
+) -> tuple[list[str], str]:
+    """Return tickers that actually had persisted Alpha158 rows by end_date.
+
+    This is the closest Factor Lab can get to the A-account operational data set:
+    main.py fetches the configured universe, computes Alpha158, then persists
+    the tickers that successfully produced factor rows.  Restricting the lab to
+    that latest <= end_date coverage exposes gaps between "configured universe"
+    and "real factor pipeline coverage" without depending on arbitrary persisted
+    factor values for the lab's tunable formula itself.
+    """
+    pred, params = _market_predicate_sql(market)
+    configured_set = set(configured or [])
+    latest = con.execute(
+        f"""
+        SELECT MAX(date)
+        FROM factor_values
+        WHERE factor_group='alpha158'
+          AND date <= ?
+          AND {pred}
+        """,
+        (end_date, *params),
+    ).fetchone()[0]
+    if not latest:
+        raise ValueError(f"no alpha158 factor_values coverage for {market} on or before {end_date}")
+    rows = con.execute(
+        f"""
+        SELECT DISTINCT ticker
+        FROM factor_values
+        WHERE factor_group='alpha158'
+          AND date=?
+          AND {pred}
+        ORDER BY ticker
+        """,
+        (latest, *params),
+    ).fetchall()
+    tickers = [str(r[0]) for r in rows]
+    if configured_set:
+        tickers = [t for t in tickers if t in configured_set]
+    tickers = [t for t in tickers if t in available]
+    if not tickers:
+        raise ValueError(f"alpha158 factor coverage exists at {latest}, but none overlap requested prices/universe")
+    return tickers, f"actual alpha158 factor coverage ({latest})"
+
+
+def _select_universe(
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    market: str,
+    start_date: str,
+    *,
+    dataset_scope: str = "configured",
+    end_date: str | None = None,
+    con: sqlite3.Connection | None = None,
+) -> tuple[list[str], str]:
     configured = _configured_universe(market)
     available = set(close.columns.tolist())
-    if configured:
+    scope = (dataset_scope or "configured").strip().lower()
+    if scope not in _VALID_DATASET_SCOPES:
+        raise ValueError("dataset_scope must be configured, factor_coverage, or priced")
+
+    if scope == "factor_coverage":
+        if con is None:
+            raise ValueError("factor_coverage scope needs a database connection")
+        return _factor_coverage_universe(con, market, end_date or start_date, configured, available)
+
+    if scope == "configured" and configured:
         selected = [t for t in configured if t in available]
         if selected:
-            return selected, "configured universe"
+            return selected, "configured live account universe"
     candidates = sorted(available)
     if not candidates:
         raise ValueError("price matrix has no tickers")
@@ -1053,8 +1122,11 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     cooldown_days = int(request.get("cooldown_days") or defaults["cooldown_days"])
     min_hold_days = int(request.get("min_hold_days") or defaults["min_hold_days"])
     rebalance = str(request.get("rebalance") or defaults["rebalance"]).lower()
+    dataset_scope = str(request.get("dataset_scope") or "configured").strip().lower()
     if rebalance not in _VALID_REBALANCE:
         raise ValueError("rebalance must be daily, weekly, or monthly")
+    if dataset_scope not in _VALID_DATASET_SCOPES:
+        raise ValueError("dataset_scope must be configured, factor_coverage, or priced")
     if not (1 <= horizon <= 60):
         raise ValueError("horizon must be 1..60")
     if not (5 <= window <= 120):
@@ -1076,7 +1148,10 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
     try:
         con.execute("PRAGMA query_only = ON")
         matrices = _load_ohlcv(con, market, start_date, end_date, _max_period(terms))
-        selected, ranking_basis = _select_universe(matrices["close"], matrices["volume"], market, start_date)
+        selected, ranking_basis = _select_universe(
+            matrices["close"], matrices["volume"], market, start_date,
+            dataset_scope=dataset_scope, end_date=end_date, con=con,
+        )
         matrices = {k: v.reindex(columns=selected).dropna(axis=1, how="all") for k, v in matrices.items()}
         close = matrices["close"]
         if close.empty:
@@ -1099,7 +1174,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "默认口径避免前瞻：t日信号从 t+1 close 后才开始计收益；IC 使用 close[t+1+h] / close[t+1] - 1。",
             "因子先做横截面 rank/z-score 后组合，避免 RSI/BETA/ROC 等尺度污染。",
             "可调周期因子按日线 OHLCV 临时计算；输入 5,10,20 会先合并同族周期，再参与总表达式。",
-            f"股票池自动使用 {market} 配置宇宙（可用 {len(selected)} 支）；交易成本使用 {exec_diag.get('cost_model')} 估算。",
+            f"数据口径：{ranking_basis}（可用 {len(selected)} 支）；交易成本使用 {exec_diag.get('cost_model')} 估算。",
             f"已应用 rank-cutoff hysteresis / no-trade band：买入阈值 top {top_n}，持有阈值 top {top_n * hold_band_mult}。",
         ]
         warnings_en: list[str] = [
@@ -1107,7 +1182,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
             "Look-ahead guard: signal at t only earns returns after t+1 close; IC uses close[t+1+h] / close[t+1] - 1.",
             "Each factor is cross-sectionally ranked/z-scored before combination to avoid RSI/BETA/ROC scale pollution.",
             "Tunable-period factors are computed on the fly from 1d OHLCV; entering 5,10,20 merges those sibling periods before the total expression.",
-            f"Universe is auto-selected from the configured {market} universe ({len(selected)} usable tickers); transaction cost estimate uses {exec_diag.get('cost_model')}.",
+            f"Dataset scope: {ranking_basis} ({len(selected)} usable tickers); transaction cost estimate uses {exec_diag.get('cost_model')}.",
             f"Rank-cutoff hysteresis / no-trade band is applied: buy threshold top {top_n}, hold threshold top {top_n * hold_band_mult}.",
         ]
         if formula_terms:
@@ -1155,6 +1230,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
                 "priced_universe": int(len(close.columns)),
                 "signal_dates": int(signal["date"].nunique()),
                 "ranking_basis": ranking_basis,
+                "dataset_scope": dataset_scope,
                 "max_factor_period": _max_period(terms),
             },
             "meta": {
@@ -1166,6 +1242,7 @@ def run_factor_lab(request: dict[str, Any]) -> dict[str, Any]:
                 "horizon": horizon,
                 "window": window,
                 "rebalance": rebalance,
+                "dataset_scope": dataset_scope,
                 "rebalance_days": rebalance_days,
                 "hold_band_mult": hold_band_mult,
                 "hold_threshold": top_n * hold_band_mult,
