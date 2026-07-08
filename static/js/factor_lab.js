@@ -150,7 +150,8 @@
           <p class="page-subtitle">${t('fl_subtitle')}</p>
         </div>
         <div class="factor-lab-layout">
-          <div class="factor-lab-library">
+          <div class="factor-lab-sidebar">
+            <div class="factor-lab-library">
             <div class="glass-card section factor-catalog-card">
               <div class="section-title-row">
                 <div class="section-title">${t('fl_catalog')}</div>
@@ -222,7 +223,6 @@
             </details>
 
             <div class="fl-step-title"><span>3</span><div><b>${t('fl_expression')}</b><em>${t('fl_expression_desc')}</em></div></div>
-            <div id="fl-recipe-summary" class="fl-recipe-summary"></div>
             <details class="fl-expression-editor">
               <summary>${t('fl_edit_formula')}</summary>
               <div class="fl-term-header">
@@ -238,8 +238,10 @@
             </details>
             <button class="btn btn-accent bt-run-btn fl-run" id="fl-run">${t('fl_run')}</button>
           </div>
+          </div>
 
           <div class="factor-lab-main">
+            <div id="fl-recipe-summary" class="glass-card section fl-recipe-summary"></div>
             <div id="fl-result-host" class="factor-lab-results">
               <div class="glass-card section fl-empty">
                 <div class="fl-empty-icon">🧪</div>

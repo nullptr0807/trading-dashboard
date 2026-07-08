@@ -2123,12 +2123,13 @@ body::after {
 .factor-lab-hero { padding: 28px 0 26px; }
 .factor-lab-layout {
   display: grid;
-  grid-template-columns: minmax(240px, 0.72fr) minmax(430px, 1.12fr) minmax(360px, 1fr);
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
   gap: 18px;
   align-items: start;
 }
-.factor-lab-config { margin-top: 0; padding: 22px 24px; position: sticky; top: 76px; min-width:0; }
-.factor-lab-library { position: sticky; top: 76px; min-width: 0; }
+.factor-lab-sidebar { min-width:0; display:flex; flex-direction:column; gap:18px; }
+.factor-lab-config { margin-top: 0; padding: 22px 24px; min-width:0; }
+.factor-lab-library { min-width: 0; }
 .factor-lab-main { min-width: 0; }
 .fl-step-title { display:flex; align-items:flex-start; gap:10px; margin: 2px 0 12px; }
 .fl-step-title span { flex:0 0 24px; width:24px; height:24px; border-radius:999px; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg, rgba(0,113,227,.16), rgba(172,57,255,.14)); color:var(--accent-blue); font-size:12px; font-weight:800; }
@@ -2169,6 +2170,7 @@ body::after {
 .fl-verdict-weak { background:rgba(224,45,45,.08); border-color:rgba(224,45,45,.16); }
 .factor-lab-main { min-width: 0; }
 .factor-catalog-card, .fl-result-card, .fl-empty { margin-top: 0; padding: 24px 26px; }
+.factor-lab-results { margin-top: 16px; }
 .fl-method-note {
   color: var(--text-secondary);
   font-size: 12px;
@@ -2243,6 +2245,7 @@ body::after {
 .fl-run { width: 100%; margin-top: 12px; }
 .fl-search { max-width: 260px; }
 .fl-catalog-host { max-height: 500px; overflow-y: auto; padding-right: 4px; }
+.factor-lab-sidebar .fl-catalog-host { max-height: 220px; }
 .fl-muted { color: var(--text-secondary); padding: 12px; font-size: 13px; }
 .fl-family { margin-bottom: 16px; }
 .fl-family-title {
