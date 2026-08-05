@@ -9,6 +9,8 @@ function createCard(account) {
   const isIDX = id.startsWith('IDX');
   const badgeClass = isA ? 'badge-a' : (isB ? 'badge-b' : (isQ ? 'badge-q' : 'badge-idx'));
   const isRetired = (account.status || 'active') === 'retired';
+  const runtimeStatus = account.runtime_status || 'ready';
+  const isNonTradeable = !isRetired && runtimeStatus !== 'ready';
   const pnlPct = account.pnl_pct || 0;
   const pnlAbs = account.pnl || 0;
   const tradeCount = account.trade_count ?? 0;
@@ -27,12 +29,16 @@ function createCard(account) {
   const retiredPill = isRetired
     ? `<span class="retired-pill" title="${(account.retire_reason || t('retired_tooltip') || '').replace(/"/g,'&quot;')}">${t('retired_badge') || 'RETIRED'}${account.retired_at ? ' · ' + account.retired_at.slice(0,10) : ''}</span>`
     : '';
+  const runtimePill = isNonTradeable
+    ? `<span class="runtime-pill" title="${_esc(account.runtime_reason || runtimeStatus)}">${t('runtime_nontradeable')}</span>`
+    : '';
   row.innerHTML = `
     <div class="row-main">
       <div class="row-left">
         <span class="account-badge ${badgeClass}">${id}</span>
         <span class="row-strategy">${displayName}</span>
         ${retiredPill}
+        ${runtimePill}
       </div>
       <div class="row-metrics">
         <div class="row-metric">

@@ -36,8 +36,13 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
         active_ids: list[str] = []
         inactive: list[dict] = []
         if 'account_meta' in tables:
+            meta_cols = {r[1] for r in con.execute('PRAGMA table_info(account_meta)')}
+            runtime_select = (
+                ",COALESCE(runtime_status,'ready') runtime_status,runtime_reason"
+                if 'runtime_status' in meta_cols else ", 'ready' runtime_status, NULL runtime_reason"
+            )
             meta = con.execute(
-                "SELECT account_id,status,retire_reason FROM account_meta "
+                "SELECT account_id,status,retire_reason" + runtime_select + " FROM account_meta "
                 "WHERE market=? ORDER BY account_id",
                 (market,),
             ).fetchall()
@@ -48,11 +53,15 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
             inactive = [
                 {
                     'account_id': str(r['account_id']),
-                    'status': str(r['status'] or 'active'),
-                    'reason': r['retire_reason'],
+                    'status': str(r['runtime_status'] or r['status'] or 'active'),
+                    'reason': r['runtime_reason'] or r['retire_reason'],
                 }
                 for r in meta
                 if str(r['status'] or 'active') not in {'active', 'retired'}
+                or (
+                    str(r['status'] or 'active') == 'active'
+                    and str(r['runtime_status'] or 'ready') != 'ready'
+                )
             ]
 
         valuation = {

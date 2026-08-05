@@ -878,6 +878,12 @@ body::after {
   vertical-align: middle;
 }
 .bt-account-retired { opacity: 0.6; }
+.runtime-pill {
+  display:inline-block; margin-left:6px; padding:1px 6px; border-radius:3px;
+  font-size:0.65rem; font-weight:700; letter-spacing:0.3px;
+  color:#8a5a00; background:rgba(255,193,7,0.15);
+  border:1px solid rgba(255,193,7,0.35); vertical-align:middle;
+}
 
 /* Highlight newly-arrived rows briefly */
 @keyframes ev-flash {

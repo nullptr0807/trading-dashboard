@@ -90,7 +90,9 @@ async def summary(market: str = Query('US')):
     # account_meta to filter properly).
     rows = await fetch_all('''
         SELECT a.name, a.cash, a.equity, a.timestamp,
-               m."group", m.strategy_name, m.initial_cash, m.status
+               m."group", m.strategy_name, m.initial_cash, m.status,
+               COALESCE(m.runtime_status,'ready') AS runtime_status,
+               m.runtime_reason
         FROM account_meta m
         JOIN accounts a ON a.id = (
             SELECT x.id FROM accounts x
@@ -105,7 +107,8 @@ async def summary(market: str = Query('US')):
     # all configured accounts at their initial equity.
     if not rows:
         meta_rows = await fetch_all(
-            'SELECT account_id as name, "group", strategy_name, initial_cash, status '
+            'SELECT account_id as name, "group", strategy_name, initial_cash, status, '
+            "COALESCE(runtime_status,'ready') AS runtime_status, runtime_reason "
             'FROM account_meta WHERE market = :market', {'market': market}
         )
         state_rows = await fetch_all(
@@ -126,6 +129,8 @@ async def summary(market: str = Query('US')):
                 'strategy_name': m.get('strategy_name') or '',
                 'initial_cash': m.get('initial_cash') or (100000 if market == 'CN' else 10000),
                 'status': m.get('status') or 'active',
+                'runtime_status': m.get('runtime_status') or 'ready',
+                'runtime_reason': m.get('runtime_reason'),
             })
 
     default_init = 100000.0 if market == 'CN' else 10000.0
@@ -143,6 +148,8 @@ async def summary(market: str = Query('US')):
             'group': r.get('group') or '',
             'strategy_name': r.get('strategy_name') or '',
             'status': r.get('status') or 'active',
+            'runtime_status': r.get('runtime_status') or 'ready',
+            'runtime_reason': r.get('runtime_reason'),
             'pnl': round(r['equity'] - r['initial_cash'], 2),
             'pnl_pct': round((r['equity'] - r['initial_cash']) / r['initial_cash'] * 100, 2),
         }
@@ -151,7 +158,10 @@ async def summary(market: str = Query('US')):
     # Retired accounts are frozen — their final return is real (we keep it in
     # totals + per_account for display) but excluding them from distribution
     # stats avoids skewing median/IQR/win-rate/best/worst with stale figures.
-    active_for_dist = [a for a in per_account if a.get('status') != 'retired']
+    active_for_dist = [
+        a for a in per_account
+        if a.get('status') != 'retired' and a.get('runtime_status', 'ready') == 'ready'
+    ]
     pcts = sorted(a['pnl_pct'] for a in active_for_dist)
 
     def _quantile(xs, q):
@@ -172,6 +182,10 @@ async def summary(market: str = Query('US')):
     distribution = {
         'count': len(pcts),
         'retired_count': sum(1 for a in per_account if a.get('status') == 'retired'),
+        'non_tradeable_count': sum(
+            1 for a in per_account
+            if a.get('status') != 'retired' and a.get('runtime_status', 'ready') != 'ready'
+        ),
         'best': best,
         'worst': worst,
         'median_pct': round(_quantile(pcts, 0.5), 2) if pcts else 0.0,
@@ -194,7 +208,11 @@ async def summary(market: str = Query('US')):
         # (median / win_rate) are computed only over active to avoid drift.
         eq = sum(r['equity'] for r in gr)
         init = sum(r['initial_cash'] for r in gr)
-        active = [r for r in gr if (r.get('status') or 'active') != 'retired']
+        active = [
+            r for r in gr
+            if (r.get('status') or 'active') != 'retired'
+            and (r.get('runtime_status') or 'ready') == 'ready'
+        ]
         pcts_g = sorted([(r['equity'] - r['initial_cash']) / r['initial_cash'] * 100 for r in active])
         return {
             'count': len(gr),
@@ -252,7 +270,9 @@ async def accounts(market: str = Query('US')):
     rows = await fetch_all('''
         SELECT a.name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.factors, m.status, m.initial_cash,
-               m.retired_at, m.retire_reason, m.created_at
+               m.retired_at, m.retire_reason, m.created_at,
+               COALESCE(m.runtime_status,'ready') AS runtime_status,
+               m.runtime_reason, m.runtime_detail, m.runtime_updated_at
         FROM account_meta m
         JOIN accounts a ON a.id = (
             SELECT x.id FROM accounts x
@@ -267,7 +287,8 @@ async def accounts(market: str = Query('US')):
         # Fallback when no `accounts` snapshots exist yet for this market.
         meta_rows = await fetch_all(
             'SELECT account_id as name, "group", strategy_name, factors, status, initial_cash, '
-            'retired_at, retire_reason, created_at '
+            'retired_at, retire_reason, created_at, '
+            "COALESCE(runtime_status,'ready') AS runtime_status, runtime_reason, runtime_detail, runtime_updated_at "
             'FROM account_meta WHERE market = :market ORDER BY account_id',
             {'market': market}
         )
@@ -289,6 +310,10 @@ async def accounts(market: str = Query('US')):
                 'strategy_name': m.get('strategy_name') or '',
                 'factors': m.get('factors') or '',
                 'status': m.get('status') or 'active',
+                'runtime_status': m.get('runtime_status') or 'ready',
+                'runtime_reason': m.get('runtime_reason'),
+                'runtime_detail': m.get('runtime_detail'),
+                'runtime_updated_at': m.get('runtime_updated_at'),
             })
 
     trade_rows = await fetch_all(
@@ -336,6 +361,10 @@ async def accounts(market: str = Query('US')):
             'pnl_pct': round(pnl / initial * 100, 2),
             'factors': r.get('factors', ''),
             'status': r.get('status', 'active'),
+            'runtime_status': r.get('runtime_status', 'ready'),
+            'runtime_reason': r.get('runtime_reason'),
+            'runtime_detail': r.get('runtime_detail'),
+            'runtime_updated_at': r.get('runtime_updated_at'),
             'retired_at': r.get('retired_at'),
             'retire_reason': r.get('retire_reason'),
             'created_at': r.get('created_at'),
