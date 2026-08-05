@@ -73,8 +73,10 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
         if active_ids and 'accounts' in tables:
             marks = ','.join('?' for _ in active_ids)
             rows = con.execute(
-                f"SELECT name,MAX(timestamp) ts FROM accounts "
-                f"WHERE market=? AND name IN ({marks}) GROUP BY name",
+                "SELECT m.account_id,(SELECT a.timestamp FROM accounts a "
+                "WHERE a.market=m.market AND a.name=m.account_id "
+                "ORDER BY a.timestamp DESC LIMIT 1) ts "
+                f"FROM account_meta m WHERE m.market=? AND m.account_id IN ({marks})",
                 (market, *active_ids),
             ).fetchall()
             timestamps = [str(r['ts']) for r in rows if r['ts']]
