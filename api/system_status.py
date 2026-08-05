@@ -5,6 +5,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,22 @@ def _age_seconds(value: Any) -> float:
         return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
     except (TypeError, ValueError):
         return float('inf')
+
+
+def _market_freshness_sla(market: str) -> int:
+    now = datetime.now(timezone.utc)
+    if market == 'CN':
+        local = now.astimezone(ZoneInfo('Asia/Shanghai'))
+        minute = local.hour * 60 + local.minute
+        rth = local.weekday() < 5 and (570 <= minute < 690 or 780 <= minute < 900)
+        return 10 * 60 if rth else 96 * 3600
+    local = now.astimezone(ZoneInfo('America/New_York'))
+    minute = local.hour * 60 + local.minute
+    if local.weekday() < 5 and 570 <= minute < 960:
+        return 10 * 60
+    if local.weekday() < 5 and 240 <= minute < 1200:
+        return 30 * 60
+    return 96 * 3600
 
 
 def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
@@ -146,14 +163,14 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
                     'last_check_at': row['last_check_at'],
                 }
 
-        max_offhours_age = 96 * 3600
+        freshness_sla = _market_freshness_sla(market)
         degraded = (
             health['status'] not in {'ok', 'healthy'}
-            or _age_seconds(health.get('success_at')) > max_offhours_age
+            or _age_seconds(health.get('success_at')) > freshness_sla
             or valuation['complete_accounts'] < valuation['active_accounts']
-            or _age_seconds(valuation.get('oldest_complete_at')) > max_offhours_age
+            or _age_seconds(valuation.get('oldest_complete_at')) > freshness_sla
             or risk['state'] not in {'ARMED', 'DISARMED'}
-            or _age_seconds(risk.get('last_check_at')) > max_offhours_age
+            or _age_seconds(risk.get('last_check_at')) > freshness_sla
             or bool(inactive)
         )
         return {
