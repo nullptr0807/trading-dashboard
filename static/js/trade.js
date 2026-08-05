@@ -14,7 +14,14 @@ async function renderTradePage(routeToken) {
     const summary = await api('/trade/summary');
     if (!routeOk()) return;
     renderHero(summary);
-    loadSystemStatus(routeToken).catch(e => console.warn('system status', e));
+    loadSystemStatus(routeToken).catch(e => {
+      console.warn('system status', e);
+      const banner = document.getElementById('system-status-banner');
+      if (banner) {
+        banner.className = 'system-status-banner system-status-degraded';
+        banner.textContent = t('system_unavailable');
+      }
+    });
   } catch (e) {
     if (!routeOk()) return;
     renderHeroFallback();

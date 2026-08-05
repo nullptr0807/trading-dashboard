@@ -56,21 +56,40 @@ def _validate_market(market: str) -> str:
 
 
 def _fetch_account_equity_rows_sync(market: str, *, since_45d: bool = False) -> list[tuple[str, float, str, float]]:
-    """Fetch hourly account-equity rows without materialising every minute tick."""
-    where_recent = "AND a.timestamp >= datetime('now', '-45 days')" if since_45d else ""
-    sql = f"""
-        SELECT a.name, AVG(a.equity), MAX(a.timestamp), AVG(a.cash)
-        FROM accounts a
-        JOIN account_meta m ON m.account_id = a.name AND m.market = a.market
-        WHERE a.market = ? AND m.market = ? {where_recent}
-        GROUP BY a.name, substr(a.timestamp,1,13)
-        ORDER BY a.name, MAX(a.timestamp)
+    """Fetch deterministic bucket-close rows: hourly recent, daily older.
+
+    A transient intrabucket V-spike no longer gets averaged into the whole bucket;
+    only the final complete mark represents that bucket.
     """
+    where_recent = "AND a.timestamp >= datetime('now', '-45 days')" if since_45d else ""
+    if since_45d:
+        # Sharpe only needs one stable observation per hour; SQL aggregation keeps
+        # the account-list request cheap and is not used to render the curve.
+        sql = f"""
+            SELECT a.name,AVG(a.equity),MAX(a.timestamp),AVG(a.cash)
+            FROM accounts a
+            JOIN account_meta m ON m.account_id=a.name AND m.market=a.market
+            WHERE a.market=? AND m.market=? {where_recent}
+            GROUP BY a.name,substr(a.timestamp,1,13)
+            ORDER BY a.name,MAX(a.timestamp)
+        """
+        params = (market, market)
+    else:
+        bucket = "substr(a.timestamp,1,13)"
+        sql = f"""
+            SELECT a.name,a.equity,MAX(a.timestamp),a.cash
+            FROM accounts a
+            JOIN account_meta m ON m.account_id=a.name AND m.market=a.market
+            WHERE a.market=? AND m.market=?
+            GROUP BY a.name,{bucket}
+            ORDER BY a.name,MAX(a.timestamp)
+        """
+        params = (market, market)
     con = sqlite3.connect(str(DB_PATH), timeout=30)
     try:
         con.execute('PRAGMA query_only = ON')
         con.execute('PRAGMA busy_timeout=30000')
-        return [(str(n), float(e or 0), str(ts), float(c or 0)) for n, e, ts, c in con.execute(sql, (market, market))]
+        return [(str(n), float(e or 0), str(ts), float(c or 0)) for n, e, ts, c in con.execute(sql, params)]
     finally:
         con.close()
 
@@ -89,12 +108,12 @@ async def summary(market: str = Query('US')):
     # table inherits the default 'US' for everything, so we always join through
     # account_meta to filter properly).
     rows = await fetch_all('''
-        SELECT a.name, a.cash, a.equity, a.timestamp,
+        SELECT m.account_id AS name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.initial_cash, m.status,
                COALESCE(m.runtime_status,'ready') AS runtime_status,
                m.runtime_reason
         FROM account_meta m
-        JOIN accounts a ON a.id = (
+        LEFT JOIN accounts a ON a.id = (
             SELECT x.id FROM accounts x
             WHERE x.market=m.market AND x.name=m.account_id
             ORDER BY x.timestamp DESC LIMIT 1
@@ -132,6 +151,22 @@ async def summary(market: str = Query('US')):
                 'runtime_status': m.get('runtime_status') or 'ready',
                 'runtime_reason': m.get('runtime_reason'),
             })
+
+    if any(r.get('equity') is None for r in rows):
+        state_rows = await fetch_all(
+            'SELECT account,cash,initial_cash,updated_at AS timestamp '
+            'FROM account_state WHERE market=:market', {'market': market}
+        )
+        state_by_acc = {r['account']: r for r in state_rows}
+        for r in rows:
+            if r.get('equity') is not None:
+                continue
+            state = state_by_acc.get(r['name'], {})
+            initial = r.get('initial_cash') or (100000 if market == 'CN' else 10000)
+            cash = state.get('cash') if state.get('cash') is not None else initial
+            r['cash'] = cash
+            r['equity'] = cash
+            r['timestamp'] = state.get('timestamp')
 
     default_init = 100000.0 if market == 'CN' else 10000.0
     for r in rows:
@@ -268,13 +303,13 @@ async def accounts(market: str = Query('US')):
     if cached is not None:
         return cached
     rows = await fetch_all('''
-        SELECT a.name, a.cash, a.equity, a.timestamp,
+        SELECT m.account_id AS name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.factors, m.status, m.initial_cash,
                m.retired_at, m.retire_reason, m.created_at,
                COALESCE(m.runtime_status,'ready') AS runtime_status,
                m.runtime_reason, m.runtime_detail, m.runtime_updated_at
         FROM account_meta m
-        JOIN accounts a ON a.id = (
+        LEFT JOIN accounts a ON a.id = (
             SELECT x.id FROM accounts x
             WHERE x.market=m.market AND x.name=m.account_id
             ORDER BY x.timestamp DESC LIMIT 1
@@ -315,6 +350,24 @@ async def accounts(market: str = Query('US')):
                 'runtime_detail': m.get('runtime_detail'),
                 'runtime_updated_at': m.get('runtime_updated_at'),
             })
+
+    # LEFT JOIN preserves tombstones/retired experiments that never produced a
+    # snapshot. Fill those rows from account_state, then configured initial cash.
+    if any(r.get('equity') is None for r in rows):
+        state_rows = await fetch_all(
+            'SELECT account,cash,initial_cash,updated_at AS timestamp '
+            'FROM account_state WHERE market=:market', {'market': market}
+        )
+        state_by_acc = {r['account']: r for r in state_rows}
+        for r in rows:
+            if r.get('equity') is not None:
+                continue
+            state = state_by_acc.get(r['name'], {})
+            initial = r.get('initial_cash') or (100000 if market == 'CN' else 10000)
+            cash = state.get('cash') if state.get('cash') is not None else initial
+            r['cash'] = cash
+            r['equity'] = cash
+            r['timestamp'] = state.get('timestamp')
 
     trade_rows = await fetch_all(
         'SELECT account, COUNT(*) as cnt FROM trades WHERE market = :market GROUP BY account',
@@ -412,11 +465,9 @@ async def equity_curves(market: str = Query('US')):
         return _dt.fromtimestamp(bucket, _tz.utc).isoformat()
 
     base_initial = 100000.0 if market == 'CN' else 10000.0
-    # First collect raw points into hourly buckets, then use the median equity
-    # within each bucket. This is deliberately more robust than "last point wins":
-    # CN minute snapshots can contain occasional bad/partial valuations that
-    # would otherwise become the representative point for the whole hour and
-    # create sawtooth curves (CB13 was the smoking gun).
+    # SQL has already selected the deterministic final complete mark per hour.
+    # Keep the read-time fallback/outlier guards below, then coarsen history older
+    # than 30 days to daily closes so cold payloads remain bounded.
     bucket_values: dict[str, dict[int, list[float]]] = {}
     last_good_equity: dict[str, float] = {}
     # Parse retired_at once → epoch sec for fast comparison
@@ -485,6 +536,21 @@ async def equity_curves(market: str = Query('US')):
         kept.append(pts[-1])
         return kept
 
+    def _coarsen_old_history(pts: list[dict]) -> list[dict]:
+        cutoff = int(_dt.now(_tz.utc).timestamp()) - 30 * 86400
+        old_by_day: dict[str, dict] = {}
+        recent = []
+        for point in pts:
+            try:
+                epoch = int(_dt.fromisoformat(point['timestamp'].replace('Z', '+00:00')).timestamp())
+            except Exception:
+                epoch = cutoff
+            if epoch < cutoff:
+                old_by_day[point['timestamp'][:10]] = point
+            else:
+                recent.append(point)
+        return list(old_by_day.values()) + recent
+
     curves: dict[str, list[dict]] = {}
     for name, by_bucket in bucket_values.items():
         pts = []
@@ -496,7 +562,7 @@ async def equity_curves(market: str = Query('US')):
             else:
                 eq = (vals[n // 2 - 1] + vals[n // 2]) / 2
             pts.append({'equity': round(eq, 2), 'timestamp': _bucket_ts(bk)})
-        curves[name] = _drop_isolated_outliers(pts)
+        curves[name] = _coarsen_old_history(_drop_isolated_outliers(pts))
 
     first_row = await fetch_one(
         'SELECT MIN(timestamp) as ts FROM trades '

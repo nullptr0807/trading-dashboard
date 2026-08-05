@@ -1,6 +1,7 @@
 """Read-only operational status for the trading overview banner."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -168,4 +169,4 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
 
 @router.get('')
 async def system_status(market: str = Query('US')):
-    return _status_sync(_validate_market(market))
+    return await asyncio.to_thread(_status_sync, _validate_market(market))
