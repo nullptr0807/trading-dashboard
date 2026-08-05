@@ -525,7 +525,14 @@ async def account_detail(account_id: str, market: str = Query('US')):
             'price': r['market_price'],
             'value': r['market_value'],
             'pnl': r['unrealized_pnl'],
-            'pnl_pct': (100.0 * r['unrealized_pnl'] / (r['shares'] * r['avg_cost'])) if (r['shares'] and r['avg_cost']) else 0.0,
+            # Historical snapshots can legitimately lack a market quote. Keep
+            # the return unknown instead of crashing the entire account API (or
+            # fabricating a 0% return) when unrealized_pnl is NULL.
+            'pnl_pct': (
+                100.0 * r['unrealized_pnl'] / (r['shares'] * r['avg_cost'])
+                if r['unrealized_pnl'] is not None and r['shares'] and r['avg_cost']
+                else None
+            ),
         })
     eq_map = {e['timestamp']: e['equity'] for e in equity}
     snapshots = []
