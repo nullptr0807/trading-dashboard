@@ -153,6 +153,7 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
             or valuation['complete_accounts'] < valuation['active_accounts']
             or _age_seconds(valuation.get('oldest_complete_at')) > max_offhours_age
             or risk['state'] not in {'ARMED', 'DISARMED'}
+            or _age_seconds(risk.get('last_check_at')) > max_offhours_age
             or bool(inactive)
         )
         return {
