@@ -2320,3 +2320,18 @@ body::after {
   .fl-latex-preview { grid-column: 1; }
   .fl-term-remove { width: 100%; }
 }
+
+.system-status-banner {
+  margin: 16px 0 4px;
+  padding: 13px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(0,0,0,0.10);
+  background: rgba(255,255,255,0.64);
+  box-shadow: 0 8px 28px rgba(31,38,72,0.08);
+}
+.system-status-head { display:flex; gap:14px; align-items:center; flex-wrap:wrap; font-size:13px; }
+.system-status-head b { font-size:14px; }
+.system-status-detail { margin-top:7px; font-size:12px; color:var(--text-secondary); overflow-wrap:anywhere; }
+.system-status-degraded { border-color:rgba(224,45,45,0.35); background:rgba(224,45,45,0.07); }
+.system-status-healthy { border-color:rgba(31,157,85,0.30); background:rgba(31,157,85,0.07); }
+.system-status-loading { color:var(--text-secondary); }

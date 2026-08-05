@@ -14,6 +14,7 @@ async function renderTradePage(routeToken) {
     const summary = await api('/trade/summary');
     if (!routeOk()) return;
     renderHero(summary);
+    loadSystemStatus(routeToken).catch(e => console.warn('system status', e));
   } catch (e) {
     if (!routeOk()) return;
     renderHeroFallback();
@@ -37,6 +38,39 @@ async function renderTradePage(routeToken) {
   }
 }
 
+async function loadSystemStatus(routeToken) {
+  const routeOk = () => typeof isRouteCurrent !== 'function' || isRouteCurrent(routeToken, '/trade');
+  const s = await api('/system-status');
+  if (!routeOk()) return;
+  const host = document.getElementById('system-status-banner');
+  if (!host) return;
+  const q = s.quote_health || {};
+  const v = s.valuation || {};
+  const r = s.risk || {};
+  const bad = (s.status || 'degraded') !== 'healthy';
+  const pct = r.drawdown == null ? '—' : `${(Number(r.drawdown) * 100).toFixed(2)}%`;
+  const coverage = `${v.complete_accounts || 0}/${v.active_accounts || 0}`;
+  const inactive = (s.non_tradeable_accounts || []).map(x => x.account_id).join(', ');
+  host.className = `system-status-banner ${bad ? 'system-status-degraded' : 'system-status-healthy'}`;
+  host.innerHTML = `
+    <div class="system-status-head">
+      <b>${bad ? t('system_degraded') : t('system_healthy')}</b>
+      <span>${t('system_quote')}: ${_escStatus(q.status || 'unknown')}</span>
+      <span>${t('system_valuation')}: ${coverage}</span>
+      <span>${t('system_risk')}: ${_escStatus(r.state || 'UNKNOWN')} · DD ${pct}</span>
+    </div>
+    <div class="system-status-detail">
+      ${t('system_oldest_valuation')}: ${_escStatus(v.oldest_complete_at || '—')}
+      ${inactive ? ` · ${t('system_nontradeable')}: ${_escStatus(inactive)}` : ''}
+    </div>`;
+}
+
+function _escStatus(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function renderHero(s) {
   const app = document.getElementById('app');
   const d = s.distribution || {};
@@ -46,6 +80,7 @@ function renderHero(s) {
   const worstCls = d.worst && d.worst.pnl_pct >= 0 ? 'positive' : 'negative';
   const heroHtml = `
     ${typeof eventsSectionHtml === 'function' ? eventsSectionHtml() : ''}
+    <div id="system-status-banner" class="system-status-banner system-status-loading">${t('system_loading')}</div>
     <div class="hero fade-in">
       <div class="hero-label">${t('dist_title')}</div>
       <div class="hero-value ${medCls}" id="hero-median">
