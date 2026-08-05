@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,18 @@ def _json(value: Any) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError):
         return {}
+
+
+def _age_seconds(value: Any) -> float:
+    if not value:
+        return float('inf')
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return float('inf')
 
 
 def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
@@ -132,10 +145,13 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
                     'last_check_at': row['last_check_at'],
                 }
 
+        max_offhours_age = 96 * 3600
         degraded = (
             health['status'] not in {'ok', 'healthy'}
+            or _age_seconds(health.get('success_at')) > max_offhours_age
             or valuation['complete_accounts'] < valuation['active_accounts']
-            or risk['state'].startswith('LEGACY_MIXED_')
+            or _age_seconds(valuation.get('oldest_complete_at')) > max_offhours_age
+            or risk['state'] not in {'ARMED', 'DISARMED'}
             or bool(inactive)
         )
         return {

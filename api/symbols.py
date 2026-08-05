@@ -234,8 +234,8 @@ async def list_symbols(market: str = Query('US')):
                MAX(t.timestamp)          AS last_trade_ts,
                MIN(t.timestamp)          AS first_trade_ts
         FROM trades t
-        JOIN account_meta m ON m.account_id = t.account
-        WHERE m.market = :market
+        JOIN account_meta m ON m.account_id = t.account AND m.market = t.market
+        WHERE m.market = :market AND t.market = :market
           AND COALESCE(m.status, 'active') != 'retired'
         GROUP BY t.ticker
         ORDER BY accounts_count DESC, trade_count DESC
@@ -248,8 +248,8 @@ async def list_symbols(market: str = Query('US')):
         '''
         SELECT t.account, t.ticker, t.side, t.shares, t.price, t.cost, t.timestamp
         FROM trades t
-        JOIN account_meta m ON m.account_id = t.account
-        WHERE m.market = :market
+        JOIN account_meta m ON m.account_id = t.account AND m.market = t.market
+        WHERE m.market = :market AND t.market = :market
           AND COALESCE(m.status, 'active') != 'retired'
         ORDER BY t.ticker, t.account, t.timestamp ASC
         ''',
@@ -295,8 +295,8 @@ async def symbol_detail(ticker: str, market: str = Query('US')):
                t.slippage, t.timestamp,
                m.strategy_name, m."group" AS group_name, m.status
         FROM trades t
-        JOIN account_meta m ON m.account_id = t.account
-        WHERE t.ticker = :tk AND m.market = :market
+        JOIN account_meta m ON m.account_id = t.account AND m.market = t.market
+        WHERE t.ticker = :tk AND m.market = :market AND t.market = :market
           AND COALESCE(m.status, 'active') != 'retired'
         ORDER BY t.account, t.timestamp ASC
         ''',
@@ -319,7 +319,7 @@ async def symbol_detail(ticker: str, market: str = Query('US')):
     # numbers stay self-consistent on the dashboard side.
     pos_rows = await fetch_all(
         'SELECT p.account, p.shares, p.avg_cost, p.current_price '
-        'FROM positions p JOIN account_meta m ON m.account_id = p.account '
+        'FROM positions p JOIN account_meta m ON m.account_id = p.account AND m.market = p.market '
         'WHERE p.ticker = :tk AND p.market = :market '
         "AND COALESCE(m.status, 'active') != 'retired'",
         {'tk': ticker, 'market': market},
