@@ -236,6 +236,7 @@ async def list_symbols(market: str = Query('US')):
         FROM trades t
         JOIN account_meta m ON m.account_id = t.account
         WHERE m.market = :market
+          AND COALESCE(m.status, 'active') != 'retired'
         GROUP BY t.ticker
         ORDER BY accounts_count DESC, trade_count DESC
         ''',
@@ -249,6 +250,7 @@ async def list_symbols(market: str = Query('US')):
         FROM trades t
         JOIN account_meta m ON m.account_id = t.account
         WHERE m.market = :market
+          AND COALESCE(m.status, 'active') != 'retired'
         ORDER BY t.ticker, t.account, t.timestamp ASC
         ''',
         {'market': market},
@@ -295,6 +297,7 @@ async def symbol_detail(ticker: str, market: str = Query('US')):
         FROM trades t
         JOIN account_meta m ON m.account_id = t.account
         WHERE t.ticker = :tk AND m.market = :market
+          AND COALESCE(m.status, 'active') != 'retired'
         ORDER BY t.account, t.timestamp ASC
         ''',
         {'tk': ticker, 'market': market},
@@ -315,8 +318,10 @@ async def symbol_detail(ticker: str, market: str = Query('US')):
     # avg_cost calculation). We still derive remaining shares from FIFO so the
     # numbers stay self-consistent on the dashboard side.
     pos_rows = await fetch_all(
-        'SELECT account, shares, avg_cost, current_price '
-        'FROM positions WHERE ticker = :tk AND market = :market',
+        'SELECT p.account, p.shares, p.avg_cost, p.current_price '
+        'FROM positions p JOIN account_meta m ON m.account_id = p.account '
+        'WHERE p.ticker = :tk AND p.market = :market '
+        "AND COALESCE(m.status, 'active') != 'retired'",
         {'tk': ticker, 'market': market},
     )
     pos_by_acc = {r['account']: dict(r) for r in pos_rows}

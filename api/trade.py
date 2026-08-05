@@ -1,10 +1,33 @@
 from fastapi import APIRouter, Query, HTTPException
-from core.db import fetch_all, fetch_one
+from core.db import fetch_all, fetch_one, DB_PATH
 from core.benchmarks import rebased_curve, benchmarks_for
-import os, json
+import os, json, sqlite3, asyncio, time
 from functools import lru_cache
 
 router = APIRouter(prefix='/api/trade', tags=['trade'])
+
+# Short API caches smooth repeated dashboard loads while preserving near-live
+# behaviour (price updater/cycles run at minute-ish cadence). Cold-path SQL is
+# still correct; hot-path avoids re-scanning ~0.8M US account rows for every
+# tab render / language switch / market toggle.
+_API_CACHE: dict[tuple[str, str], tuple[float, object]] = {}
+
+
+def _cache_get(kind: str, market: str, ttl: float):
+    item = _API_CACHE.get((kind, market))
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > ttl:
+        _API_CACHE.pop((kind, market), None)
+        return None
+    return value
+
+
+def _cache_set(kind: str, market: str, value):
+    _API_CACHE[(kind, market)] = (time.time(), value)
+    return value
+
 
 VALID_MARKETS = {'US', 'CN'}
 
@@ -32,19 +55,48 @@ def _validate_market(market: str) -> str:
     return m
 
 
+def _fetch_account_equity_rows_sync(market: str, *, since_45d: bool = False) -> list[tuple[str, float, str, float]]:
+    """Fetch hourly account-equity rows without materialising every minute tick."""
+    where_recent = "AND a.timestamp >= datetime('now', '-45 days')" if since_45d else ""
+    sql = f"""
+        SELECT a.name, AVG(a.equity), MAX(a.timestamp), AVG(a.cash)
+        FROM accounts a
+        JOIN account_meta m ON m.account_id = a.name AND m.market = a.market
+        WHERE a.market = ? AND m.market = ? {where_recent}
+        GROUP BY a.name, substr(a.timestamp,1,13)
+        ORDER BY a.name, MAX(a.timestamp)
+    """
+    con = sqlite3.connect(str(DB_PATH), timeout=30)
+    try:
+        con.execute('PRAGMA query_only = ON')
+        con.execute('PRAGMA busy_timeout=30000')
+        return [(str(n), float(e or 0), str(ts), float(c or 0)) for n, e, ts, c in con.execute(sql, (market, market))]
+    finally:
+        con.close()
+
+
+async def _fetch_account_equity_rows(market: str, *, since_45d: bool = False) -> list[tuple[str, float, str, float]]:
+    return await asyncio.to_thread(_fetch_account_equity_rows_sync, market, since_45d=since_45d)
+
+
 @router.get('/summary')
 async def summary(market: str = Query('US')):
     market = _validate_market(market)
+    cached = _cache_get('summary', market, ttl=15)
+    if cached is not None:
+        return cached
     # Source of truth for market = account_meta.market (the `accounts` snapshot
     # table inherits the default 'US' for everything, so we always join through
     # account_meta to filter properly).
     rows = await fetch_all('''
         SELECT a.name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.initial_cash, m.status
-        FROM accounts a
-        JOIN (SELECT name, MAX(timestamp) as max_ts FROM accounts GROUP BY name) latest
-            ON a.name = latest.name AND a.timestamp = latest.max_ts
-        JOIN account_meta m ON a.name = m.account_id
+        FROM account_meta m
+        JOIN accounts a ON a.id = (
+            SELECT x.id FROM accounts x
+            WHERE x.market=m.market AND x.name=m.account_id
+            ORDER BY x.timestamp DESC LIMIT 1
+        )
         WHERE m.market = :market
     ''', {'market': market})
 
@@ -161,15 +213,14 @@ async def summary(market: str = Query('US')):
     ).isoformat()
     prev_rows = await fetch_all(
         '''
-        SELECT a.name, a.equity
-        FROM accounts a
-        JOIN (
-            SELECT name, MAX(timestamp) AS max_ts
-            FROM accounts
-            WHERE timestamp < :ts
-            GROUP BY name
-        ) prev ON a.name = prev.name AND a.timestamp = prev.max_ts
-        WHERE a.name IN (SELECT account_id FROM account_meta WHERE market = :market)
+        SELECT m.account_id AS name, a.equity
+        FROM account_meta m
+        JOIN accounts a ON a.id = (
+            SELECT x.id FROM accounts x
+            WHERE x.market=m.market AND x.name=m.account_id AND x.timestamp < :ts
+            ORDER BY x.timestamp DESC LIMIT 1
+        )
+        WHERE m.market=:market
         ''',
         {'ts': today_start, 'market': market},
     )
@@ -177,7 +228,7 @@ async def summary(market: str = Query('US')):
     baseline = sum(prev_equity.get(r['name'], r['initial_cash']) for r in rows)
     daily_pnl = total_equity - baseline
 
-    return {
+    payload = {
         'market': market,
         'total_equity': round(total_equity, 2),
         'total_pnl': round(total_pnl, 2),
@@ -189,20 +240,26 @@ async def summary(market: str = Query('US')):
         'group_Q': group_stats(q_rows),
         'distribution': distribution,
     }
+    return _cache_set('summary', market, payload)
 
 
 @router.get('/accounts')
 async def accounts(market: str = Query('US')):
     market = _validate_market(market)
+    cached = _cache_get('accounts', market, ttl=15)
+    if cached is not None:
+        return cached
     rows = await fetch_all('''
         SELECT a.name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.factors, m.status, m.initial_cash,
                m.retired_at, m.retire_reason, m.created_at
-        FROM accounts a
-        JOIN (SELECT name, MAX(timestamp) as max_ts FROM accounts GROUP BY name) latest
-            ON a.name = latest.name AND a.timestamp = latest.max_ts
-        JOIN account_meta m ON a.name = m.account_id
-        WHERE m.market = :market
+        FROM account_meta m
+        JOIN accounts a ON a.id = (
+            SELECT x.id FROM accounts x
+            WHERE x.market=m.market AND x.name=m.account_id
+            ORDER BY x.timestamp DESC LIMIT 1
+        )
+        WHERE m.market=:market
         ORDER BY a.name
     ''', {'market': market})
 
@@ -239,13 +296,10 @@ async def accounts(market: str = Query('US')):
         {'market': market}
     )
     trade_counts = {r['account']: r['cnt'] for r in trade_rows}
-    eq_rows = await fetch_all(
-        'SELECT name, equity, timestamp FROM accounts WHERE market = :market ORDER BY name, timestamp',
-        {'market': market}
-    )
+    eq_rows = await _fetch_account_equity_rows(market, since_45d=True)
     eq_by_acc: dict = {}
-    for r in eq_rows:
-        eq_by_acc.setdefault(r['name'], []).append(r['equity'])
+    for name, equity, _ts, _cash in eq_rows:
+        eq_by_acc.setdefault(name, []).append(equity)
 
     def compute_sharpe(equities):
         if not equities or len(equities) < 3:
@@ -289,12 +343,15 @@ async def accounts(market: str = Query('US')):
             'trade_count': trade_counts.get(acc_id, 0),
             'sharpe_ratio': round(sharpe, 3),
         })
-    return result
+    return _cache_set('accounts', market, result)
 
 
 @router.get('/equity-curves')
 async def equity_curves(market: str = Query('US')):
     market = _validate_market(market)
+    cached = _cache_get('equity_curves', market, ttl=60)
+    if cached is not None:
+        return cached
     # Pull retired metadata so we can truncate frozen accounts at retired_at
     # (snapshots written after retirement are skipped by update_prices.py, but
     # any historical drift is still visible — clip server-side to be safe).
@@ -304,12 +361,7 @@ async def equity_curves(market: str = Query('US')):
         {'market': market}
     )
     meta_by_acct = {r['account_id']: dict(r) for r in meta_rows}
-    rows = await fetch_all(
-        'SELECT name, equity, timestamp FROM accounts '
-        'WHERE name IN (SELECT account_id FROM account_meta WHERE market = :market) '
-        'ORDER BY name, timestamp',
-        {'market': market}
-    )
+    rows = await _fetch_account_equity_rows(market)
 
     # Dedup overview curves to ≤1 point per hour per account. Upstream writers
     # can emit many snapshots per hour; more importantly, per-account timestamps
@@ -348,21 +400,20 @@ async def equity_curves(market: str = Query('US')):
                 ).timestamp())
             except Exception:
                 pass
-    for r in rows:
-        name = r['name']
+    for name, equity, ts, cash in rows:
         # Hard clip retired accounts at retired_at
         if name in retired_cutoff:
             try:
                 pt_epoch = int(_dt.fromisoformat(
-                    r['timestamp'].replace('Z', '+00:00')
+                    ts.replace('Z', '+00:00')
                 ).timestamp())
                 if pt_epoch > retired_cutoff[name]:
                     continue
             except Exception:
                 pass
         initial = (meta_by_acct.get(name) or {}).get('initial_cash') or base_initial
-        equity = float(r['equity'] or 0)
-        cash = float(r.get('cash') or 0)
+        equity = float(equity or 0)
+        cash = float(cash or 0)
         # Read-time guard for historical avg_cost-fallback pollution: if an
         # account is mostly invested (low cash) but equity snaps back near the
         # starting capital after it previously had a materially different real
@@ -377,7 +428,7 @@ async def equity_curves(market: str = Query('US')):
         )
         if looks_like_fallback:
             continue
-        bk = _bucket_key(r['timestamp'])
+        bk = _bucket_key(ts)
         bucket_values.setdefault(name, {}).setdefault(bk, []).append(equity)
         last_good_equity[name] = equity
 
@@ -447,7 +498,8 @@ async def equity_curves(market: str = Query('US')):
             'retired_at': m.get('retired_at'),
             'retire_reason': m.get('retire_reason'),
         }
-    return {'curves': curves, 'meta': curves_meta}
+    payload = {'curves': curves, 'meta': curves_meta}
+    return _cache_set('equity_curves', market, payload)
 
 
 @router.get('/recent-trades')
@@ -498,22 +550,22 @@ async def account_detail(account_id: str, market: str = Query('US')):
         {'a': account_id}
     )
     positions = await fetch_all(
-        'SELECT * FROM positions WHERE account = :a',
-        {'a': account_id}
+        'SELECT * FROM positions WHERE account = :a AND market = :m',
+        {'a': account_id, 'm': market}
     )
     trades = await fetch_all(
-        'SELECT * FROM trades WHERE account = :a ORDER BY timestamp ASC',
-        {'a': account_id}
+        'SELECT * FROM trades WHERE account = :a AND market = :m ORDER BY timestamp ASC',
+        {'a': account_id, 'm': market}
     )
     equity = await fetch_all(
-        'SELECT equity, timestamp FROM accounts WHERE name = :a ORDER BY timestamp',
-        {'a': account_id}
+        'SELECT equity, timestamp FROM accounts WHERE name = :a AND market = :m ORDER BY timestamp',
+        {'a': account_id, 'm': market}
     )
 
     ph_rows = await fetch_all(
         'SELECT ticker, shares, avg_cost, market_price, market_value, unrealized_pnl, timestamp '
-        'FROM positions_history WHERE account = :a ORDER BY timestamp ASC',
-        {'a': account_id}
+        'FROM positions_history WHERE account = :a AND market = :m ORDER BY timestamp ASC',
+        {'a': account_id, 'm': market}
     )
     snap_map = {}
     for r in ph_rows:

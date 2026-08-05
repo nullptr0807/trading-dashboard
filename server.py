@@ -13,6 +13,9 @@ from api.explore import router as explore_router
 from api.frontier import router as frontier_router
 from api.symbols import router as symbols_router
 from api.factor_lab import router as factor_lab_router
+from core.db_admin import ensure_read_indexes
+
+ensure_read_indexes()
 
 app = FastAPI(title='Trading Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])

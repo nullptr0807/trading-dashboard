@@ -59,7 +59,14 @@ async def backtest_accounts(market: str = Query('US')):
     rows = await fetch_all(
         "SELECT account_id as account, strategy_name, description, \"group\", factors, "
         "status, retired_at, retire_reason "
-        "FROM account_meta WHERE market = :m ORDER BY account_id",
+        "FROM account_meta m "
+        "WHERE market = :m "
+        "AND EXISTS ("
+        "  SELECT 1 FROM account_state s WHERE s.account=m.account_id AND s.market=m.market "
+        "  UNION SELECT 1 FROM accounts a WHERE a.name=m.account_id AND a.market=m.market "
+        "  UNION SELECT 1 FROM trades t WHERE t.account=m.account_id AND t.market=m.market"
+        ") "
+        "ORDER BY account_id",
         {'m': market}
     )
     return {"accounts": rows, "market": market}
