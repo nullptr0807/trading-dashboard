@@ -48,19 +48,14 @@ def test_trade_queries_are_market_scoped_and_invalid_account_stops_early(monkeyp
         queries.append((' '.join(query.split()), dict(params)))
         return []
 
-    async def fake_one(query, params=()):
-        queries.append((' '.join(query.split()), dict(params)))
-        if 'FROM account_meta' in query:
-            return None
-        return None
-
     monkeypatch.setattr(trade, 'fetch_all', fake_all)
-    monkeypatch.setattr(trade, 'fetch_one', fake_one)
+    sync_calls = []
+    monkeypatch.setattr(trade, '_account_detail_sync', lambda account, market: sync_calls.append((account, market)))
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(trade.account_detail('SAME-ID', 'CN'))
     assert exc.value.status_code == 404
-    assert len(queries) == 1
+    assert sync_calls == [('SAME-ID', 'CN')]
 
     queries.clear()
     asyncio.run(trade.recent_trades(20, 'CN'))
@@ -96,57 +91,39 @@ def test_account_detail_uses_market_for_state_first_trade_and_same_id(monkeypatc
     import api.trade as trade
 
     seen = []
-
-    async def fake_one(query, params=()):
-        q = ' '.join(query.split())
-        seen.append((q, dict(params)))
-        if 'FROM account_meta' in q:
-            return {'account_id': 'SAME-ID', 'market': params['m'], 'initial_cash': 100}
-        return None
-
-    async def fake_all(query, params=()):
-        seen.append((' '.join(query.split()), dict(params)))
-        return []
-
-    monkeypatch.setattr(trade, 'fetch_one', fake_one)
-    monkeypatch.setattr(trade, 'fetch_all', fake_all)
+    def fake_sync(account, market):
+        seen.append((account, market))
+        return {
+            'meta': {'account_id': account, 'market': market, 'initial_cash': 100},
+            'state': None, 'positions': [], 'trades': [], 'equity': [],
+            'equity_source_points': 0, 'snapshots': [], 'anchor_ts': None,
+            'trade_total': 0, 'trade_stats': {'total': 0, 'buys': 0, 'sells': 0},
+            'trade_markers': [], 'trade_marker_source_points': 0,
+        }
+    monkeypatch.setattr(trade, '_account_detail_sync', fake_sync)
     payload = asyncio.run(trade.account_detail('SAME-ID', 'CN'))
     assert payload['market'] == 'CN'
-    relevant = [q for q, _ in seen if 'account_state' in q or 'MIN(timestamp)' in q]
-    assert relevant
-    assert all('market = :m' in q for q in relevant)
-    assert all(params.get('m') == 'CN' for q, params in seen if q in relevant)
+    assert seen == [('SAME-ID', 'CN')]
 
 
 def test_account_detail_payload_is_bounded_and_preserves_endpoints(monkeypatch):
     import api.trade as trade
 
-    seen = []
     equity_rows = [{'equity': float(i), 'timestamp': f'2026-01-{1 + i // 100:02d}T{i % 100:02d}:00:00'} for i in range(5000)]
-
-    async def fake_one(query, params=()):
-        q = ' '.join(query.split())
-        if 'FROM account_meta' in q:
-            return {'account_id': 'A1', 'market': 'US', 'initial_cash': 100}
-        if 'MIN(timestamp)' in q:
-            return {'ts': equity_rows[0]['timestamp']}
-        return None
-
-    async def fake_all(query, params=()):
-        q = ' '.join(query.split())
-        seen.append((q, dict(params)))
-        if 'SELECT equity, timestamp FROM accounts' in q:
-            return equity_rows
-        if 'FROM positions_history' in q:
-            assert params['snapshot_limit'] <= trade.ACCOUNT_SNAPSHOT_MAX
-            return []
-        return []
+    sampled = trade._downsample_endpoints(equity_rows, trade.ACCOUNT_EQUITY_MAX_POINTS)
+    def fake_sync(account, market):
+        return {
+            'meta': {'account_id': account, 'market': market, 'initial_cash': 100},
+            'state': None, 'positions': [], 'trades': [], 'equity': sampled,
+            'equity_source_points': len(equity_rows), 'snapshots': [], 'anchor_ts': None,
+            'trade_total': 0, 'trade_stats': {'total': 0, 'buys': 0, 'sells': 0},
+            'trade_markers': [], 'trade_marker_source_points': 0,
+        }
 
     async def no_benchmark(*args, **kwargs):
         return []
 
-    monkeypatch.setattr(trade, 'fetch_one', fake_one)
-    monkeypatch.setattr(trade, 'fetch_all', fake_all)
+    monkeypatch.setattr(trade, '_account_detail_sync', fake_sync)
     monkeypatch.setattr(trade, 'rebased_curve', no_benchmark)
     payload = asyncio.run(trade.account_detail('A1', 'US'))
     curve = payload['equity_curve']

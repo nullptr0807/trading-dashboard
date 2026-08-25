@@ -662,7 +662,7 @@ async function toggleRowExpand(row, accountId) {
     loadSignalQuality(accountId, 5).then(sq => {
       loadFactorAi(accountId, accData, factors, { signalQuality: summarizeSignalQuality(sq) });
     });
-    renderRowEquity(`rowchart-${accountId}`, accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks, accData.alpha, accData.trades || [], accData.snapshots || []);
+    renderRowEquity(`rowchart-${accountId}`, accData.equity_curve || accData.sparkline || [], accountId, accData.benchmarks, accData.alpha, accData.trade_markers || accData.trades || [], accData.snapshots || []);
   } catch (e) {
     detail.querySelector('.row-detail-inner').innerHTML = `<p style="color:var(--negative);padding:16px;">${t('load_failed')} ${e.message}</p>`;
   }
@@ -751,7 +751,10 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
   Object.entries(tradesByTime).forEach(([tt, list]) => {
     const tnum = Number(tt);
     let buys = 0, sells = 0;
-    list.forEach(x => { if ((x.side || '').toLowerCase() === 'buy') buys++; else sells++; });
+    list.forEach(x => {
+      const count = Number(x.count) || 1;
+      if ((x.side || '').toLowerCase() === 'buy') buys += count; else sells += count;
+    });
     markerBuckets[tnum] = { buys, sells };
   });
   const markers = Object.entries(markerBuckets)
@@ -807,7 +810,7 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
             <span class="${sideC}" style="font-weight:600;">${side}</span>
             <span class="tip-ticker">${formatTicker(tr.ticker || '')}</span>
           </div>
-          <div class="tip-trade-meta">${tr.shares} × ${fmtMoney(tr.price)}</div>
+          <div class="tip-trade-meta">${tr.count > 1 ? tr.count + ' trades · ' : ''}${tr.shares} × ${fmtMoney(tr.price)}</div>
         </div>`;
     }).join('');
     tipEl.innerHTML = `<div class="tip-ts">${fmtTs(ts)}</div>${rows}`;

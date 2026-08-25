@@ -666,8 +666,10 @@ function renderTombstoneModal(body, accountId, accData, factors) {
   const lifeDays = (meta.created_at && meta.retired_at)
     ? Math.max(1, Math.round((new Date(meta.retired_at) - new Date(meta.created_at)) / 86400000))
     : '—';
-  const buys = trades.filter(tr => (tr.side || '').toLowerCase() === 'buy').length;
-  const sells = trades.length - buys;
+  const tradeStats = accData.trade_stats || {};
+  const tradeTotal = Number.isFinite(tradeStats.total) ? tradeStats.total : trades.length;
+  const buys = Number.isFinite(tradeStats.buys) ? tradeStats.buys : trades.filter(tr => (tr.side || '').toLowerCase() === 'buy').length;
+  const sells = Number.isFinite(tradeStats.sells) ? tradeStats.sells : trades.length - buys;
 
   body.innerHTML = `
     <button class="tombstone-modal-close" aria-label="Close">×</button>
@@ -692,7 +694,7 @@ function renderTombstoneModal(body, accountId, accData, factors) {
         <div><span class="tomb-k">${t('tomb_factors') || 'Factors'}:</span> <span>${meta.factors || '—'}</span></div>
         <div><span class="tomb-k">${t('tomb_initial') || 'Initial cash'}:</span> <span>${formatCurrency(initialCash)}</span></div>
         <div><span class="tomb-k">${t('tomb_final') || 'Final equity'}:</span> <span>${formatCurrency(finalEquity)}</span></div>
-        <div><span class="tomb-k">${t('tomb_trades') || 'Total trades'}:</span> <span>${trades.length} (${buys} B / ${sells} S)</span></div>
+        <div><span class="tomb-k">${t('tomb_trades') || 'Total trades'}:</span> <span>${tradeTotal} (${buys} B / ${sells} S)</span></div>
       </div>
       ${meta.description ? `<div class="tomb-desc"><span class="tomb-k">${t('tomb_desc') || 'Description'}:</span> ${_esc(meta.description)}</div>` : ''}
       <div class="tomb-cause-of-death">
@@ -717,8 +719,12 @@ function renderTombstoneModal(body, accountId, accData, factors) {
     </div>
 
     <div class="tomb-modal-section">
-      <div class="tomb-section-title">${t('tomb_all_trades') || `📜 All Trades (${trades.length})`}</div>
+      <div class="tomb-section-title">${t('tomb_trade_history') || '📜 Trade History'} (${tradeTotal})</div>
       <div id="tomb-trades-${accountId}">${createTradesTable(trades.slice().reverse())}</div>
+      <div id="tomb-trades-status-${accountId}" class="tomb-trades-status">
+        ${(t('tomb_showing_trades') || 'Showing {shown} of {total}').replace('{shown}', trades.length).replace('{total}', tradeTotal)}
+      </div>
+      ${accData.trades_next_cursor ? `<button type="button" id="tomb-load-trades-${accountId}" class="btn-secondary">${t('tomb_load_older_trades') || 'Load older trades'}</button>` : ''}
     </div>
   `;
   body.querySelector('.tombstone-modal-close').addEventListener('click', () => {
@@ -726,7 +732,7 @@ function renderTombstoneModal(body, accountId, accData, factors) {
   });
   // Equity chart with markers — reuse renderRowEquity from components.js
   if (typeof renderRowEquity === 'function') {
-    renderRowEquity(`tomb-equity-${accountId}`, equityCurve, accountId, accData.benchmarks, accData.alpha, trades, accData.snapshots || []);
+    renderRowEquity(`tomb-equity-${accountId}`, equityCurve, accountId, accData.benchmarks, accData.alpha, accData.trade_markers || trades, accData.snapshots || []);
   }
   // Factors
   const factorsContainer = document.getElementById(`tomb-factors-${accountId}`);
@@ -739,6 +745,29 @@ function renderTombstoneModal(body, accountId, accData, factors) {
     }
     factorsContainer.insertAdjacentHTML('beforeend', createFactorAiBlock(accountId));
     loadFactorAi(accountId, accData, factors);
+  }
+  const loadTrades = document.getElementById(`tomb-load-trades-${accountId}`);
+  if (loadTrades) {
+    let cursor = accData.trades_next_cursor;
+    const loaded = trades.slice().reverse();
+    loadTrades.addEventListener('click', async () => {
+      if (!cursor || loadTrades.disabled) return;
+      loadTrades.disabled = true;
+      try {
+        const page = await api(`/trade/account/${encodeURIComponent(accountId)}/trades?limit=200&cursor=${encodeURIComponent(cursor)}`);
+        loaded.push(...(page.trades || []));
+        cursor = page.next_cursor;
+        document.getElementById(`tomb-trades-${accountId}`).innerHTML = createTradesTable(loaded);
+        const status = document.getElementById(`tomb-trades-status-${accountId}`);
+        if (status) status.textContent = (t('tomb_showing_trades') || 'Showing {shown} of {total}')
+          .replace('{shown}', loaded.length).replace('{total}', tradeTotal);
+        if (!cursor) loadTrades.remove();
+      } catch (error) {
+        loadTrades.textContent = `${t('load_failed') || 'Load failed'} ${error.message}`;
+      } finally {
+        loadTrades.disabled = false;
+      }
+    });
   }
 }
 

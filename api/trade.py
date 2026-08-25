@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from core.db import fetch_all, fetch_one, DB_PATH
 from core.benchmarks import rebased_curve, benchmarks_for
-import os, json, sqlite3, asyncio, time, re
+import os, json, sqlite3, asyncio, time, re, base64
 from functools import lru_cache
 
 router = APIRouter(prefix='/api/trade', tags=['trade'])
@@ -33,7 +33,9 @@ VALID_MARKETS = {'US', 'CN'}
 ACCOUNT_EQUITY_MAX_POINTS = 1200
 ACCOUNT_SNAPSHOT_MAX = 240
 ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX = 50
-ACCOUNT_TRADES_MAX = 2000
+ACCOUNT_TRADES_MAX = 200
+ACCOUNT_TRADE_PAGE_MAX = 500
+ACCOUNT_TRADE_MARKERS_MAX = 1200
 
 CN_UNIVERSE_FILE = os.path.expanduser('~/quant-trading/data/cn_universe.json')
 
@@ -75,6 +77,24 @@ def _downsample_endpoints(rows: list[dict], maximum: int) -> list[dict]:
     last = len(rows) - 1
     indexes = {round(i * last / (maximum - 1)) for i in range(maximum)}
     return [row for i, row in enumerate(rows) if i in indexes]
+
+
+def _trade_cursor(timestamp: str, trade_id: int) -> str:
+    raw = json.dumps({'v': 1, 'ts': timestamp, 'id': trade_id}, separators=(',', ':')).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+
+def _decode_trade_cursor(value: str | None) -> tuple[str, int] | None:
+    if not value:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+        data = json.loads(raw)
+        if data.get('v') != 1 or not isinstance(data.get('ts'), str):
+            raise ValueError
+        return data['ts'], int(data['id'])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail='invalid trades cursor') from exc
 
 
 def _fetch_account_equity_rows_sync(market: str, *, since_45d: bool = False) -> list[tuple[str, float, str, float]]:
@@ -661,97 +681,190 @@ async def ticker_names(market: str = Query('CN')):
     return {}
 
 
+def _rows(cursor: sqlite3.Cursor) -> list[dict]:
+    """Convert tuple rows in the worker, never on the asyncio event loop."""
+    columns = [item[0] for item in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _account_detail_sync(account_id: str, market: str) -> dict | None:
+    """Read, window and shape the account's heavy data in one worker thread."""
+    con = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
+    try:
+        con.execute('PRAGMA query_only = ON')
+        params = {'a': account_id, 'm': market}
+        meta_rows = _rows(con.execute(
+            'SELECT * FROM account_meta WHERE account_id = :a AND market = :m', params
+        ))
+        if not meta_rows:
+            return None
+        state_rows = _rows(con.execute(
+            'SELECT * FROM account_state WHERE account = :a AND market = :m', params
+        ))
+        positions = _rows(con.execute(
+            'SELECT * FROM positions WHERE account = :a AND market = :m', params
+        ))
+
+        # Exact lifetime totals are independent of the bounded initial page.
+        stats = con.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN lower(side) = 'buy' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN lower(side) = 'sell' THEN 1 ELSE 0 END), MIN(timestamp) "
+            'FROM trades WHERE account = :a AND market = :m', params
+        ).fetchone()
+        trade_total, buy_total, sell_total, anchor_ts = stats
+        trade_total = int(trade_total or 0)
+        buy_total, sell_total = int(buy_total or 0), int(sell_total or 0)
+        trades = _rows(con.execute(
+            'SELECT * FROM (SELECT * FROM trades WHERE account = :a AND market = :m '
+            'ORDER BY timestamp DESC, id DESC LIMIT :lim) ORDER BY timestamp ASC, id ASC',
+            {**params, 'lim': ACCOUNT_TRADES_MAX},
+        ))
+
+        # Keep all equity tuples long enough to map every retained position
+        # snapshot. Only the chart curve is downsampled afterwards.
+        equity_tuples = con.execute(
+            'SELECT equity, timestamp FROM accounts '
+            'WHERE name = :a AND market = :m ORDER BY timestamp', params
+        ).fetchall()
+        equity_raw = [{'equity': row[0], 'timestamp': row[1]} for row in equity_tuples]
+        eq_map = {row[1]: row[0] for row in equity_tuples}
+        equity = _downsample_endpoints(equity_raw, ACCOUNT_EQUITY_MAX_POINTS)
+
+        # SQL performs timestamp/holding windowing and carries the complete
+        # snapshot market value, so cash remains exact even when holdings are cut.
+        ph_rows = _rows(con.execute(
+            'WITH latest_ts AS ('
+            ' SELECT timestamp FROM positions_history WHERE account = :a AND market = :m '
+            ' GROUP BY timestamp ORDER BY timestamp DESC LIMIT :snap_lim'
+            '), ranked AS ('
+            ' SELECT ticker, shares, avg_cost, market_price, market_value, unrealized_pnl, timestamp,'
+            ' ROW_NUMBER() OVER (PARTITION BY timestamp ORDER BY market_value DESC, ticker) AS rn,'
+            ' SUM(COALESCE(market_value, 0)) OVER (PARTITION BY timestamp) AS total_value'
+            ' FROM positions_history WHERE account = :a AND market = :m '
+            ' AND timestamp IN (SELECT timestamp FROM latest_ts)'
+            ') SELECT ticker, shares, avg_cost, market_price, market_value, unrealized_pnl, '
+            'timestamp, total_value FROM ranked WHERE rn <= :holding_lim '
+            'ORDER BY timestamp ASC, market_value DESC',
+            {**params, 'snap_lim': ACCOUNT_SNAPSHOT_MAX,
+             'holding_lim': ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX},
+        ))
+        snap_map: dict[str, dict] = {}
+        for row in ph_rows:
+            snap = snap_map.setdefault(row['timestamp'], {
+                'total_value': row['total_value'], 'holdings': [],
+            })
+            snap['holdings'].append({
+                'ticker': row['ticker'], 'shares': row['shares'],
+                'avg_cost': row['avg_cost'], 'price': row['market_price'],
+                'value': row['market_value'], 'pnl': row['unrealized_pnl'],
+                'pnl_pct': (
+                    100.0 * row['unrealized_pnl'] / (row['shares'] * row['avg_cost'])
+                    if row['unrealized_pnl'] is not None and row['shares'] and row['avg_cost']
+                    else None
+                ),
+            })
+        snapshots = []
+        for ts, snap in sorted(snap_map.items()):
+            eq_val = eq_map.get(ts)
+            snapshots.append({
+                'timestamp': ts, 'equity': eq_val,
+                'cash': eq_val - snap['total_value'] if eq_val is not None else None,
+                'holdings': snap['holdings'],
+            })
+
+        # Aggregate all trades by timestamp+side for complete chart markers at a
+        # fraction of the payload. Downsample only if the aggregate itself is huge.
+        marker_rows = _rows(con.execute(
+            'SELECT MIN(id) AS id, timestamp, lower(side) AS side, COUNT(*) AS count, '
+            'SUM(shares) AS shares, AVG(price) AS price FROM trades '
+            'WHERE account = :a AND market = :m GROUP BY timestamp, lower(side) '
+            'ORDER BY timestamp, id', params
+        ))
+        marker_source_points = len(marker_rows)
+        trade_markers = _downsample_endpoints(marker_rows, ACCOUNT_TRADE_MARKERS_MAX)
+        return {
+            'meta': meta_rows[0], 'state': state_rows[0] if state_rows else None,
+            'positions': positions, 'trades': trades, 'equity': equity,
+            'equity_source_points': len(equity_raw), 'snapshots': snapshots,
+            'anchor_ts': anchor_ts, 'trade_total': trade_total,
+            'trade_stats': {'total': trade_total, 'buys': buy_total, 'sells': sell_total},
+            'trade_markers': trade_markers,
+            'trade_marker_source_points': marker_source_points,
+        }
+    finally:
+        con.close()
+
+
+def _account_trades_page_sync(account_id: str, market: str, limit: int,
+                              cursor: tuple[str, int] | None) -> dict | None:
+    con = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
+    try:
+        con.execute('PRAGMA query_only = ON')
+        params = {'a': account_id, 'm': market, 'lim': limit + 1}
+        if not con.execute(
+            'SELECT 1 FROM account_meta WHERE account_id = :a AND market = :m', params
+        ).fetchone():
+            return None
+        where = ''
+        if cursor:
+            params.update({'ts': cursor[0], 'id': cursor[1]})
+            where = ' AND (timestamp < :ts OR (timestamp = :ts AND id < :id))'
+        trades = _rows(con.execute(
+            'SELECT * FROM trades WHERE account = :a AND market = :m' + where +
+            ' ORDER BY timestamp DESC, id DESC LIMIT :lim', params
+        ))
+        has_more = len(trades) > limit
+        trades = trades[:limit]
+        next_cursor = _trade_cursor(trades[-1]['timestamp'], trades[-1]['id']) if has_more else None
+        return {'trades': trades, 'next_cursor': next_cursor}
+    finally:
+        con.close()
+
+
+@router.get('/account/{account_id}/trades')
+async def account_trades(account_id: str, market: str = Query('US'),
+                         limit: int = Query(200, ge=1, le=ACCOUNT_TRADE_PAGE_MAX),
+                         cursor: str | None = Query(None)):
+    market = _validate_market(market)
+    account_id = _validate_account_id(account_id)
+    payload = await asyncio.to_thread(
+        _account_trades_page_sync, account_id, market, limit, _decode_trade_cursor(cursor)
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail='account not found in requested market')
+    return {'market': market, 'account_id': account_id, **payload}
+
+
 @router.get('/account/{account_id}')
 async def account_detail(account_id: str, market: str = Query('US')):
     market = _validate_market(market)
     account_id = _validate_account_id(account_id)
-    meta = await fetch_one(
-        'SELECT * FROM account_meta WHERE account_id = :a AND market = :m',
-        {'a': account_id, 'm': market}
-    )
-    if not meta:
+    detail = await asyncio.to_thread(_account_detail_sync, account_id, market)
+    if detail is None:
         raise HTTPException(status_code=404, detail='account not found in requested market')
-    state = await fetch_one(
-        'SELECT * FROM account_state WHERE account = :a AND market = :m',
-        {'a': account_id, 'm': market}
-    )
-    positions = await fetch_all(
-        'SELECT * FROM positions WHERE account = :a AND market = :m',
-        {'a': account_id, 'm': market}
-    )
-    trades = await fetch_all(
-        'SELECT * FROM (SELECT * FROM trades WHERE account = :a AND market = :m '
-        'ORDER BY timestamp DESC, id DESC LIMIT :trade_limit) ORDER BY timestamp ASC, id ASC',
-        {'a': account_id, 'm': market, 'trade_limit': ACCOUNT_TRADES_MAX}
-    )
-    equity_raw = await fetch_all(
-        'SELECT equity, timestamp FROM accounts WHERE name = :a AND market = :m ORDER BY timestamp',
-        {'a': account_id, 'm': market}
-    )
-    equity = _downsample_endpoints(equity_raw, ACCOUNT_EQUITY_MAX_POINTS)
-
-    ph_rows = await fetch_all(
-        'SELECT ticker, shares, avg_cost, market_price, market_value, unrealized_pnl, timestamp '
-        'FROM positions_history WHERE account = :a AND market = :m '
-        'AND timestamp IN (SELECT timestamp FROM positions_history '
-        'WHERE account = :a AND market = :m GROUP BY timestamp '
-        'ORDER BY timestamp DESC LIMIT :snapshot_limit) '
-        'ORDER BY timestamp ASC, market_value DESC',
-        {'a': account_id, 'm': market, 'snapshot_limit': ACCOUNT_SNAPSHOT_MAX}
-    )
-    snap_map = {}
-    for r in ph_rows:
-        ts = r['timestamp']
-        holdings = snap_map.setdefault(ts, [])
-        if len(holdings) >= ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX:
-            continue
-        holdings.append({
-            'ticker': r['ticker'],
-            'shares': r['shares'],
-            'avg_cost': r['avg_cost'],
-            'price': r['market_price'],
-            'value': r['market_value'],
-            'pnl': r['unrealized_pnl'],
-            # Historical snapshots can legitimately lack a market quote. Keep
-            # the return unknown instead of crashing the entire account API (or
-            # fabricating a 0% return) when unrealized_pnl is NULL.
-            'pnl_pct': (
-                100.0 * r['unrealized_pnl'] / (r['shares'] * r['avg_cost'])
-                if r['unrealized_pnl'] is not None and r['shares'] and r['avg_cost']
-                else None
-            ),
-        })
-    eq_map = {e['timestamp']: e['equity'] for e in equity}
-    snapshots = []
-    for ts in sorted(snap_map.keys()):
-        holdings = sorted(snap_map[ts], key=lambda h: (h['value'] or 0), reverse=True)
-        total_val = sum(h['value'] or 0 for h in holdings)
-        eq_val = eq_map.get(ts)
-        snapshots.append({
-            'timestamp': ts,
-            'equity': eq_val,
-            'cash': (eq_val - total_val) if eq_val is not None else None,
-            'holdings': holdings,
-        })
-
-    first_trade_row = await fetch_one(
-        'SELECT MIN(timestamp) as ts FROM trades WHERE account = :a AND market = :m',
-        {'a': account_id, 'm': market}
-    )
-    anchor_ts = first_trade_row['ts'] if first_trade_row else None
+    meta, state = detail['meta'], detail['state']
+    positions, trades = detail['positions'], detail['trades']
+    equity, snapshots = detail['equity'], detail['snapshots']
+    anchor_ts = detail['anchor_ts']
 
     align_ts = [r['timestamp'] for r in equity] if equity else None
     benchmarks = []
     base_initial = 100000.0 if market == 'CN' else 10000.0
     if not account_id.startswith('IDX') and anchor_ts:
-        for b in benchmarks_for(market):
-            curve = await rebased_curve(b['ticker'], anchor_ts, initial=base_initial, align_to=align_ts)
+        benchmark_defs = benchmarks_for(market)
+        try:
+            # A stale/missing price cache must not turn the account drawer into
+            # a multi-second network cold path. Cached overlays usually return
+            # immediately; otherwise the core account response wins after 2s.
+            curves = await asyncio.wait_for(asyncio.gather(*[
+                rebased_curve(b['ticker'], anchor_ts, initial=base_initial, align_to=align_ts)
+                for b in benchmark_defs
+            ]), timeout=2.0)
+        except asyncio.TimeoutError:
+            curves = []
+        for b, curve in zip(benchmark_defs, curves):
             if curve:
-                benchmarks.append({
-                    'label': b['label'],
-                    'ticker': b['ticker'],
-                    'curve': curve,
-                })
+                benchmarks.append({'label': b['label'], 'ticker': b['ticker'], 'curve': curve})
 
     alpha_info = None
     if equity and anchor_ts:
@@ -784,6 +897,14 @@ async def account_detail(account_id: str, market: str = Query('US')):
         'state': state,
         'positions': positions,
         'trades': trades,
+        'trade_total': detail['trade_total'],
+        'trades_truncated': detail['trade_total'] > len(trades),
+        'trades_next_cursor': (
+            _trade_cursor(trades[0]['timestamp'], trades[0]['id'])
+            if detail['trade_total'] > len(trades) and trades else None
+        ),
+        'trade_stats': detail['trade_stats'],
+        'trade_markers': detail['trade_markers'],
         'equity_curve': equity,
         'snapshots': snapshots,
         'benchmarks': benchmarks,
@@ -793,6 +914,8 @@ async def account_detail(account_id: str, market: str = Query('US')):
             'snapshot_timestamps': ACCOUNT_SNAPSHOT_MAX,
             'holdings_per_snapshot': ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX,
             'trades': ACCOUNT_TRADES_MAX,
-            'equity_source_points': len(equity_raw),
+            'equity_source_points': detail['equity_source_points'],
+            'trade_marker_points': ACCOUNT_TRADE_MARKERS_MAX,
+            'trade_marker_source_points': detail['trade_marker_source_points'],
         },
     }
