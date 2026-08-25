@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -272,9 +273,12 @@ class FactorLabRunRequest(BaseModel):
     expression: FactorExpressionRequest
 
 
-@router.get("/catalog")
-async def factor_lab_catalog(market: str = Query("US")):
-    market = _validate_market(market)
+_CATALOG_CACHE_TTL = 60.0
+_CATALOG_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _factor_lab_catalog_sync(market: str) -> dict:
+    """Run the catalog's aggregate scans off the asyncio event loop."""
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
@@ -298,13 +302,7 @@ async def factor_lab_catalog(market: str = Query("US")):
 
     return {
         "market": market,
-        "factors": [
-            {
-                **f,
-                "coverage": coverage.get(f["name"], {}),
-            }
-            for f in ALPHA158_FACTORS
-        ],
+        "factors": [{**f, "coverage": coverage.get(f["name"], {})} for f in ALPHA158_FACTORS],
         "account_composites": account_composites,
         "defaults": {
             **MARKET_DEFAULTS.get(market, MARKET_DEFAULTS["US"]),
@@ -327,6 +325,18 @@ async def factor_lab_catalog(market: str = Query("US")):
             "Look-ahead guard: signal[t] is evaluated against close[t+1+h] / close[t+1] - 1.",
         ],
     }
+
+
+@router.get("/catalog")
+async def factor_lab_catalog(market: str = Query("US")):
+    market = _validate_market(market)
+    cached = _CATALOG_CACHE.get(market)
+    now = time.monotonic()
+    if cached and now - cached[0] < _CATALOG_CACHE_TTL:
+        return cached[1]
+    payload = await asyncio.to_thread(_factor_lab_catalog_sync, market)
+    _CATALOG_CACHE[market] = (time.monotonic(), payload)
+    return payload
 
 
 @router.post("/run")

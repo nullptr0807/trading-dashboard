@@ -26,6 +26,7 @@ let _eventsState = {
   loadingMore: false,
   exhausted: false,   // server returned 0 older items
   scrollBound: false,
+  nextCursor: null,
 };
 
 function eventsSectionHtml() {
@@ -68,14 +69,14 @@ function eventRowHtml(ev, isNew) {
   const tickerLabel = ev.ticker
     ? (typeof formatTicker === 'function' ? formatTicker(ev.ticker) : ev.ticker)
     : '';
-  const tag = (ev.account || ev.ticker)
-    ? `<span class="ev-tag">${[ev.account, tickerLabel].filter(Boolean).join(' · ')}</span>`
-    : '';
-  const catLabel = t(style.label) || ev.category;
-  const sevClass = ev.severity && ev.severity !== 'info' ? ` ev-sev-${ev.severity}` : '';
   const escape = s => String(s || '').replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
+  const tag = (ev.account || ev.ticker)
+    ? `<span class="ev-tag">${escape([ev.account, tickerLabel].filter(Boolean).join(' · '))}</span>`
+    : '';
+  const catLabel = escape(t(style.label) || ev.category);
+  const sevClass = /^[a-z]+$/.test(ev.severity || '') && ev.severity !== 'info' ? ` ev-sev-${ev.severity}` : '';
   const safeTitle = escape(ev.title);
   // Detail line: parse as JSON if possible, surface .reason; plain text → 2nd line.
   let detailLine = '';
@@ -164,7 +165,9 @@ async function pollEvents() {
       paintEvents(host, new Set());
       return;
     }
+    const hadItems = _eventsState.items.length > 0;
     const freshIds = mergeTopPage(incoming);
+    if (!hadItems) _eventsState.nextCursor = resp.next_cursor || null;
     paintEvents(host, freshIds);
     bindScrollLoader();
   } catch (e) {
@@ -174,7 +177,10 @@ async function pollEvents() {
 
 async function loadMoreOlder() {
   if (_eventsState.loadingMore || _eventsState.exhausted) return;
-  if (!_eventsState.items.length) return;
+  if (!_eventsState.items.length || !_eventsState.nextCursor) {
+    _eventsState.exhausted = true;
+    return;
+  }
   _eventsState.loadingMore = true;
   const footer = document.getElementById('events-footer');
   if (footer) {
@@ -183,9 +189,8 @@ async function loadMoreOlder() {
     footer.classList.remove('events-footer-end');
   }
   try {
-    const oldest = _eventsState.items[_eventsState.items.length - 1];
-    const beforeTs = encodeURIComponent(oldest.ts);
-    const resp = await api(`/events?limit=${EVENT_PAGE}&before_ts=${beforeTs}`);
+    const cursor = encodeURIComponent(_eventsState.nextCursor);
+    const resp = await api(`/events?limit=${EVENT_PAGE}&cursor=${cursor}`);
     const older = (resp && resp.events) || [];
     if (!older.length) {
       _eventsState.exhausted = true;
@@ -203,6 +208,8 @@ async function loadMoreOlder() {
           if (a.ts === b.ts) return String(b.id).localeCompare(String(a.id));
           return (a.ts < b.ts) ? 1 : -1;
         });
+        _eventsState.nextCursor = resp.next_cursor || null;
+        if (!_eventsState.nextCursor) _eventsState.exhausted = true;
       }
     }
     const host = document.getElementById('events-list');
@@ -231,6 +238,7 @@ function startEventsStream() {
   _eventsState = {
     items: [], knownIds: new Set(), timer: null,
     loadingMore: false, exhausted: false, scrollBound: false,
+    nextCursor: null,
   };
   pollEvents();
   _eventsState.timer = setInterval(pollEvents, EVENT_POLL_MS);

@@ -25,9 +25,9 @@ function createCard(account) {
   row.dataset.status = account.status || 'active';
   const rawName = account.strategy_name || account.strategy || '';
   // Strip verbose Chinese nicknames from B group; show a neutral tag instead
-  const displayName = isB ? t('gp_evolved_factor') : tStrategy(rawName, id);
+  const displayName = _esc(isB ? t('gp_evolved_factor') : tStrategy(rawName, id));
   const retiredPill = isRetired
-    ? `<span class="retired-pill" title="${(account.retire_reason || t('retired_tooltip') || '').replace(/"/g,'&quot;')}">${t('retired_badge') || 'RETIRED'}${account.retired_at ? ' · ' + account.retired_at.slice(0,10) : ''}</span>`
+    ? `<span class="retired-pill" title="${_esc(account.retire_reason || t('retired_tooltip') || '')}">${_esc(t('retired_badge') || 'RETIRED')}${account.retired_at ? ' · ' + _esc(account.retired_at.slice(0,10)) : ''}</span>`
     : '';
   const runtimePill = isNonTradeable
     ? `<span class="runtime-pill" title="${_esc(account.runtime_reason || runtimeStatus)}">${t('runtime_nontradeable')}</span>`

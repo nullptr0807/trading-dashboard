@@ -299,7 +299,7 @@ function renderPnlHistogram(dist) {
     const rows = all.map(a => {
       const cls = a.pnl_pct >= 0 ? 'color:#4ade80;' : 'color:#f87171;';
       const sign = a.pnl_pct >= 0 ? '+' : '';
-      const strat = a.strategy_name ? ` <span style="opacity:0.6;">${a.strategy_name}</span>` : '';
+      const strat = a.strategy_name ? ` <span style="opacity:0.6;">${_esc(a.strategy_name)}</span>` : '';
       return `<div style="display:flex;justify-content:space-between;gap:12px;">
         <span><b>${a.account_id}</b>${strat}</span>
         <span style="${cls}font-variant-numeric:tabular-nums;">${sign}${a.pnl_pct.toFixed(2)}%</span>
@@ -611,17 +611,17 @@ function tombstoneHtml(a) {
   const pnlCls = pnlPct >= 0 ? 'positive' : 'negative';
   const born = (a.created_at || '').slice(0, 10) || '—';
   const died = (a.retired_at || '').slice(0, 10) || '—';
-  const reason = (a.retire_reason || t('retired_tooltip') || '').replace(/"/g, '&quot;');
-  const strat = a.strategy_name ? tStrategy(a.strategy_name, id) : '';
+  const reason = _esc(a.retire_reason || t('retired_tooltip') || '');
+  const strat = a.strategy_name ? _esc(tStrategy(a.strategy_name, id)) : '';
   return `
     <div class="tombstone fade-in" data-id="${id}" title="${reason}">
       <div class="tombstone-cross">✝</div>
       <div class="tombstone-rip">R.I.P.</div>
-      <div class="tombstone-id">${id}</div>
+      <div class="tombstone-id">${_esc(id)}</div>
       <div class="tombstone-strat">${strat}</div>
       <div class="tombstone-dates">${born} — ${died}</div>
       <div class="tombstone-return ${pnlCls}">${sign}${formatPercent(pnlPct)}</div>
-      <div class="tombstone-epitaph">${(a.retire_reason || '').slice(0, 60) || (t('retired_tooltip') || '')}</div>
+      <div class="tombstone-epitaph">${_esc((a.retire_reason || '').slice(0, 60) || (t('retired_tooltip') || ''))}</div>
     </div>`;
 }
 
@@ -675,7 +675,7 @@ function renderTombstoneModal(body, accountId, accData, factors) {
       <div class="tomb-modal-cross">✝</div>
       <div class="tomb-modal-title">
         <div class="tomb-modal-rip">${t('tomb_rip') || 'In Loving Memory of'}</div>
-        <h2 class="tomb-modal-id">${accountId} <span class="tomb-modal-strat">${tStrategy(meta.strategy_name || '', accountId)}</span></h2>
+        <h2 class="tomb-modal-id">${_esc(accountId)} <span class="tomb-modal-strat">${_esc(tStrategy(meta.strategy_name || '', accountId))}</span></h2>
         <div class="tomb-modal-dates">${born} ✦ ${died} <span class="tomb-modal-days">(${lifeDays} ${t('tomb_days') || 'days'})</span></div>
       </div>
       <div class="tomb-modal-return ${retCls}">
@@ -687,17 +687,17 @@ function renderTombstoneModal(body, accountId, accData, factors) {
     <div class="tomb-modal-eulogy">
       <div class="tomb-section-title">${t('tomb_eulogy') || '📜 Eulogy'}</div>
       <div class="tomb-eulogy-grid">
-        <div><span class="tomb-k">${t('tomb_strategy') || 'Strategy'}:</span> <span>${meta.strategy_name || '—'}</span></div>
+        <div><span class="tomb-k">${t('tomb_strategy') || 'Strategy'}:</span> <span>${_esc(meta.strategy_name || '—')}</span></div>
         <div><span class="tomb-k">${t('tomb_group') || 'Group'}:</span> <span>${meta.group || '—'}</span></div>
         <div><span class="tomb-k">${t('tomb_factors') || 'Factors'}:</span> <span>${meta.factors || '—'}</span></div>
         <div><span class="tomb-k">${t('tomb_initial') || 'Initial cash'}:</span> <span>${formatCurrency(initialCash)}</span></div>
         <div><span class="tomb-k">${t('tomb_final') || 'Final equity'}:</span> <span>${formatCurrency(finalEquity)}</span></div>
         <div><span class="tomb-k">${t('tomb_trades') || 'Total trades'}:</span> <span>${trades.length} (${buys} B / ${sells} S)</span></div>
       </div>
-      ${meta.description ? `<div class="tomb-desc"><span class="tomb-k">${t('tomb_desc') || 'Description'}:</span> ${meta.description}</div>` : ''}
+      ${meta.description ? `<div class="tomb-desc"><span class="tomb-k">${t('tomb_desc') || 'Description'}:</span> ${_esc(meta.description)}</div>` : ''}
       <div class="tomb-cause-of-death">
         <span class="tomb-k">${t('tomb_cause') || '⚰️ Cause of retirement'}:</span>
-        <span>${meta.retire_reason || '—'}</span>
+        <span>${_esc(meta.retire_reason || '—')}</span>
       </div>
     </div>
 

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from core.db import fetch_all, fetch_one, DB_PATH
 from core.benchmarks import rebased_curve, benchmarks_for
-import os, json, sqlite3, asyncio, time
+import os, json, sqlite3, asyncio, time, re
 from functools import lru_cache
 
 router = APIRouter(prefix='/api/trade', tags=['trade'])
@@ -30,6 +30,10 @@ def _cache_set(kind: str, market: str, value):
 
 
 VALID_MARKETS = {'US', 'CN'}
+ACCOUNT_EQUITY_MAX_POINTS = 1200
+ACCOUNT_SNAPSHOT_MAX = 240
+ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX = 50
+ACCOUNT_TRADES_MAX = 2000
 
 CN_UNIVERSE_FILE = os.path.expanduser('~/quant-trading/data/cn_universe.json')
 
@@ -53,6 +57,24 @@ def _validate_market(market: str) -> str:
     if m not in VALID_MARKETS:
         raise HTTPException(status_code=400, detail=f"invalid market '{market}'; expected one of {sorted(VALID_MARKETS)}")
     return m
+
+
+def _validate_account_id(account_id: str) -> str:
+    value = str(account_id or '')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', value):
+        raise HTTPException(status_code=400, detail='invalid account id')
+    return value
+
+
+def _downsample_endpoints(rows: list[dict], maximum: int) -> list[dict]:
+    """Uniformly bound a time series while retaining exact first/last points."""
+    if len(rows) <= maximum:
+        return rows
+    if maximum <= 1:
+        return rows[-1:]
+    last = len(rows) - 1
+    indexes = {round(i * last / (maximum - 1)) for i in range(maximum)}
+    return [row for i, row in enumerate(rows) if i in indexes]
 
 
 def _fetch_account_equity_rows_sync(market: str, *, since_45d: bool = False) -> list[tuple[str, float, str, float]]:
@@ -234,25 +256,35 @@ async def summary(market: str = Query('US')):
         'accounts': per_account,
     }
 
-    a_rows = [r for r in rows if r.get('group') == 'A']
-    b_rows = [r for r in rows if r.get('group') == 'B']
-    q_rows = [r for r in rows if r.get('group') == 'Q']
+    group_rows = {
+        name: [r for r in rows if r.get('group') == name]
+        for name in ('A', 'B', 'Q', 'F', 'IDX')
+    }
 
     def group_stats(gr):
-        # totals include retired accounts (real money), but distribution stats
-        # (median / win_rate) are computed only over active to avoid drift.
+        # Money totals include every lifecycle/readiness state. Distribution
+        # statistics include only active-ready strategies.
         eq = sum(r['equity'] for r in gr)
         init = sum(r['initial_cash'] for r in gr)
-        active = [
+        active_ready = [
             r for r in gr
             if (r.get('status') or 'active') != 'retired'
             and (r.get('runtime_status') or 'ready') == 'ready'
         ]
-        pcts_g = sorted([(r['equity'] - r['initial_cash']) / r['initial_cash'] * 100 for r in active])
+        active_nontradeable = [
+            r for r in gr
+            if (r.get('status') or 'active') != 'retired'
+            and (r.get('runtime_status') or 'ready') != 'ready'
+        ]
+        retired = [r for r in gr if (r.get('status') or 'active') == 'retired']
+        pcts_g = sorted([(r['equity'] - r['initial_cash']) / r['initial_cash'] * 100 for r in active_ready])
         return {
             'count': len(gr),
-            'active_count': len(active),
-            'retired_count': len(gr) - len(active),
+            # Compatibility alias: historically active_count meant ready.
+            'active_count': len(active_ready),
+            'active_ready_count': len(active_ready),
+            'active_nontradeable_count': len(active_nontradeable),
+            'retired_count': len(retired),
             'equity': round(eq, 2),
             'pnl': round(eq - init, 2),
             'avg_pnl': round((eq - init) / max(len(gr), 1), 2),
@@ -288,9 +320,7 @@ async def summary(market: str = Query('US')):
         'total_initial': total_initial,
         'account_count': len(rows),
         'daily_pnl': round(daily_pnl, 2),
-        'group_A': group_stats(a_rows),
-        'group_B': group_stats(b_rows),
-        'group_Q': group_stats(q_rows),
+        **{f'group_{name}': group_stats(group_rows[name]) for name in group_rows},
         'distribution': distribution,
     }
     return _cache_set('summary', market, payload)
@@ -566,7 +596,8 @@ async def equity_curves(market: str = Query('US')):
 
     first_row = await fetch_one(
         'SELECT MIN(timestamp) as ts FROM trades '
-        'WHERE account IN (SELECT account_id FROM account_meta WHERE market = :market)',
+        'WHERE market = :market AND account IN '
+        '(SELECT account_id FROM account_meta WHERE market = :market)',
         {'market': market}
     )
     anchor_ts = first_row['ts'] if first_row else None
@@ -602,7 +633,7 @@ async def recent_trades(limit: int = Query(20, ge=1, le=200), market: str = Quer
     market = _validate_market(market)
     rows = await fetch_all(
         'SELECT * FROM trades '
-        'WHERE account IN (SELECT account_id FROM account_meta WHERE market = :market) '
+        'WHERE market = :market AND account IN (SELECT account_id FROM account_meta WHERE market = :market) '
         'ORDER BY timestamp DESC, id DESC LIMIT :limit',
         {'market': market, 'limit': limit}
     )
@@ -633,39 +664,48 @@ async def ticker_names(market: str = Query('CN')):
 @router.get('/account/{account_id}')
 async def account_detail(account_id: str, market: str = Query('US')):
     market = _validate_market(market)
-    # Per-account names are globally unique (A01 vs CA01, IDX1 vs IDX3),
-    # so we filter only by account_id on the row-level tables — but we
-    # validate the account belongs to the requested market via account_meta.
+    account_id = _validate_account_id(account_id)
     meta = await fetch_one(
         'SELECT * FROM account_meta WHERE account_id = :a AND market = :m',
         {'a': account_id, 'm': market}
     )
+    if not meta:
+        raise HTTPException(status_code=404, detail='account not found in requested market')
     state = await fetch_one(
-        'SELECT * FROM account_state WHERE account = :a',
-        {'a': account_id}
+        'SELECT * FROM account_state WHERE account = :a AND market = :m',
+        {'a': account_id, 'm': market}
     )
     positions = await fetch_all(
         'SELECT * FROM positions WHERE account = :a AND market = :m',
         {'a': account_id, 'm': market}
     )
     trades = await fetch_all(
-        'SELECT * FROM trades WHERE account = :a AND market = :m ORDER BY timestamp ASC',
-        {'a': account_id, 'm': market}
+        'SELECT * FROM (SELECT * FROM trades WHERE account = :a AND market = :m '
+        'ORDER BY timestamp DESC, id DESC LIMIT :trade_limit) ORDER BY timestamp ASC, id ASC',
+        {'a': account_id, 'm': market, 'trade_limit': ACCOUNT_TRADES_MAX}
     )
-    equity = await fetch_all(
+    equity_raw = await fetch_all(
         'SELECT equity, timestamp FROM accounts WHERE name = :a AND market = :m ORDER BY timestamp',
         {'a': account_id, 'm': market}
     )
+    equity = _downsample_endpoints(equity_raw, ACCOUNT_EQUITY_MAX_POINTS)
 
     ph_rows = await fetch_all(
         'SELECT ticker, shares, avg_cost, market_price, market_value, unrealized_pnl, timestamp '
-        'FROM positions_history WHERE account = :a AND market = :m ORDER BY timestamp ASC',
-        {'a': account_id, 'm': market}
+        'FROM positions_history WHERE account = :a AND market = :m '
+        'AND timestamp IN (SELECT timestamp FROM positions_history '
+        'WHERE account = :a AND market = :m GROUP BY timestamp '
+        'ORDER BY timestamp DESC LIMIT :snapshot_limit) '
+        'ORDER BY timestamp ASC, market_value DESC',
+        {'a': account_id, 'm': market, 'snapshot_limit': ACCOUNT_SNAPSHOT_MAX}
     )
     snap_map = {}
     for r in ph_rows:
         ts = r['timestamp']
-        snap_map.setdefault(ts, []).append({
+        holdings = snap_map.setdefault(ts, [])
+        if len(holdings) >= ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX:
+            continue
+        holdings.append({
             'ticker': r['ticker'],
             'shares': r['shares'],
             'avg_cost': r['avg_cost'],
@@ -695,8 +735,8 @@ async def account_detail(account_id: str, market: str = Query('US')):
         })
 
     first_trade_row = await fetch_one(
-        'SELECT MIN(timestamp) as ts FROM trades WHERE account = :a',
-        {'a': account_id}
+        'SELECT MIN(timestamp) as ts FROM trades WHERE account = :a AND market = :m',
+        {'a': account_id, 'm': market}
     )
     anchor_ts = first_trade_row['ts'] if first_trade_row else None
 
@@ -748,4 +788,11 @@ async def account_detail(account_id: str, market: str = Query('US')):
         'snapshots': snapshots,
         'benchmarks': benchmarks,
         'alpha': alpha_info,
+        'limits': {
+            'equity_points': ACCOUNT_EQUITY_MAX_POINTS,
+            'snapshot_timestamps': ACCOUNT_SNAPSHOT_MAX,
+            'holdings_per_snapshot': ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX,
+            'trades': ACCOUNT_TRADES_MAX,
+            'equity_source_points': len(equity_raw),
+        },
     }

@@ -241,7 +241,7 @@ function renderAccountSelector(accounts) {
       const disabledAttr = isQlib ? 'disabled' : '';
       html += `<label class="${cls}">
         <input type="checkbox" value="${aid}" data-group="${group}" class="bt-account-cb" ${disabledAttr}>
-        <span>${aid} — ${tStrategy(a.strategy_name || '', aid)}${retiredBadge}${qlibBadge}</span>
+        <span>${_esc(aid)} — ${_esc(tStrategy(a.strategy_name || '', aid))}${retiredBadge}${qlibBadge}</span>
       </label>`;
     });
     html += `</div></div>`;
@@ -388,7 +388,7 @@ function renderBacktestResults(data) {
     const retCls = (st.total_return || 0) >= 0 ? 'positive' : 'negative';
     return `<tr class="bt-acct-row" data-idx="${i}" style="cursor:pointer;">
       <td>${a.account_id} <span style="color:var(--text-secondary);font-size:10px;">▸</span></td>
-      <td>${tStrategy(a.strategy_name || '', a.account_id)}</td>
+      <td>${_esc(tStrategy(a.strategy_name || '', a.account_id))}</td>
       <td class="${retCls}">${formatPercent(st.total_return)}</td>
       <td class="negative">${formatPercent(st.max_drawdown)}</td>
       <td>${(st.sharpe_ratio || 0).toFixed(2)}</td>
@@ -528,7 +528,7 @@ function openAccountDetail(acct) {
         <div>
           <div style="font-size:16px;font-weight:600;">${acct.account_id}
             <span style="color:var(--text-secondary);font-weight:400;font-size:12px;margin-left:8px;">
-              ${tStrategy(acct.strategy_name || '', acct.account_id)}
+              ${_esc(tStrategy(acct.strategy_name || '', acct.account_id))}
             </span>
           </div>
           <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">

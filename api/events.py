@@ -1,18 +1,12 @@
-"""Live system events feed for the dashboard.
+"""Market-scoped live events merged with synthetic dashboard git events.
 
-Sources merged into one stream (by ts DESC):
-  1. The `events` table written by ~/quant-trading (data/factor/trade/risk/lifecycle/...)
-  2. Synthetic `system` events: every git commit on this trading-dashboard repo
-     becomes a "[系统]" event so the user sees code changes alongside live activity.
-
-Pagination via `before_ts` for "load older". Polling on the client just re-pulls
-the top page (no after_id) — newest events naturally rise to the top.
+Pagination uses an opaque composite cursor over (timestamp, source, source id), so
+large same-timestamp batches are stable and neither skipped nor duplicated.
 """
+import base64
 import json
-import os
 import subprocess
 import time
-from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
@@ -20,10 +14,9 @@ from fastapi import APIRouter, HTTPException, Query
 from core.db import fetch_all
 
 router = APIRouter(prefix='/api/events', tags=['events'])
-
 VALID_MARKETS = {'US', 'CN'}
-_REPO_DIR = Path(__file__).resolve().parent.parent  # /home/.../trading-dashboard
-_GIT_CACHE_TTL = 30  # seconds
+_REPO_DIR = Path(__file__).resolve().parent.parent
+_GIT_CACHE_TTL = 30
 _git_cache: dict = {'ts': 0.0, 'commits': []}
 
 
@@ -35,7 +28,6 @@ def _validate_market(market: str) -> str:
 
 
 def _load_git_commits() -> list[dict]:
-    """Return all commits as event-shaped dicts, newest first. Cached 30s."""
     now = time.time()
     if now - _git_cache['ts'] < _GIT_CACHE_TTL and _git_cache['commits']:
         return _git_cache['commits']
@@ -55,65 +47,109 @@ def _load_git_commits() -> list[dict]:
         parts = chunk.split('\x1f')
         if len(parts) < 4:
             continue
-        sha, ts, author, subject = parts[0], parts[1], parts[2], parts[3]
-        body = parts[4].strip() if len(parts) >= 5 else ''
-        # Title only — no detail expanded into the stream (cleaner UI).
-        title = f"🧬 {subject}"
+        sha, ts, _author, subject = parts[:4]
         commits.append({
-            'id': f'git_{sha[:12]}',
-            'ts': ts,
-            'category': 'system',
-            'severity': 'info',
-            'account': None,
-            'ticker': None,
-            'title': title,
-            'detail': None,
+            'id': f'git_{sha[:12]}', 'ts': ts, 'category': 'system',
+            'severity': 'info', 'account': None, 'ticker': None,
+            'title': f"🧬 {subject}", 'detail': None,
         })
     _git_cache['ts'] = now
     _git_cache['commits'] = commits
     return commits
 
 
+def _event_key(event: dict) -> tuple:
+    source = event.get('_source') or ('git' if str(event.get('id', '')).startswith('git_') else 'db')
+    if source == 'db':
+        try:
+            source_id = int(event['id'])
+        except (TypeError, ValueError):
+            source_id = 0
+        return (event.get('ts') or '', 1, source_id)
+    return (event.get('ts') or '', 0, str(event.get('id') or ''))
+
+
+def _encode_cursor(event: dict) -> str:
+    ts, source_rank, source_id = _event_key(event)
+    payload = {'v': 1, 'ts': ts, 'source': 'db' if source_rank else 'git', 'id': source_id}
+    raw = json.dumps(payload, separators=(',', ':')).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+
+def _decode_cursor(value: str | None) -> dict | None:
+    if not value:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+        payload = json.loads(raw)
+        if payload.get('v') != 1 or payload.get('source') not in {'db', 'git'} or not isinstance(payload.get('ts'), str):
+            raise ValueError
+        if payload['source'] == 'db':
+            payload['id'] = int(payload['id'])
+        else:
+            payload['id'] = str(payload['id'])
+        return payload
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail='invalid events cursor') from exc
+
+
+def _cursor_key(cursor: dict) -> tuple:
+    return (cursor['ts'], 1 if cursor['source'] == 'db' else 0, cursor['id'])
+
+
 @router.get('')
 async def list_events(
     limit: int = Query(100, ge=1, le=500),
-    before_ts: str | None = Query(None, description="Return events strictly older than this ISO ts"),
+    cursor: str | None = Query(None, description='Opaque composite cursor returned by next_cursor'),
+    before_ts: str | None = Query(None, description='Deprecated strict timestamp cursor'),
     market: str = Query('US'),
 ):
-    """Return events newest first.
-
-    No `after_id` path anymore — clients poll by re-fetching the top page.
-    For "load more older" use `before_ts=<oldest visible ts>`.
-    `system` events (git commits) are market-agnostic and shown in every market.
-    """
     market = _validate_market(market)
+    cursor = cursor if isinstance(cursor, str) else None
+    before_ts = before_ts if isinstance(before_ts, str) else None
+    decoded = _decode_cursor(cursor)
+    git = [dict(g, _source='git') for g in _load_git_commits()]
 
-    # 1) DB events for this market (oversample so merging with git stays correct)
-    over = limit * 2
-    if before_ts:
+    # Fetch enough DB candidates to survive merging with the complete (max 500)
+    # synthetic stream without hiding DB rows that precede the page boundary.
+    db_limit = limit + len(git)
+    if decoded:
+        include_same_ts = 1 if decoded['source'] == 'db' else 0
+        rows = await fetch_all(
+            "SELECT id, ts, category, severity, account, ticker, title, detail "
+            "FROM events WHERE market = :m AND "
+            "(ts < :bt OR (:include_same_ts = 1 AND ts = :bt AND id < :cid)) "
+            "ORDER BY ts DESC, id DESC LIMIT :lim",
+            {'m': market, 'bt': decoded['ts'], 'cid': decoded['id'] if include_same_ts else 0,
+             'include_same_ts': include_same_ts, 'lim': db_limit},
+        )
+    elif before_ts:
         rows = await fetch_all(
             "SELECT id, ts, category, severity, account, ticker, title, detail "
             "FROM events WHERE market = :m AND ts < :bt "
             "ORDER BY ts DESC, id DESC LIMIT :lim",
-            {'m': market, 'bt': before_ts, 'lim': over},
+            {'m': market, 'bt': before_ts, 'lim': db_limit},
         )
     else:
         rows = await fetch_all(
             "SELECT id, ts, category, severity, account, ticker, title, detail "
             "FROM events WHERE market = :m ORDER BY ts DESC, id DESC LIMIT :lim",
-            {'m': market, 'lim': over},
+            {'m': market, 'lim': db_limit},
         )
-    for r in rows:
-        # detail stays as a raw string — client does its own JSON.parse() with try/catch.
-        # (Some events have JSON detail, others have plain text like risk-regime banners.)
-        pass
 
-    # 2) Git commits (market-agnostic, full set is small)
-    git = _load_git_commits()
-    if before_ts:
-        git = [g for g in git if g['ts'] < before_ts]
+    db = [dict(r, _source='db') for r in rows]
+    if decoded:
+        key = _cursor_key(decoded)
+        git = [g for g in git if _event_key(g) < key]
+    elif before_ts:
+        git = [g for g in git if (g.get('ts') or '') < before_ts]
 
-    # 3) Merge by ts DESC, cap to limit
-    merged = sorted(rows + git, key=lambda e: (e['ts'] or '', str(e['id'])), reverse=True)
-    merged = merged[:limit]
-    return {'events': merged, 'count': len(merged), 'market': market}
+    merged = sorted(db + git, key=_event_key, reverse=True)[:limit]
+    next_cursor = _encode_cursor(merged[-1]) if len(merged) == limit else None
+    public = [{k: v for k, v in event.items() if k != '_source'} for event in merged]
+    return {
+        'events': public,
+        'count': len(public),
+        'market': market,
+        'next_cursor': next_cursor,
+    }

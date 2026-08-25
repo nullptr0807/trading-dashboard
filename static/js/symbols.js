@@ -271,7 +271,7 @@
           ${d.accounts.map(a => `
             <div class="sym-arow sym-arow-body" data-account="${a.account}" data-trades='${encodeURIComponent(JSON.stringify(a.trades))}'>
               <div><span class="sym-acct-toggle" aria-hidden="true">▸</span><a href="#/trade?focus=${a.account}" class="sym-acct-link" onclick="event.stopPropagation();">${a.account}</a><span class="sym-grp grp-${a.group||'X'}">${a.group||''}</span></div>
-              <div class="sym-strat">${a.strategy_name || '—'}</div>
+              <div class="sym-strat">${typeof _esc === 'function' ? _esc(a.strategy_name || '—') : '—'}</div>
               <div class="num">${a.trade_count}</div>
               <div class="num ${a.realized_pnl>=0?'positive':'negative'}">${signed(cur, a.realized_pnl)}</div>
               <div class="num ${a.unrealized_pnl>=0?'positive':'negative'}">${signed(cur, a.unrealized_pnl)}</div>
