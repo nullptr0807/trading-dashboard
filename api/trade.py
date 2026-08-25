@@ -776,7 +776,8 @@ def _account_detail_sync(account_id: str, market: str) -> dict | None:
         # fraction of the payload. Downsample only if the aggregate itself is huge.
         marker_rows = _rows(con.execute(
             'SELECT MIN(id) AS id, timestamp, lower(side) AS side, COUNT(*) AS count, '
-            'SUM(shares) AS shares, AVG(price) AS price FROM trades '
+            'SUM(shares) AS shares, '
+            'SUM(shares * price) / NULLIF(SUM(shares), 0) AS price FROM trades '
             'WHERE account = :a AND market = :m GROUP BY timestamp, lower(side) '
             'ORDER BY timestamp, id', params
         ))

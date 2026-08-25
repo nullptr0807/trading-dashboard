@@ -74,6 +74,29 @@ def test_all_240_snapshots_keep_equity_and_cash_after_curve_downsampling(tmp_pat
     assert all(s['cash'] == s['equity'] - 100.0 for s in detail['snapshots'])
 
 
+def test_aggregated_trade_marker_uses_share_weighted_price(tmp_path, monkeypatch):
+    import api.trade as trade
+
+    db = tmp_path / 'detail.db'
+    _make_db(db)
+    with sqlite3.connect(db) as con:
+        con.executemany(
+            'INSERT INTO trades VALUES(?,?,?,?,?,?,?,?,?,?)',
+            [
+                (451, 'A1', 'US', 'SPY', 'buy', 100, 100, 0, 0,
+                 '2026-03-01T12:00:00'),
+                (452, 'A1', 'US', 'SPY', 'buy', 1, 10, 0, 0,
+                 '2026-03-01T12:00:00'),
+            ],
+        )
+    monkeypatch.setattr(trade, 'DB_PATH', db)
+    detail = trade._account_detail_sync('A1', 'US')
+    assert detail is not None
+    marker = next(m for m in detail['trade_markers'] if m['timestamp'] == '2026-03-01T12:00:00')
+    assert marker['shares'] == 101
+    assert marker['price'] == (100 * 100 + 1 * 10) / 101
+
+
 def test_trade_totals_are_full_and_cursor_pages_cover_every_trade(tmp_path, monkeypatch):
     import api.trade as trade
 
