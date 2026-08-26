@@ -162,8 +162,10 @@ def test_factor_catalog_runs_sql_in_worker_and_uses_ttl_cache(monkeypatch):
 def test_gp_factor_lab_translation_preserves_ma_coordinate_and_pairwise_max():
     import numpy as np
     import pandas as pd
-    from api.factor_lab import _gp_expr_to_runnable_formula
+    from api.factor_lab import _feature_to_formula_symbol, _gp_expr_to_runnable_formula
     from core.factor_lab_engine import _compute_formula_matrix
+
+    assert _feature_to_formula_symbol('pv_corr_20') == 'rho_20(ROC_1,(VOLUME/lag(VOLUME,1)-1))'
 
     cols = ['ma_5', 'ma_10', 'ma_20', 'o_c', 'h_c', 'l_c']
     formula = _gp_expr_to_runnable_formula(

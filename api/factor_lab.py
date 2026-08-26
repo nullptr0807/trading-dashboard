@@ -65,7 +65,8 @@ def _feature_to_formula_symbol(name: str) -> str | None:
         'vol_of_vol_20': 'std(VMOM_20,20)',
         'skew_20': None,
         'kurt_20': None,
-        'pv_corr_20': 'rho_20(ROC_1,delta(VOLUME,1))',
+        # gp_miner uses pct_change(volume), not the raw volume delta.
+        'pv_corr_20': 'rho_20(ROC_1,(VOLUME/lag(VOLUME,1)-1))',
         'slope_20': 'BETA_20',
         'trend_r2_20': None,
         'trend_resi_20': None,
