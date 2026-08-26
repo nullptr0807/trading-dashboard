@@ -21,6 +21,10 @@ except Exception:  # pragma: no cover - catalog can still serve base factors
     _load_gp_alphas = None
 
 _CATALOG_BY_NAME = {str(f.get("name", "")).upper(): f for f in ALPHA158_FACTORS}
+_LEGACY_GP_FEATURE_COLS = [
+    'o_c', 'h_c', 'l_c', 'v_vma20', 'ma_5', 'ma_10', 'ma_20',
+    'std_5', 'std_10', 'std_20', 'ret_1', 'ret_5', 'ret_10',
+]
 
 
 def _parse_account_factor_token(token: str) -> dict | None:
@@ -43,7 +47,10 @@ def _feature_to_formula_symbol(name: str) -> str | None:
     n = str(name or '').strip()
     mapping = {
         'ret_1': 'ROC_1', 'ret_5': 'ROC_5', 'ret_10': 'ROC_10',
-        'ma_5': 'MA_RATIO_5', 'ma_10': 'MA_RATIO_10', 'ma_20': 'MA_RATIO_20',
+        # GP defines ma_N = rolling_mean(close,N) / close, while Factor Lab's
+        # MA_RATIO_N is close / rolling_mean(close,N). Preserve the GP
+        # coordinate exactly instead of silently inverting the signal.
+        'ma_5': '(1/MA_RATIO_5)', 'ma_10': '(1/MA_RATIO_10)', 'ma_20': '(1/MA_RATIO_20)',
         'std_5': 'STD_5', 'std_10': 'STD_10', 'std_20': 'STD_20',
         'v_vma20': 'VMOM_20',
         'o_c': '(OPEN/CLOSE)', 'h_c': '(HIGH/CLOSE)', 'l_c': '(LOW/CLOSE)',
@@ -115,6 +122,10 @@ def _gp_expr_to_runnable_formula(expr: str, feature_cols: list[str] | None = Non
                 return f'-({args[0]})'
             if tok == 'inv' and len(args) == 1:
                 return f'(1/({args[0]}))'
+            if tok == 'max2' and len(args) == 2:
+                return f'max2({args[0]},{args[1]})'
+            if tok == 'min2' and len(args) == 2:
+                return f'min2({args[0]},{args[1]})'
             raise ValueError(f'unsupported GP function {tok}')
         mapped = _feature_to_formula_symbol(tok)
         if mapped:
@@ -140,7 +151,10 @@ def _gp_account_item(account_id: str, group: str, strategy_name: str, factors_ra
     runnable_terms = []
     for alpha in active:
         expr = alpha.get('expression') or ''
-        feature_cols = alpha.get('feature_cols') or []
+        # B01-B10 legacy artifacts predate persisted feature_cols. Their X0..
+        # mapping is frozen by gp_miner.FEATURE_COLS and must not be guessed as
+        # an empty list (which made valid legacy accounts unrunnable).
+        feature_cols = alpha.get('feature_cols') or _LEGACY_GP_FEATURE_COLS
         runnable_formula = _gp_expr_to_runnable_formula(expr, feature_cols)
         factor_cards.append({
             "name": alpha.get('name') or 'gp_factor',

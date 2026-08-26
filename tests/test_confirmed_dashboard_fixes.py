@@ -159,6 +159,37 @@ def test_factor_catalog_runs_sql_in_worker_and_uses_ttl_cache(monkeypatch):
     assert calls.count(('thread', 'US')) == 1
 
 
+def test_gp_factor_lab_translation_preserves_ma_coordinate_and_pairwise_max():
+    import numpy as np
+    import pandas as pd
+    from api.factor_lab import _gp_expr_to_runnable_formula
+    from core.factor_lab_engine import _compute_formula_matrix
+
+    cols = ['ma_5', 'ma_10', 'ma_20', 'o_c', 'h_c', 'l_c']
+    formula = _gp_expr_to_runnable_formula(
+        'max2(max2(inv(X0), X3), X3)', cols
+    )
+    # GP ma_5 is MA5/close; Factor Lab MA_RATIO_5 is close/MA5. The
+    # expression's inv(X0) must therefore become close/MA5, not MA5/close.
+    assert formula == 'max2(max2((1/((1/MA_RATIO_5))),(OPEN/CLOSE)),(OPEN/CLOSE))'
+
+    idx = pd.Index(['2026-01-01'])
+    columns = ['UP', 'DOWN']
+    close = pd.DataFrame([[110.0, 90.0]], index=idx, columns=columns)
+    open_ = pd.DataFrame([[100.0, 100.0]], index=idx, columns=columns)
+    matrices = {
+        'close': close,
+        'open': open_,
+        'high': pd.DataFrame([[112.0, 102.0]], index=idx, columns=columns),
+        'low': pd.DataFrame([[99.0, 88.0]], index=idx, columns=columns),
+        'volume': pd.DataFrame([[1.0, 1.0]], index=idx, columns=columns),
+    }
+    # Direct pairwise max/min are distinct from rolling max/min and must work
+    # element-wise for translated gplearn expressions.
+    got = _compute_formula_matrix('max2(OPEN,CLOSE)', matrices)
+    assert np.allclose(got.to_numpy(), [[110.0, 100.0]])
+
+
 def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     css = (ROOT / 'static/css/style.css').read_text()
     html = (ROOT / 'static/index.html').read_text()

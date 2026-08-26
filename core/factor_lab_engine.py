@@ -97,7 +97,7 @@ _MAX_PERIOD = 252
 _LATEX_MAX_LEN = 6000
 _LATEX_ALLOWED_FUNCS = {
     "rank", "zscore", "rho", "corr", "cov", "delta", "lag", "mean", "sum",
-    "std", "min", "max", "abs", "log", "sqrt", "sign", "clip",
+    "std", "min", "max", "max2", "min2", "abs", "log", "sqrt", "sign", "clip",
 }
 _LATEX_FUNC_ALIASES = {"correlation": "rho"}
 _LATEX_FACTOR_SYMBOLS = {
@@ -836,6 +836,13 @@ def _eval_formula_node(node: _FormulaNode, matrices: dict[str, pd.DataFrame]):
                 return np.sqrt(x.clip(lower=0)) if isinstance(x, pd.DataFrame) else math.sqrt(max(float(x), 0.0))
             if func == "sign":
                 return np.sign(x)
+        if func in {"max2", "min2"}:
+            if len(args) != 2:
+                raise ValueError(f"{func} takes two arguments")
+            left = _eval_formula_node(args[0], matrices)
+            right = _eval_formula_node(args[1], matrices)
+            op = np.maximum if func == "max2" else np.minimum
+            return op(left, right)
         if func == "clip":
             if len(args) != 3:
                 raise ValueError("clip takes x, low, high")
