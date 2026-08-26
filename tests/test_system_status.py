@@ -114,3 +114,41 @@ def test_legacy_singleton_is_never_presented_as_market_state(tmp_path):
     result = _status_sync('US', db)
     assert result['risk']['state'] == 'LEGACY_MIXED_ARMED'
     assert result['status'] == 'degraded'
+
+
+def test_closed_market_does_not_replay_extended_quote_warning_as_system_failure(
+    tmp_path, monkeypatch
+):
+    import api.system_status as status_api
+
+    now = datetime.now(timezone.utc).isoformat()
+    db = tmp_path / 'closed-market.db'
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE account_meta(account_id TEXT,market TEXT,status TEXT,retire_reason TEXT,"
+        "runtime_status TEXT,runtime_reason TEXT);"
+        "CREATE TABLE accounts(name TEXT,market TEXT,timestamp TEXT);"
+        "CREATE TABLE operational_health(component TEXT,market TEXT,status TEXT,success_at TEXT,"
+        "source_timestamp TEXT,details TEXT);"
+        "CREATE TABLE risk_regime(market TEXT,state TEXT,last_drawdown REAL,last_check_at TEXT);"
+    )
+    con.executemany(
+        'INSERT INTO account_meta VALUES (?,?,?,?,?,?)',
+        [('A01', 'US', 'active', None, 'ready', None),
+         ('F14', 'US', 'active', None, 'non_tradeable', 'NO_ADMISSIBLE_FACTOR')],
+    )
+    con.executemany('INSERT INTO accounts VALUES (?,?,?)', [('A01', 'US', now), ('F14', 'US', now)])
+    con.execute(
+        "INSERT INTO operational_health VALUES('update_prices','US','degraded',?,?,?)",
+        (now, now, json.dumps({'valid': 40, 'expected': 103})),
+    )
+    con.execute("INSERT INTO risk_regime VALUES('US','DISARMED',.01,?)", (now,))
+    con.commit(); con.close()
+
+    monkeypatch.setattr(status_api, '_market_phase', lambda market: 'closed')
+    result = status_api._status_sync('US', db)
+    assert result['status'] == 'healthy'
+    assert result['market_phase'] == 'closed'
+    assert result['quote_health']['status'] == 'closed'
+    assert result['quote_health']['recorded_status'] == 'degraded'
+    assert result['non_tradeable_accounts'][0]['account_id'] == 'F14'

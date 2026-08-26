@@ -39,18 +39,29 @@ def _age_seconds(value: Any) -> float:
         return float('inf')
 
 
-def _market_freshness_sla(market: str) -> int:
+def _market_phase(market: str) -> str:
+    """Return the current quote session used by the status banner."""
     now = datetime.now(timezone.utc)
     if market == 'CN':
         local = now.astimezone(ZoneInfo('Asia/Shanghai'))
         minute = local.hour * 60 + local.minute
-        rth = local.weekday() < 5 and (570 <= minute < 690 or 780 <= minute < 900)
-        return 10 * 60 if rth else 96 * 3600
+        if local.weekday() < 5 and (570 <= minute < 690 or 780 <= minute < 900):
+            return 'rth'
+        return 'closed'
     local = now.astimezone(ZoneInfo('America/New_York'))
     minute = local.hour * 60 + local.minute
     if local.weekday() < 5 and 570 <= minute < 960:
-        return 10 * 60
+        return 'rth'
     if local.weekday() < 5 and 240 <= minute < 1200:
+        return 'extended'
+    return 'closed'
+
+
+def _market_freshness_sla(market: str) -> int:
+    phase = _market_phase(market)
+    if phase == 'rth':
+        return 10 * 60
+    if phase == 'extended':
         return 30 * 60
     return 96 * 3600
 
@@ -163,18 +174,27 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
                     'last_check_at': row['last_check_at'],
                 }
 
+        phase = _market_phase(market)
         freshness_sla = _market_freshness_sla(market)
+        quote_stale = _age_seconds(health.get('success_at')) > freshness_sla
+        quote_unhealthy = health['status'] not in {'ok', 'healthy'}
+        if phase == 'closed' and not quote_stale:
+            # A sparse pre/post-market tick is useful evidence, but it must not
+            # keep the whole system red after the quote session has ended.
+            health['recorded_status'] = health['status']
+            health['status'] = 'closed'
+            quote_unhealthy = False
         degraded = (
-            health['status'] not in {'ok', 'healthy'}
-            or _age_seconds(health.get('success_at')) > freshness_sla
+            quote_unhealthy
+            or quote_stale
             or valuation['complete_accounts'] < valuation['active_accounts']
             or _age_seconds(valuation.get('oldest_complete_at')) > freshness_sla
             or risk['state'] not in {'ARMED', 'DISARMED'}
             or _age_seconds(risk.get('last_check_at')) > freshness_sla
-            or bool(inactive)
         )
         return {
             'market': market,
+            'market_phase': phase,
             'status': 'degraded' if degraded else 'healthy',
             'quote_health': health,
             'valuation': valuation,

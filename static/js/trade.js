@@ -58,11 +58,12 @@ async function loadSystemStatus(routeToken) {
   const pct = r.drawdown == null ? '—' : `${(Number(r.drawdown) * 100).toFixed(2)}%`;
   const coverage = `${v.complete_accounts || 0}/${v.active_accounts || 0}`;
   const inactive = (s.non_tradeable_accounts || []).map(x => x.account_id).join(', ');
+  const quoteStatus = q.status === 'closed' ? t('system_quote_closed') : _escStatus(q.status || 'unknown');
   host.className = `system-status-banner ${bad ? 'system-status-degraded' : 'system-status-healthy'}`;
   host.innerHTML = `
     <div class="system-status-head">
       <b>${bad ? t('system_degraded') : t('system_healthy')}</b>
-      <span>${t('system_quote')}: ${_escStatus(q.status || 'unknown')}</span>
+      <span>${t('system_quote')}: ${quoteStatus}</span>
       <span>${t('system_valuation')}: ${coverage}</span>
       <span>${t('system_risk')}: ${_escStatus(r.state || 'UNKNOWN')} · DD ${pct}</span>
     </div>
