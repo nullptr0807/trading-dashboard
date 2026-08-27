@@ -128,9 +128,22 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     owned_symbols = {row["symbol"] for row in owned}
     external = [symbol for symbol, qty in broker_positions.items()
                 if qty > 1e-9 and symbol not in owned_symbols]
-    if external:
+    settings = getattr(client, "settings", None)
+    shared_read_only = bool(
+        settings
+        and not settings.dedicated_account_confirmed
+        and not settings.trading_enabled
+        and not settings.auto_trading_enabled
+    )
+    if external and not shared_read_only:
         raise ControlRejected(
             "Dedicated strategy account contains external holdings; strong isolation proof failed"
+        )
+    if external:
+        store.event(
+            "shared_account_external_holdings", "moomoo_reconciler", "info",
+            "Shared-account holdings observed in read-only mode and excluded from the strategy ledger",
+            {"count": len(external)},
         )
     for row in owned:
         broker_qty = broker_positions.get(row["symbol"], 0.0)
@@ -159,6 +172,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             store.event("risk_freeze_cancel_failed", "moomoo_reconciler", "critical",
                         "Risk freeze could not confirm cancellation of module orders", {})
     result = {"ok": True, "applied_fills": applied, "owned_positions": len(owned),
+              "external_positions": len(external), "shared_read_only": shared_read_only,
               "equity": state.strategy_equity, "market_value": state.owned_market_value,
               "lifecycle": state.lifecycle, "freeze_reason": state.freeze_reason,
               "cancellation": cancellation}

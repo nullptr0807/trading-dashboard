@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,14 @@ reconcile = _module.reconcile
 
 
 class FakeClient:
+    settings = SimpleNamespace(
+        dedicated_account_confirmed=True,
+        trading_enabled=False,
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+
     def snapshot(self):
         return {
             "account_id": 1,
@@ -118,3 +127,52 @@ def test_dedicated_account_rejects_any_external_holding(tmp_path):
     client.snapshot = lambda: data
     with pytest.raises(ControlRejected, match="external holdings"):
         reconcile(client, store, ownership_proof=lambda *_: True)
+
+
+def test_shared_account_read_only_observes_but_never_imports_external_holdings(tmp_path):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        dedicated_account_confirmed=False,
+        trading_enabled=False,
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["orders"] = [row for row in data["orders"] if row["order_id"] == "manual-order"]
+    data["deals"] = [row for row in data["deals"] if row["order_id"] == "manual-order"]
+    data["order_fees"] = []
+    data["positions"] = [{"code": "US.MSFT", "qty": 50}]
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store)
+
+    assert result["shared_read_only"] is True
+    assert result["external_positions"] == 1
+    assert result["owned_positions"] == 0
+    assert store.positions() == []
+    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().freeze_reason == "not_provisioned"
+    assert store.snapshot().last_sync_at is not None
+
+
+def test_shared_account_external_holdings_fail_if_trading_is_enabled(tmp_path):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        dedicated_account_confirmed=False,
+        trading_enabled=True,
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["orders"] = []
+    data["deals"] = []
+    data["order_fees"] = []
+    data["positions"] = [{"code": "US.MSFT", "qty": 1}]
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="external holdings"):
+        reconcile(client, store)

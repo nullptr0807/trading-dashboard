@@ -12,7 +12,8 @@ from server import app
 
 def setup_client(tmp_path, monkeypatch):
     store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
-    settings = MoomooSettings(read_api_token="r", control_api_token="c")
+    settings = MoomooSettings(read_api_token="r", control_api_token="c",
+                              dedicated_account_confirmed=True)
     client = MoomooClient(settings=settings, control_store=store)
     monkeypatch.setattr(live_api, "_client", client)
     monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
@@ -94,6 +95,27 @@ def test_unfreeze_rejects_unknown_broker_outcome(tmp_path, monkeypatch):
                        json={"confirmation": "UNFREEZE LIVE TRADING",
                              "reason": "operator review complete"})
     assert result.status_code == 409
+    assert store.snapshot().lifecycle == "FROZEN"
+
+
+def test_unfreeze_rejects_shared_account_even_after_fresh_read_only_sync(tmp_path, monkeypatch):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    settings = MoomooSettings(read_api_token="r", control_api_token="c",
+                              dedicated_account_confirmed=False)
+    client = MoomooClient(settings=settings, control_store=store)
+    monkeypatch.setattr(live_api, "_client", client)
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
+    store.mark_to_market({}, sync_complete=True)
+
+    result = TestClient(app).post(
+        "/api/live-account/control/unfreeze",
+        headers={"X-Moomoo-Control-Token": "c"},
+        json={"confirmation": "UNFREEZE LIVE TRADING",
+              "reason": "shared-account read-only sync complete"},
+    )
+
+    assert result.status_code == 409
+    assert "dedicated Moomoo account" in result.json()["detail"]
     assert store.snapshot().lifecycle == "FROZEN"
 
 
