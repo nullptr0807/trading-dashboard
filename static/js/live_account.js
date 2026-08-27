@@ -28,6 +28,38 @@ function laStatusItem(ok, label, detail) {
   return `<div class="la-check ${ok ? 'ok' : 'off'}"><span>${ok ? '✓' : '×'}</span><div><b>${laEsc(label)}</b><small>${laEsc(detail || '')}</small></div></div>`;
 }
 
+function laMarketMeta(state) {
+  const value=String(state||'UNKNOWN').toUpperCase();
+  if(['MORNING','AFTERNOON'].includes(value))return {tone:'live',label:laT('交易中','Market open'),detail:'RTH'};
+  if(['PRE_MARKET_BEGIN','PRE_MARKET_END'].includes(value))return {tone:'pre',label:laT('盘前交易','Pre-market'),detail:'EXT'};
+  if(['AFTER_HOURS_BEGIN','AFTER_HOURS_END'].includes(value))return {tone:'after',label:laT('盘后交易','After-hours'),detail:'EXT'};
+  if(['OVERNIGHT','NIGHT','NIGHT_OPEN'].includes(value))return {tone:'night',label:laT('隔夜交易','Overnight'),detail:'EXT'};
+  if(['CLOSED','NONE','WAITING_OPEN','REST','NIGHT_END'].includes(value))return {tone:'closed',label:laT('休市中','Market closed'),detail:'US'};
+  return {tone:'unknown',label:laT('市场状态未知','Market unknown'),detail:value};
+}
+
+function laHealthMeta(status, state) {
+  if(!status.opend_connected)return {tone:'danger',label:laT('连接异常','Disconnected'),detail:'OpenD'};
+  if(state.lifecycle!=='ACTIVE')return {tone:'danger',label:laT('系统冻结','System frozen'),detail:state.freeze_reason||'FROZEN'};
+  if(!status.sync_proof_current||!status.control_sync_fresh)return {tone:'warn',label:laT('等待对账','Sync required'),detail:'STALE'};
+  return {tone:'live',label:laT('健康正常','Healthy'),detail:'ALL CHECKS'};
+}
+
+function laHero(control, status) {
+  const state=control.state||{}, perf=control.performance_summary||{};
+  const market=laMarketMeta(control.market_status&&control.market_status.state);
+  const health=laHealthMeta(status,state);
+  const execution=status.auto_trading_enabled
+    ? {tone:'live',label:laT('自动交易中','Auto trading'),detail:'AUTO'}
+    : status.trading_enabled
+      ? {tone:'pre',label:laT('真实交易就绪','Live ready'),detail:'MANUAL GATE'}
+      : {tone:'closed',label:laT('真实交易关闭','Live trading off'),detail:'SAFE'};
+  const ret=Number(perf.total_return_pct||0), pnl=Number(perf.pnl||0), sharpe=perf.sharpe_ratio;
+  const pnlText=`${pnl>=0?'+':'-'}$${Math.abs(pnl).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+  const chips=[market,health,execution,{tone:status.control_sync_fresh?'live':'warn',label:laT('对账','Reconciliation'),detail:status.control_sync_fresh?laT('新鲜','FRESH'):laT('过期','STALE')}];
+  return `<section class="la-hero la-hero-pro"><div class="la-hero-copy"><span class="la-kicker">MOOMOO OPENAPI · STRATEGY COMMAND</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><p>${laT('独立$10,000策略子账本 · Long-only · Broker持仓逻辑隔离','Independent $10,000 sub-ledger · Long-only · Logically isolated broker inventory')}</p><div class="la-status-rack">${chips.map(x=>`<div class="la-status-chip ${x.tone}"><i></i><span><b>${laEsc(x.label)}</b><small>${laEsc(x.detail)}</small></span></div>`).join('')}</div></div><div class="la-command-deck"><div class="la-return-card ${laClass(ret)}"><small>${laT('累计收益','TOTAL RETURN')}</small><strong>${laPct(ret)}</strong><span>${pnlText}</span></div><div class="la-risk-pair"><div><small>SHARPE · ANN.</small><b>${sharpe==null?'—':Number(sharpe).toFixed(2)}</b><span>${Number(perf.sharpe_observations||0)}/20 ${laT('日收益样本','daily returns')}</span></div><div><small>MAX DRAWDOWN</small><b>${Number(perf.max_drawdown_pct||0).toFixed(2)}%</b><span>${laT('策略子账本','sub-ledger')}</span></div></div><div class="la-hero-sync">${laT('最后对账','Last reconciliation')} · ${laEsc(laTime(state.last_sync_at))}</div></div></section>`;
+}
+
 function laPolicyCard(policy, control) {
   const c=(control.config||{}).values||{};
   const fields=[
@@ -141,7 +173,7 @@ async function renderLiveAccountPage(token) {
     const [root,control]=await Promise.all([laFetch('/status'),laFetch('/strategy')]);
     if(token && !isRouteCurrent(token,'/live-account'))return;
     const st=root.status,p=root.policy;
-    app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · STRATEGY SUB-LEDGER</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><p>${laT('仅展示独立$10,000策略子账本；个人账户资金、持仓和交易不会发送到此页面。','Only the independent $10,000 strategy sub-ledger is shown. Personal account cash, holdings and activity are never sent to this page.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section>
+    app.innerHTML=`<div class="la-shell">${laHero(control,st)}
       <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)}</span><button class="la-link" id="la-refresh">${laT('刷新','Refresh')}</button></div>
       ${st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：页面仅展示逻辑策略子仓。','RESTRICTED SHARED ACCOUNT: this page shows the logical strategy sub-position only.')}</b> ${laT('个人持仓不会进入页面；策略只记录并卖出自己经证明成交的数量。','Personal holdings never enter this page. The strategy records and sells only its proven quantity.')}</div>`:''}
       ${laControlPanel(control)}

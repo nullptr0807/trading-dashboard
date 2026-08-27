@@ -482,6 +482,34 @@ class LiveStrategyStore:
             "last_trade_at": row["last_trade_at"],
         }
 
+    def performance_summary(self) -> dict[str, Any]:
+        state = self.snapshot()
+        daily_closes: dict[str, float] = {}
+        for row in self.equity_history():
+            equity = float(row["equity"])
+            if math.isfinite(equity) and equity > 0:
+                daily_closes[str(row["ts"])[:10]] = equity
+        values = list(daily_closes.values())
+        daily_returns = [values[i] / values[i - 1] - 1.0 for i in range(1, len(values))]
+        sharpe = None
+        if len(daily_returns) >= 20:
+            mean = sum(daily_returns) / len(daily_returns)
+            variance = sum((value - mean) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
+            if variance > 0:
+                sharpe = mean / math.sqrt(variance) * math.sqrt(252)
+        peak = INITIAL_CAPITAL
+        max_drawdown = 0.0
+        for equity in [INITIAL_CAPITAL, *values]:
+            peak = max(peak, equity)
+            max_drawdown = min(max_drawdown, equity / peak - 1.0)
+        return {
+            "pnl": float(state.strategy_equity - INITIAL_CAPITAL),
+            "total_return_pct": float((state.strategy_equity / INITIAL_CAPITAL - 1.0) * 100),
+            "sharpe_ratio": float(sharpe) if sharpe is not None and math.isfinite(sharpe) else None,
+            "sharpe_observations": len(daily_returns),
+            "max_drawdown_pct": float(max_drawdown * 100),
+        }
+
     def owned_quantity(self, symbol: str) -> float:
         with self.connect() as con:
             row = con.execute("SELECT quantity FROM owned_positions WHERE symbol=?", (symbol.upper(),)).fetchone()

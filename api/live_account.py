@@ -123,6 +123,15 @@ async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
     store = get_client().control
     try:
         events = await asyncio.to_thread(store.recent_events, event_limit)
+        try:
+            market_quote = await asyncio.to_thread(get_client().quote, "US.SPY")
+            market_status = {
+                "state": str(market_quote.get("market_state") or "UNKNOWN").upper(),
+                "security_status": str(market_quote.get("sec_status") or "UNKNOWN").upper(),
+                "updated_at": market_quote.get("update_time"),
+            }
+        except MoomooUnavailable:
+            market_status = {"state": "UNKNOWN", "security_status": "UNKNOWN", "updated_at": None}
         public_events = [
             {key: row.get(key) for key in ("ts", "event_type", "source", "severity", "message")}
             for row in events
@@ -132,6 +141,8 @@ async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
             "config": await asyncio.to_thread(store.config),
             "owned_positions": await asyncio.to_thread(store.positions),
             "execution_summary": await asyncio.to_thread(store.execution_summary),
+            "performance_summary": await asyncio.to_thread(store.performance_summary),
+            "market_status": market_status,
             "fills": await asyncio.to_thread(store.fills, fill_limit),
             "equity": await asyncio.to_thread(store.equity_history),
             "paper_series": await asyncio.to_thread(store.paper_series),

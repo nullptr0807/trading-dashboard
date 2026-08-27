@@ -639,3 +639,6 @@ def test_live_dashboard_uses_strategy_only_public_view():
     assert "Server setup" not in js
     assert "la-event-scroll" in js
     assert "Save & reload — control token required" in js
+    assert "SHARPE · ANN." in js
+    assert "MAX DRAWDOWN" in js
+    assert "laHealthMeta" in js

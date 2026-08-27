@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tarfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -102,6 +103,26 @@ def test_strategy_execution_summary_and_fill_history(tmp_path):
     assert len(fills) == 2
     assert set(fills[0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
     assert all("fill_hash" not in row for row in fills)
+
+
+def test_performance_summary_requires_enough_daily_sharpe_observations(tmp_path):
+    s = store(tmp_path)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with s.connect() as con:
+        for day in range(22):
+            equity = 10_000 + day * 10 + (5 if day % 2 else -5)
+            con.execute(
+                "INSERT INTO strategy_equity(ts,equity,cash,market_value,realized_pnl,unrealized_pnl,lifecycle) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ((start + timedelta(days=day)).isoformat(), equity, equity, 0, 0, 0, "ACTIVE"),
+            )
+        con.execute("UPDATE strategy_state SET strategy_equity=? WHERE id=1", (10_205,))
+    summary = s.performance_summary()
+    assert summary["pnl"] == pytest.approx(205)
+    assert summary["total_return_pct"] == pytest.approx(2.05)
+    assert summary["sharpe_observations"] == 21
+    assert summary["sharpe_ratio"] is not None
+    assert summary["max_drawdown_pct"] <= 0
 
 
 def test_buy_exposure_can_never_exceed_ten_thousand(tmp_path):
