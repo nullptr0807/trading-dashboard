@@ -199,7 +199,7 @@ def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     assert 'grid-template-columns: minmax(0, 1fr) auto auto' in css
     assert 'overflow-x: auto' in css
     assert 'max-width: 100%' in css
-    assert 'style.css?v=44' in html
+    assert 'style.css?v=45' in html
 
 
 def test_strategy_text_is_html_escaped_in_card(tmp_path):

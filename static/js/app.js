@@ -106,6 +106,7 @@ async function api(path) {
 // --- Router ---
 const routes = {
   '/trade': renderTradePage,
+  '/live-account': renderLiveAccountPage,
   '/backtest': renderBacktestPage,
   '/factor-lab': renderFactorLabPage,
   '/explore': renderExplorePage,
@@ -144,9 +145,21 @@ function navigate() {
   const symbolMatch = hash.match(/^\/symbols\/(.+)$/);
   const navKey = routeKeyFromHash(hash);
 
+  let activeNavLink = null;
   document.querySelectorAll('.nav-link').forEach(link => {
-    link.classList.toggle('active', link.getAttribute('href') === '#' + navKey);
+    const active = link.getAttribute('href') === '#' + navKey;
+    link.classList.toggle('active', active);
+    if (active) activeNavLink = link;
   });
+  // Mobile nav is horizontally scrollable. Keep the selected route visible
+  // instead of leaving its label clipped at the viewport edge.
+  const navStrip = document.querySelector('.nav-links');
+  if (navStrip && activeNavLink && navStrip.scrollWidth > navStrip.clientWidth) {
+    navStrip.scrollTo({
+      left: activeNavLink.offsetLeft - navStrip.clientWidth / 2 + activeNavLink.clientWidth / 2,
+      behavior: 'smooth',
+    });
+  }
 
   if (_navTimer) clearTimeout(_navTimer);
   app.classList.add('fade-out');

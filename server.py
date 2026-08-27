@@ -14,6 +14,7 @@ from api.frontier import router as frontier_router
 from api.symbols import router as symbols_router
 from api.factor_lab import router as factor_lab_router
 from api.system_status import router as system_status_router
+from api.live_account import router as live_account_router
 
 app = FastAPI(title='Trading Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
@@ -29,6 +30,7 @@ app.include_router(frontier_router)
 app.include_router(symbols_router)
 app.include_router(factor_lab_router)
 app.include_router(system_status_router)
+app.include_router(live_account_router)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.get('/')
