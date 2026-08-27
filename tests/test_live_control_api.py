@@ -37,6 +37,21 @@ def test_control_read_requires_separate_read_token(tmp_path, monkeypatch):
     assert body["state"]["lifecycle"] == "FROZEN"
 
 
+def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    store.apply_fill("strategy-fill", "US.DRAM", "BUY", 1, 58.21, 0.99)
+    result = http.get("/api/live-account/strategy")
+    assert result.status_code == 200
+    body = result.json()
+    assert body["data_scope"] == "strategy_subledger_only"
+    assert body["execution_summary"]["total_trades"] == 1
+    assert body["execution_summary"]["total_fees"] == 0.99
+    assert body["owned_positions"][0]["symbol"] == "US.DRAM"
+    assert set(body["fills"][0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
+    for forbidden in ("account", "account_id", "positions", "orders", "deals", "order_fees"):
+        assert forbidden not in body
+
+
 def test_preview_api_forwards_explicit_overnight_session(tmp_path, monkeypatch):
     http, _ = setup_client(tmp_path, monkeypatch)
     seen = {}

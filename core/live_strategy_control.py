@@ -451,6 +451,37 @@ class LiveStrategyStore:
             rows = con.execute("SELECT * FROM owned_positions WHERE quantity>0 ORDER BY market_value DESC").fetchall()
         return [dict(row) for row in rows]
 
+    def fills(self, limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT symbol,side,quantity,price,fee,applied_at "
+                "FROM applied_fills ORDER BY applied_at DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def execution_summary(self) -> dict[str, Any]:
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS total_trades, "
+                "COALESCE(SUM(fee),0) AS total_fees, "
+                "COALESCE(SUM(quantity*price),0) AS total_notional, "
+                "COALESCE(SUM(CASE WHEN side='BUY' THEN 1 ELSE 0 END),0) AS buy_trades, "
+                "COALESCE(SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END),0) AS sell_trades, "
+                "MIN(applied_at) AS first_trade_at, MAX(applied_at) AS last_trade_at "
+                "FROM applied_fills"
+            ).fetchone()
+        return {
+            "total_trades": int(row["total_trades"]),
+            "total_fees": float(row["total_fees"]),
+            "total_notional": float(row["total_notional"]),
+            "buy_trades": int(row["buy_trades"]),
+            "sell_trades": int(row["sell_trades"]),
+            "first_trade_at": row["first_trade_at"],
+            "last_trade_at": row["last_trade_at"],
+        }
+
     def owned_quantity(self, symbol: str) -> float:
         with self.connect() as con:
             row = con.execute("SELECT quantity FROM owned_positions WHERE symbol=?", (symbol.upper(),)).fetchone()

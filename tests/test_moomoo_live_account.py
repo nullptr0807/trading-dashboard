@@ -624,3 +624,13 @@ def test_dashboard_executes_no_third_party_javascript_and_vendor_hashes_are_pinn
     }
     for rel, digest in expected.items():
         assert hashlib.sha256((root / rel).read_bytes()).hexdigest() == digest
+
+
+def test_live_dashboard_uses_strategy_only_public_view():
+    js = (Path(__file__).resolve().parents[1] / "static/js/live_account.js").read_text()
+    assert "laFetch('/strategy')" in js
+    assert "laFetch('/snapshot')" not in js
+    assert "_laReadToken" not in js
+    assert "la-read-token" not in js
+    assert "Full Moomoo account positions" not in js
+    assert "Personal account cash, holdings and activity are never sent to this page." in js

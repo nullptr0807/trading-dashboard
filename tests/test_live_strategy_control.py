@@ -88,6 +88,22 @@ def test_only_module_confirmed_fills_create_sellable_ownership(tmp_path):
         s.pretrade_guard("SELL", "US.AAPL", 10.01, 100)
 
 
+def test_strategy_execution_summary_and_fill_history(tmp_path):
+    s = store(tmp_path)
+    assert s.apply_fill("buy-1", "US.DRAM", "BUY", 2, 10, 1.0)
+    assert s.apply_fill("sell-1", "US.DRAM", "SELL", 1, 12, 0.5)
+    summary = s.execution_summary()
+    assert summary["total_trades"] == 2
+    assert summary["buy_trades"] == 1
+    assert summary["sell_trades"] == 1
+    assert summary["total_fees"] == pytest.approx(1.5)
+    assert summary["total_notional"] == pytest.approx(32)
+    fills = s.fills()
+    assert len(fills) == 2
+    assert set(fills[0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
+    assert all("fill_hash" not in row for row in fills)
+
+
 def test_buy_exposure_can_never_exceed_ten_thousand(tmp_path):
     s = store(tmp_path)
     make_active(s)

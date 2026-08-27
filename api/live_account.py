@@ -116,6 +116,29 @@ async def live_control(x_moomoo_read_token: str = Header(default=""),
         raise HTTPException(status_code=503, detail=str(exc))
 
 
+@router.get("/strategy")
+async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
+                        fill_limit: int = Query(200, ge=1, le=1000)):
+    """Public strategy sub-ledger only; never returns broker account data."""
+    store = get_client().control
+    try:
+        return {
+            "state": asdict(await asyncio.to_thread(store.snapshot)),
+            "config": await asyncio.to_thread(store.config),
+            "owned_positions": await asyncio.to_thread(store.positions),
+            "execution_summary": await asyncio.to_thread(store.execution_summary),
+            "fills": await asyncio.to_thread(store.fills, fill_limit),
+            "equity": await asyncio.to_thread(store.equity_history),
+            "paper_series": await asyncio.to_thread(store.paper_series),
+            "events": await asyncio.to_thread(store.recent_events, event_limit),
+            "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
+                            "loss_floor": 7_500, "regular_hours_only": True},
+            "data_scope": "strategy_subledger_only",
+        }
+    except ControlRejected as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 @router.put("/control/config")
 async def update_live_config(req: ConfigUpdateRequest,
                              x_moomoo_control_token: str = Header(default="")):
