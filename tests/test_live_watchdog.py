@@ -25,6 +25,8 @@ class FakeStore:
         )
     def freeze(self, *args, **kwargs):
         self.freeze_calls += 1
+    def list_auto_order_intents(self, limit=1000):
+        return []
     def event(self, *args, **kwargs):
         raise AssertionError("read-only AI snapshot must not write events")
 

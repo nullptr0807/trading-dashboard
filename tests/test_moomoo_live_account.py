@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from pathlib import Path
 import hashlib
+import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -14,7 +16,7 @@ from core.moomoo_audit import (
     record_nav_snapshot, register_preview,
 )
 from core.moomoo_client import (
-    BrokerOutcomeUnknown, LiveTradeRejected, MoomooClient, MoomooSettings,
+    BrokerOutcomeUnknown, LiveTradeRejected, MoomooClient, MoomooSettings, MoomooUnavailable,
 )
 from core.live_strategy_control import LiveStrategyStore
 
@@ -85,12 +87,12 @@ class FakeQuoteContext:
     def __init__(self): self.closed = False
     def close(self): self.closed = True
     def get_market_snapshot(self, codes):
-        return 0, pd.DataFrame([{"code": codes[0], "last_price": 100.0,
+        return 0, pd.DataFrame([{"code": code, "last_price": 100.0,
                                  "bid_price": 99.9, "ask_price": 100.1,
                                  "update_time": "2026-08-26 10:00:00",
-                                 "sec_status": "NORMAL"}])
+                                 "sec_status": "NORMAL"} for code in codes])
     def get_market_state(self, codes):
-        return 0, pd.DataFrame([{"code": codes[0], "market_state": "MORNING"}])
+        return 0, pd.DataFrame([{"code": code, "market_state": "MORNING"} for code in codes])
 
 
 class FakeSDK:
@@ -101,9 +103,11 @@ class FakeSDK:
         self.trade = FakeTradeContext()
         self.quote = FakeQuoteContext()
         self.quote_context_kwargs = None
+        self.quote_context_calls = 0
 
     def OpenSecTradeContext(self, **kwargs): return self.trade
     def OpenQuoteContext(self, **kwargs):
+        self.quote_context_calls += 1
         self.quote_context_kwargs = kwargs
         return self.quote
 
@@ -160,6 +164,25 @@ def client(control_store=None, **overrides):
     return c
 
 
+def auto_client(tmp_path):
+    control = LiveStrategyStore(tmp_path / "auto-strategy.db", tmp_path / "archives")
+    with control.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+                    "freeze_reason=NULL,last_sync_at='2026-08-26T14:00:00+00:00' WHERE id=1")
+    c = client(control_store=control, trading_enabled=True, auto_trading_enabled=True,
+               account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+               shared_account_risk_accepted=True)
+    fingerprint = c.current_sync_fingerprint()
+    control.record_broker_sync_proof(fingerprint, "2026-08-26T14:00:00+00:00")
+    intent = control.create_auto_order_intent(
+        strategy_id="B16", config_version=1, signal_batch_id="b" * 64,
+        signal_source_date="2026-08-26", factor_set_hash="f" * 64,
+        symbol="US.AAPL", side="BUY", purpose="TARGET_BUY", target_qty=10,
+        order_qty=1, limit_price=100,
+    )
+    return c, control, intent
+
+
 def test_settings_default_to_fail_closed(monkeypatch):
     for key in ["MOOMOO_TRADING_ENABLED", "MOOMOO_AUTO_TRADING_ENABLED",
                 "MOOMOO_TRADE_API_TOKEN", "MOOMOO_TRADE_PASSWORD_MD5",
@@ -202,6 +225,19 @@ def test_snapshot_and_quote_are_moomoo_only():
     assert quote["last_price"] == 100.0
     assert quote["source"] == "Moomoo OpenD"
     assert "security_firm" not in c._sdk.quote_context_kwargs
+
+
+def test_batch_quotes_use_one_context_and_require_every_symbol():
+    c = client()
+    quotes = c.quotes(("AAPL", "MSFT", "NVDA"))
+    assert set(quotes) == {"US.AAPL", "US.MSFT", "US.NVDA"}
+    assert c._sdk.quote_context_calls == 1
+    c._sdk.quote.get_market_snapshot = lambda codes: (0, pd.DataFrame([{
+        "code": codes[0], "last_price": 100, "bid_price": 99.9,
+        "ask_price": 100.1, "update_time": "2026-08-26 10:00:00", "sec_status": "NORMAL",
+    }]))
+    with pytest.raises(MoomooUnavailable, match="No Moomoo quote"):
+        c.quotes(("AAPL", "MSFT"))
 
 
 def test_browser_snapshot_uses_five_minute_server_cache():
@@ -642,3 +678,94 @@ def test_live_dashboard_uses_strategy_only_public_view():
     assert "SHARPE · ANN." in js
     assert "MAX DRAWDOWN" in js
     assert "laHealthMeta" in js
+
+
+def test_auto_preview_requires_enabled_matching_reserved_intent(tmp_path):
+    c, control, intent = auto_client(tmp_path)
+    disabled = client(control_store=control, trading_enabled=True, auto_trading_enabled=False,
+                      account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+                      shared_account_risk_accepted=True)
+    with pytest.raises(LiveTradeRejected, match="requires auto trading enabled"):
+        disabled.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                               auto_intent_id=intent["intent_id"])
+    with pytest.raises(LiveTradeRejected, match="does not match"):
+        c.preview_order(code="AAPL", side="BUY", qty=2, limit_price=100,
+                        auto_intent_id=intent["intent_id"])
+    with control.connect() as con:
+        con.execute("UPDATE strategy_state SET config_version=2 WHERE id=1")
+    with pytest.raises(LiveTradeRejected, match="stale strategy configuration"):
+        c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                        auto_intent_id=intent["intent_id"])
+
+
+def test_auto_place_requires_preview_bound_dispatching_intent(tmp_path):
+    c, control, intent = auto_client(tmp_path)
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                              auto_intent_id=intent["intent_id"])
+    with pytest.raises(LiveTradeRejected, match="not bound"):
+        c.place_order(preview["preview_token"], "t")
+    assert c._sdk.trade.place_calls == 0
+
+
+def test_auto_place_dispatches_only_after_exact_preview_binding(tmp_path):
+    c, control, intent = auto_client(tmp_path)
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                              auto_intent_id=intent["intent_id"])
+    control.mark_auto_intent_dispatching(intent["intent_id"], preview["preview_id"])
+    result = c.place_order(preview["preview_token"], "t")
+    assert result["accepted"] is True
+    assert c._sdk.trade.place_calls == 1
+    assert result["order"]["remark"].endswith(preview["preview_id"])
+
+
+def test_final_dispatch_guard_blocks_config_change_during_unlock(tmp_path):
+    c, control, intent = auto_client(tmp_path)
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                              auto_intent_id=intent["intent_id"])
+    control.mark_auto_intent_dispatching(intent["intent_id"], preview["preview_id"])
+
+    def mutate_config_during_unlock(**kwargs):
+        control.update_config({"top_n": 5}, 1, "race-test", "change during unlock")
+        return 0, "ok"
+
+    c._sdk.trade.unlock_trade = mutate_config_during_unlock
+    with pytest.raises(LiveTradeRejected, match="changed at dispatch"):
+        c.place_order(preview["preview_token"], "t")
+    assert c._sdk.trade.place_calls == 0
+
+
+def test_dispatch_guard_serializes_concurrent_config_update(tmp_path):
+    c, control, intent = auto_client(tmp_path)
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100,
+                              auto_intent_id=intent["intent_id"])
+    control.mark_auto_intent_dispatching(intent["intent_id"], preview["preview_id"])
+    entered, release, config_done = threading.Event(), threading.Event(), threading.Event()
+    original_place = c._sdk.trade.place_order
+
+    def blocked_place(**kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_place(**kwargs)
+
+    c._sdk.trade.place_order = blocked_place
+    result = {}
+    order_thread = threading.Thread(
+        target=lambda: result.update(c.place_order(preview["preview_token"], "t")), daemon=True,
+    )
+    order_thread.start()
+    assert entered.wait(2)
+
+    def update_config():
+        control.update_config({"top_n": 5}, 1, "race-test", "concurrent update")
+        config_done.set()
+
+    config_thread = threading.Thread(target=update_config, daemon=True)
+    config_thread.start()
+    time.sleep(0.1)
+    assert not config_done.is_set()
+    release.set()
+    order_thread.join(3)
+    config_thread.join(3)
+    assert result["accepted"] is True
+    assert config_done.is_set()
+    assert control.config()["version"] == 2

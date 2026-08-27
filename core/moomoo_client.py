@@ -15,10 +15,10 @@ import secrets
 import socket
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, ContextManager, Iterator, cast
 from zoneinfo import ZoneInfo
 
 from core.moomoo_audit import (
@@ -540,40 +540,52 @@ class MoomooClient:
             raise LiveTradeRejected("Invalid US symbol")
         return "US." + raw
 
-    def quote(self, code: str) -> dict[str, Any]:
-        code = self.normalize_code(code)
+    def quotes(self, codes: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        normalized = tuple(dict.fromkeys(self.normalize_code(code) for code in codes))
+        if not normalized:
+            return {}
         if not self._port_open():
             raise MoomooUnavailable("Moomoo OpenD is not connected")
         with self._quote_context() as ctx:
-            rows = self._records(self._result(ctx.get_market_snapshot([code]), "market snapshot"))
-            market_rows = self._records(self._result(ctx.get_market_state([code]), "market state"))
-        if not rows:
-            raise MoomooUnavailable(f"No Moomoo quote for {code}")
-        row = rows[0]
-        market_row = market_rows[0] if market_rows else {}
-        if str(row.get("code") or "").upper() != code:
-            raise MoomooUnavailable("Moomoo returned a quote for the wrong symbol")
-        prices = {}
-        for key in ("last_price", "bid_price", "ask_price"):
-            try:
-                value = float(row.get(key))
-            except (TypeError, ValueError):
-                value = 0.0
-            if not math.isfinite(value) or value < 0:
-                raise MoomooUnavailable(f"Moomoo returned invalid {key}")
-            prices[key] = value
-        quote = {
-            "code": code,
-            **prices,
-            "update_time": row.get("update_time"),
-            "sec_status": row.get("sec_status"),
-            "market_state": market_row.get("market_state"),
-            "source": "Moomoo OpenD",
-        }
-        log_event(_moomoo_logger, "info", "moomoo_quote", symbol=code,
-                  last_price=prices["last_price"], market_state=quote["market_state"],
-                  update_time=quote["update_time"])
-        return quote
+            rows = self._records(self._result(
+                ctx.get_market_snapshot(list(normalized)), "market snapshot",
+            ))
+            market_rows = self._records(self._result(
+                ctx.get_market_state(list(normalized)), "market state",
+            ))
+        row_by_code = {str(row.get("code") or "").upper(): row for row in rows}
+        market_by_code = {str(row.get("code") or "").upper(): row for row in market_rows}
+        result: dict[str, dict[str, Any]] = {}
+        for code in normalized:
+            row = row_by_code.get(code)
+            if not row:
+                raise MoomooUnavailable(f"No Moomoo quote for {code}")
+            prices = {}
+            for key in ("last_price", "bid_price", "ask_price"):
+                try:
+                    raw_value = row.get(key)
+                    value = float(raw_value if raw_value is not None else 0.0)
+                except (TypeError, ValueError):
+                    value = 0.0
+                if not math.isfinite(value) or value < 0:
+                    raise MoomooUnavailable(f"Moomoo returned invalid {key}")
+                prices[key] = value
+            quote = {
+                "code": code, **prices,
+                "update_time": row.get("update_time"),
+                "sec_status": row.get("sec_status"),
+                "market_state": (market_by_code.get(code) or {}).get("market_state"),
+                "source": "Moomoo OpenD",
+            }
+            result[code] = quote
+            log_event(_moomoo_logger, "info", "moomoo_quote", symbol=code,
+                      last_price=prices["last_price"], market_state=quote["market_state"],
+                      update_time=quote["update_time"])
+        return result
+
+    def quote(self, code: str) -> dict[str, Any]:
+        normalized = self.normalize_code(code)
+        return self.quotes([normalized])[normalized]
 
     @staticmethod
     def _number(row: dict[str, Any], *keys: str) -> float:
@@ -618,7 +630,8 @@ class MoomooClient:
 
     def preview_order(self, *, code: str, side: str, qty: int, limit_price: float,
                       session: str = "RTH",
-                      _register: bool = True) -> dict[str, Any]:
+                      _register: bool = True,
+                      auto_intent_id: str | None = None) -> dict[str, Any]:
         config_errors = self.settings.configuration_errors()
         if config_errors:
             raise LiveTradeRejected("Invalid live-trade configuration: " + "; ".join(config_errors))
@@ -634,6 +647,36 @@ class MoomooClient:
         policy = self.public_policy()
         now = self._clock().astimezone(timezone.utc)
         control_state = self.control.snapshot()
+        auto_intent: dict[str, Any] | None = None
+        auto_reservations: dict[str, Any] = {
+            "reserved_buy_notional": 0.0, "reserved_sell_qty": {},
+        }
+        reservation_fn = getattr(self.control, "auto_intent_reservations", None)
+        if auto_intent_id is not None:
+            if not self.settings.auto_trading_enabled:
+                raise LiveTradeRejected("Automatic order preview requires auto trading enabled")
+            getter = getattr(self.control, "get_auto_order_intent", None)
+            candidate_intent = getter(auto_intent_id) if callable(getter) else None
+            auto_intent = candidate_intent if isinstance(candidate_intent, dict) else None
+            if not auto_intent or str(auto_intent.get("status")) not in {"RESERVED", "DISPATCHING"}:
+                raise LiveTradeRejected("Automatic order intent is missing or not dispatchable")
+            if (str(auto_intent.get("symbol")) != code
+                    or str(auto_intent.get("side")) != side
+                    or int(float(auto_intent.get("order_qty", 0))) != int(qty)
+                    or abs(float(auto_intent.get("limit_price", 0)) - float(limit_price)) > 1e-6):
+                raise LiveTradeRejected("Automatic order intent does not match the requested order")
+            if int(auto_intent.get("config_version", -1)) != int(control_state.config_version):
+                raise LiveTradeRejected("Automatic order intent uses a stale strategy configuration")
+            if callable(reservation_fn):
+                candidate_reservations = reservation_fn(exclude_intent_id=auto_intent_id)
+                if not isinstance(candidate_reservations, dict):
+                    raise LiveTradeRejected("Automatic order reservations are unavailable")
+                auto_reservations = candidate_reservations
+        elif callable(reservation_fn):
+            candidate_reservations = reservation_fn()
+            if not isinstance(candidate_reservations, dict):
+                raise LiveTradeRejected("Automatic order reservations are unavailable")
+            auto_reservations = candidate_reservations
         if self.settings.trading_enabled and not self._control_sync_is_fresh(control_state):
             raise LiveTradeRejected("A fresh Moomoo reconciliation within 7 minutes is required")
         if (self.settings.trading_enabled
@@ -711,7 +754,7 @@ class MoomooClient:
                 if str(order.get("trd_side") or "").upper() == "BUY"
                 and str(order.get("order_status") or "").upper() not in terminal_statuses
             )
-            if notional + reserved > cash:
+            if notional + reserved + float(auto_reservations["reserved_buy_notional"]) > cash:
                 raise LiveTradeRejected("Insufficient available cash")
         else:
             held = next((p for p in snap["positions"] if str(p.get("code")) == code), None)
@@ -753,6 +796,10 @@ class MoomooClient:
             and str(order.get("order_status") or "").upper() not in terminal_statuses
             and str(order.get("remark") or "").startswith("dashboard:")
         )
+        broker_pending_buy = pending_buy
+        pending_buy = (max(0.0, broker_pending_buy - float(control_state.reserved_buy_notional))
+                       + float(auto_reservations["reserved_buy_notional"]))
+        pending_sell += float(auto_reservations["reserved_sell_qty"].get(code, 0.0))
         try:
             self.control.pretrade_guard(side, code, qty, limit_price,
                                         pending_buy_notional=pending_buy,
@@ -767,6 +814,8 @@ class MoomooClient:
                    "config_version": int(control_state.config_version),
                    "account_isolation_mode": self.settings.account_isolation_mode,
                    "sync_fingerprint": self.current_sync_fingerprint()}
+        if auto_intent_id is not None:
+            payload["auto_intent_id"] = str(auto_intent_id)
         token = self._sign_preview(payload)
         # A durable ready record is required before the preview can leave the
         # server. If the audit DB is unavailable, preview fails closed.
@@ -829,7 +878,8 @@ class MoomooClient:
             fresh = self.preview_order(code=payload["code"], side=payload["side"],
                                        qty=payload["qty"], limit_price=payload["limit_price"],
                                        session=payload.get("session", "RTH"),
-                                       _register=False)
+                                       _register=False,
+                                       auto_intent_id=payload.get("auto_intent_id"))
             if int(payload.get("config_version", -1)) != int(fresh.get("config_version", -2)):
                 raise LiveTradeRejected("Strategy configuration changed after order preview")
             if payload.get("account_isolation_mode") != fresh.get("account_isolation_mode"):
@@ -843,26 +893,44 @@ class MoomooClient:
             if ("fill_outside_rth" not in payload
                     or bool(payload["fill_outside_rth"]) != bool(fresh["fill_outside_rth"])):
                 raise LiveTradeRejected("Extended-hours fill policy changed after order preview")
+            if payload.get("auto_intent_id") != fresh.get("auto_intent_id"):
+                raise LiveTradeRejected("Automatic order intent changed after order preview")
+            if payload.get("auto_intent_id"):
+                intent = self.control.get_auto_order_intent(payload["auto_intent_id"])
+                if (not intent or intent.get("status") != "DISPATCHING"
+                        or intent.get("preview_id") != payload.get("preview_id")):
+                    raise LiveTradeRejected("Automatic order intent is not bound to this preview")
             with self._trade_context() as ctx:
                 account_id = self._select_account_id(self._account_rows(ctx))
                 if account_id != self.settings.account_id or account_id != int(payload["account_id"]):
                     raise LiveTradeRejected("Final Moomoo account does not match the signed preview")
                 self._result(ctx.unlock_trade(password_md5=self.settings.password_md5), "trade unlock")
+                guard_fn = getattr(self.control, "final_dispatch_guard", None)
+                guard = cast(ContextManager[None], (
+                    guard_fn(payload["config_version"],
+                             auto_intent_id=payload.get("auto_intent_id"),
+                             preview_id=payload.get("preview_id"))
+                    if callable(guard_fn) else nullcontext()
+                ))
                 try:
-                    broker_result = ctx.place_order(
-                        price=fresh["limit_price"], qty=fresh["qty"], code=fresh["code"],
-                        trd_side=getattr(sdk.TrdSide, fresh["side"]),
-                        order_type=sdk.OrderType.NORMAL, trd_env=sdk.TrdEnv.REAL,
-                        acc_id=account_id, time_in_force="DAY",
-                        fill_outside_rth=bool(fresh["fill_outside_rth"]),
-                        session=(sdk.Session.OVERNIGHT if fresh["session"] == "OVERNIGHT"
-                                 else sdk.Session.RTH),
-                        remark=f"dashboard:{self.settings.strategy_id}:{payload['preview_id']}",
-                    )
-                except Exception as exc:
-                    raise BrokerOutcomeUnknown(
-                        "Moomoo order outcome is unknown; reconcile orders before retrying"
-                    ) from exc
+                    with guard:
+                        try:
+                            broker_result = ctx.place_order(
+                                price=fresh["limit_price"], qty=fresh["qty"], code=fresh["code"],
+                                trd_side=getattr(sdk.TrdSide, fresh["side"]),
+                                order_type=sdk.OrderType.NORMAL, trd_env=sdk.TrdEnv.REAL,
+                                acc_id=account_id, time_in_force="DAY",
+                                fill_outside_rth=bool(fresh["fill_outside_rth"]),
+                                session=(sdk.Session.OVERNIGHT if fresh["session"] == "OVERNIGHT"
+                                         else sdk.Session.RTH),
+                                remark=f"dashboard:{self.settings.strategy_id}:{payload['preview_id']}",
+                            )
+                        except Exception as exc:
+                            raise BrokerOutcomeUnknown(
+                                "Moomoo order outcome is unknown; reconcile orders before retrying"
+                            ) from exc
+                except ControlRejected as exc:
+                    raise LiveTradeRejected(str(exc)) from exc
                 result = self._records(self._result(broker_result, "place order"))
         return {"accepted": True, "source": "Moomoo OpenD", "preview_id": payload["preview_id"],
                 "order": result[0] if result else {}}

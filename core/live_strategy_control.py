@@ -50,6 +50,14 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 _LONG_NUMBER = re.compile(r"\b\d{6,}\b")
 _OPAQUE_WITH_DIGIT = re.compile(r"\b(?=[A-Za-z0-9_-]{12,}\b)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\b")
+_INTENT_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+AUTO_INTENT_STATUSES = frozenset({
+    "PLANNED", "RESERVED", "DISPATCHING", "ACKED", "PARTIAL",
+    "FILLED", "CANCELLED", "FAILED", "UNKNOWN",
+})
+AUTO_INTENT_TERMINAL = frozenset({"FILLED", "CANCELLED", "FAILED"})
+AUTO_INTENT_UNRESOLVED = frozenset({"PLANNED", "RESERVED", "DISPATCHING", "ACKED", "PARTIAL", "UNKNOWN"})
 
 
 class ControlRejected(RuntimeError):
@@ -105,13 +113,26 @@ class RiskSnapshot:
 
 
 class LiveStrategyStore:
-    def __init__(self, path: str | Path = DB_PATH, archive_dir: str | Path = ARCHIVE_DIR):
+    def __init__(self, path: str | Path = DB_PATH, archive_dir: str | Path = ARCHIVE_DIR,
+                 *, read_only: bool = False):
         self.path = Path(path)
         self.archive_dir = Path(archive_dir)
-        self._initialize()
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            self._initialize()
 
     @contextmanager
     def connect(self):
+        if self.read_only:
+            resolved = self.path.expanduser().resolve(strict=True)
+            con = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True, timeout=20)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA query_only=ON")
+            try:
+                yield con
+            finally:
+                con.close()
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(str(self.path), timeout=20)
         con.row_factory = sqlite3.Row
@@ -231,6 +252,32 @@ class LiveStrategyStore:
                     return_pct REAL,
                     PRIMARY KEY(series_id,ts)
                 );
+                CREATE TABLE IF NOT EXISTS auto_order_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    payload_hash TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    config_version INTEGER NOT NULL,
+                    signal_batch_id TEXT NOT NULL,
+                    signal_source_date TEXT NOT NULL,
+                    factor_set_hash TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+                    purpose TEXT NOT NULL,
+                    target_qty REAL NOT NULL CHECK(target_qty>=0),
+                    order_qty REAL NOT NULL CHECK(order_qty>0),
+                    limit_price REAL NOT NULL CHECK(limit_price>0),
+                    status TEXT NOT NULL CHECK(status IN
+                        ('PLANNED','RESERVED','DISPATCHING','ACKED','PARTIAL',
+                         'FILLED','CANCELLED','FAILED','UNKNOWN')),
+                    preview_id TEXT,
+                    reserved_notional REAL NOT NULL CHECK(reserved_notional>=0),
+                    reserved_sell_qty REAL NOT NULL CHECK(reserved_sell_qty>=0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error_code TEXT
+                );
+                CREATE INDEX IF NOT EXISTS auto_order_intents_status
+                    ON auto_order_intents(status,created_at);
             """)
             columns = {row[1] for row in con.execute("PRAGMA table_info(strategy_state)")}
             if "required_sync_after" not in columns:
@@ -515,6 +562,314 @@ class LiveStrategyStore:
             row = con.execute("SELECT quantity FROM owned_positions WHERE symbol=?", (symbol.upper(),)).fetchone()
         return float(row[0]) if row else 0.0
 
+    @staticmethod
+    def _auto_intent_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def get_auto_order_intent(self, intent_id: str) -> dict[str, Any] | None:
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (str(intent_id),)
+            ).fetchone()
+        return self._auto_intent_dict(row) if row else None
+
+    def list_auto_order_intents(self, status: str | None = None,
+                                limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        params: tuple[Any, ...]
+        query = "SELECT * FROM auto_order_intents"
+        if status is not None:
+            normalized = str(status).upper()
+            if normalized not in AUTO_INTENT_STATUSES:
+                raise ControlRejected("Invalid auto intent status")
+            query += " WHERE status=?"
+            params = (normalized, safe_limit)
+        else:
+            params = (safe_limit,)
+        query += " ORDER BY created_at DESC,intent_id DESC LIMIT ?"
+        with self.connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [self._auto_intent_dict(row) for row in rows]
+
+    def auto_intent_reservations(self, exclude_intent_id: str | None = None) -> dict[str, Any]:
+        """Return nonterminal reservations for a final, race-safe order preview."""
+        query = ("SELECT symbol,reserved_notional,reserved_sell_qty FROM auto_order_intents "
+                 "WHERE status NOT IN ('FILLED','CANCELLED','FAILED')")
+        params: tuple[Any, ...] = ()
+        if exclude_intent_id is not None:
+            query += " AND intent_id<>?"
+            params = (str(exclude_intent_id),)
+        with self.connect() as con:
+            rows = con.execute(query, params).fetchall()
+        sell: dict[str, float] = {}
+        buy = 0.0
+        for row in rows:
+            buy += float(row["reserved_notional"])
+            quantity = float(row["reserved_sell_qty"])
+            if quantity > 0:
+                symbol = str(row["symbol"])
+                sell[symbol] = sell.get(symbol, 0.0) + quantity
+        return {"reserved_buy_notional": buy, "reserved_sell_qty": sell}
+
+    def create_auto_order_intent(
+        self, *, strategy_id: str, config_version: int, signal_batch_id: str,
+        signal_source_date: str, factor_set_hash: str, symbol: str, side: str,
+        purpose: str, target_qty: float, order_qty: float, limit_price: float,
+        broker_pending_buy_notional: float = 0.0,
+        broker_pending_sell_qty: float = 0.0,
+        daily_order_notional: float = 0.0,
+    ) -> dict[str, Any]:
+        """Atomically create and reserve a deterministic at-most-once intent."""
+        strategy_id = str(strategy_id).strip()
+        signal_batch_id = str(signal_batch_id).strip()
+        signal_source_date = str(signal_source_date).strip()
+        factor_set_hash = str(factor_set_hash).strip().lower()
+        symbol = str(symbol).strip().upper()
+        side = str(side).strip().upper()
+        purpose = str(purpose).strip().upper()
+        if not all((strategy_id, signal_batch_id, signal_source_date,
+                    factor_set_hash, symbol, purpose)):
+            raise ControlRejected("Auto intent identity fields are required")
+        if strategy_id != "B16" or not symbol.startswith("US."):
+            raise ControlRejected("Auto intents are restricted to B16 US symbols")
+        if not _HEX64.fullmatch(signal_batch_id.lower()) or not _HEX64.fullmatch(factor_set_hash):
+            raise ControlRejected("Auto intent signal hashes must be SHA-256")
+        if side not in {"BUY", "SELL"}:
+            raise ControlRejected("Only BUY and SELL are supported")
+        allowed_purposes = {"TARGET_BUY": "BUY", "RANK_EXIT": "SELL", "STOP_LOSS": "SELL"}
+        if purpose not in allowed_purposes or allowed_purposes[purpose] != side:
+            raise ControlRejected("Auto intent purpose does not match side")
+        if isinstance(config_version, bool):
+            raise ControlRejected("Invalid config_version")
+        raw_config_version = config_version
+        try:
+            config_version = int(raw_config_version)
+        except (TypeError, ValueError) as exc:
+            raise ControlRejected("Invalid config_version") from exc
+        if isinstance(raw_config_version, float) and raw_config_version != config_version:
+            raise ControlRejected("Invalid config_version")
+        if isinstance(raw_config_version, str) and raw_config_version.strip() != str(config_version):
+            raise ControlRejected("Invalid config_version")
+        target_qty = _finite(target_qty, "target_qty")
+        order_qty = _finite(order_qty, "order_qty")
+        limit_price = _finite(limit_price, "limit_price")
+        broker_pending_buy_notional = _finite(
+            broker_pending_buy_notional, "broker_pending_buy_notional"
+        )
+        broker_pending_sell_qty = _finite(
+            broker_pending_sell_qty, "broker_pending_sell_qty"
+        )
+        daily_order_notional = _finite(daily_order_notional, "daily_order_notional")
+        if (target_qty < 0 or order_qty <= 0 or limit_price <= 0
+                or broker_pending_buy_notional < 0 or broker_pending_sell_qty < 0
+                or daily_order_notional < 0):
+            raise ControlRejected("Invalid auto intent quantity, price, or pending reservation")
+        if target_qty != int(target_qty) or order_qty != int(order_qty):
+            raise ControlRejected("US auto intents require whole-share quantities")
+
+        key_payload = {
+            "config_version": config_version, "purpose": purpose, "side": side,
+            "signal_batch_id": signal_batch_id, "strategy_id": strategy_id,
+            "symbol": symbol, "target_qty": target_qty, "order_qty": order_qty,
+        }
+        payload = {
+            **key_payload, "signal_source_date": signal_source_date,
+            "factor_set_hash": factor_set_hash,
+            "limit_price": limit_price,
+        }
+        canonical_key = json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
+        canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        intent_id = hashlib.sha256(canonical_key.encode()).hexdigest()
+        payload_hash = hashlib.sha256(canonical_payload.encode()).hexdigest()
+        conflict = False
+        result: dict[str, Any] | None = None
+
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            existing = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if existing:
+                if hmac.compare_digest(str(existing["payload_hash"]), payload_hash):
+                    result = self._auto_intent_dict(existing)
+                else:
+                    now = utcnow()
+                    con.execute(
+                        "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                        "freeze_reason='auto_intent_payload_conflict',updated_at=?,"
+                        "required_sync_after=? WHERE id=1", (now, now)
+                    )
+                    self._event_tx(
+                        con, "auto_intent_payload_conflict", "auto_executor", "critical",
+                        "Deterministic auto intent key received a conflicting payload",
+                        {"intent_id_hash": intent_id},
+                    )
+                    conflict = True
+            else:
+                state = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
+                if state["lifecycle"] != "ACTIVE":
+                    raise ControlRejected(
+                        f"Trading system is {state['lifecycle']}: "
+                        f"{state['freeze_reason'] or 'not armed'}"
+                    )
+                if int(state["config_version"]) != config_version or str(state["strategy_id"]) != strategy_id:
+                    raise ControlRejected("Auto intent does not match active strategy configuration")
+                if float(state["strategy_equity"]) <= float(state["loss_floor"]):
+                    raise ControlRejected("Strategy equity reached the immutable USD 7,500 loss floor")
+                if con.execute(
+                    "SELECT 1 FROM auto_order_intents "
+                    "WHERE status NOT IN ('FILLED','CANCELLED','FAILED') LIMIT 1"
+                ).fetchone():
+                    raise ControlRejected("An unresolved auto intent globally blocks creation")
+                config_row = con.execute(
+                    "SELECT config_json FROM strategy_config WHERE active=1 AND version=?",
+                    (config_version,),
+                ).fetchone()
+                if not config_row:
+                    raise ControlRejected("Active strategy configuration is missing")
+                config = json.loads(config_row["config_json"])
+                notional = order_qty * limit_price
+                if notional > float(config["max_order_notional"]) + 1e-6:
+                    raise ControlRejected("Auto intent exceeds configured maximum order notional")
+                if daily_order_notional + notional > float(config["max_daily_order_notional"]) + 1e-6:
+                    raise ControlRejected("Auto intent exceeds configured daily order notional")
+                reservations = con.execute(
+                    "SELECT COALESCE(SUM(reserved_notional),0) AS buy_notional "
+                    "FROM auto_order_intents WHERE status NOT IN ('FILLED','CANCELLED','FAILED')"
+                ).fetchone()
+                auto_buy = float(reservations["buy_notional"])
+                if side == "BUY":
+                    broker_buy = max(float(state["reserved_buy_notional"]),
+                                     broker_pending_buy_notional)
+                    projected = float(state["owned_market_value"]) + broker_buy + auto_buy + notional
+                    if projected > float(state["exposure_cap"]) + 1e-6:
+                        raise ControlRejected("Projected strategy exposure exceeds immutable USD 10,000 cap")
+                    if broker_buy + auto_buy + notional > float(state["allocated_cash"]) + 1e-6:
+                        raise ControlRejected("Auto intent exceeds strategy sub-ledger cash")
+                    reserved_notional, reserved_sell_qty = notional, 0.0
+                else:
+                    row = con.execute(
+                        "SELECT quantity FROM owned_positions WHERE symbol=?", (symbol,)
+                    ).fetchone()
+                    owned = float(row["quantity"]) if row else 0.0
+                    row = con.execute(
+                        "SELECT COALESCE(SUM(reserved_sell_qty),0) AS qty "
+                        "FROM auto_order_intents WHERE symbol=? "
+                        "AND status NOT IN ('FILLED','CANCELLED','FAILED')", (symbol,)
+                    ).fetchone()
+                    if broker_pending_sell_qty + float(row["qty"]) + order_qty > owned + 1e-9:
+                        raise ControlRejected("Cannot reserve more than strategy-owned shares")
+                    reserved_notional, reserved_sell_qty = 0.0, order_qty
+                now = utcnow()
+                con.execute(
+                    """INSERT INTO auto_order_intents
+                    (intent_id,payload_hash,strategy_id,config_version,signal_batch_id,
+                     signal_source_date,factor_set_hash,symbol,side,purpose,target_qty,
+                     order_qty,limit_price,status,preview_id,reserved_notional,
+                     reserved_sell_qty,created_at,updated_at,error_code)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',NULL,?,?,?,?,NULL)""",
+                    (intent_id, payload_hash, strategy_id, config_version, signal_batch_id,
+                     signal_source_date, factor_set_hash, symbol, side, purpose, target_qty,
+                     order_qty, limit_price, reserved_notional, reserved_sell_qty, now, now),
+                )
+                result = self._auto_intent_dict(con.execute(
+                    "SELECT * FROM auto_order_intents WHERE intent_id=?", (intent_id,)
+                ).fetchone())
+        if conflict:
+            raise ControlRejected("Deterministic auto intent payload conflict; trading frozen")
+        if result is None:
+            raise ControlRejected("Auto intent creation failed")
+        return result
+
+    _AUTO_TRANSITIONS = {
+        "PLANNED": frozenset({"RESERVED", "CANCELLED", "FAILED"}),
+        "RESERVED": frozenset({"DISPATCHING", "CANCELLED", "FAILED"}),
+        "DISPATCHING": frozenset({"ACKED", "PARTIAL", "FILLED", "CANCELLED", "FAILED", "UNKNOWN"}),
+        "UNKNOWN": frozenset({"ACKED", "PARTIAL", "FILLED", "CANCELLED", "FAILED"}),
+        "ACKED": frozenset({"PARTIAL", "FILLED", "CANCELLED", "FAILED", "UNKNOWN"}),
+        "PARTIAL": frozenset({"FILLED", "CANCELLED", "FAILED", "UNKNOWN"}),
+        "FILLED": frozenset(), "CANCELLED": frozenset(), "FAILED": frozenset(),
+    }
+
+    def _mark_auto_intent(self, intent_id: str, status: str, *,
+                          preview_id: str | None = None,
+                          error_code: str | None = None) -> dict[str, Any]:
+        status = str(status).upper()
+        if status not in AUTO_INTENT_STATUSES:
+            raise ControlRejected("Invalid auto intent status")
+        if error_code is not None and not _INTENT_ERROR_CODE.fullmatch(str(error_code)):
+            raise ControlRejected("Invalid error_code; use a secret-free symbolic code")
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (str(intent_id),)
+            ).fetchone()
+            if not row:
+                raise ControlRejected("Auto intent not found")
+            current = str(row["status"])
+            if status not in self._AUTO_TRANSITIONS[current]:
+                raise ControlRejected(f"Illegal auto intent transition {current}->{status}")
+            if status == "DISPATCHING":
+                preview_id = str(preview_id or "").strip()
+                if not preview_id or len(preview_id) > 128 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", preview_id):
+                    raise ControlRejected("A valid secret-free preview_id is required")
+            elif preview_id is not None:
+                raise ControlRejected("preview_id can only be bound when dispatching")
+            release = status in {"FILLED", "CANCELLED", "FAILED"}
+            con.execute(
+                "UPDATE auto_order_intents SET status=?,preview_id=COALESCE(?,preview_id),"
+                "error_code=?,reserved_notional=CASE WHEN ? THEN 0 ELSE reserved_notional END,"
+                "reserved_sell_qty=CASE WHEN ? THEN 0 ELSE reserved_sell_qty END,"
+                "updated_at=? WHERE intent_id=?",
+                (status, preview_id, error_code, release, release, utcnow(), str(intent_id)),
+            )
+            updated = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (str(intent_id),)
+            ).fetchone()
+        return self._auto_intent_dict(updated)
+
+    def handoff_auto_intent_reservation(self, intent_id: str) -> dict[str, Any]:
+        """Release local reservation only after caller proves Broker order visibility."""
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (str(intent_id),)
+            ).fetchone()
+            if not row or str(row["status"]) not in {"ACKED", "PARTIAL"}:
+                raise ControlRejected("Broker reservation handoff requires ACKED or PARTIAL intent")
+            con.execute(
+                "UPDATE auto_order_intents SET reserved_notional=0,reserved_sell_qty=0,"
+                "updated_at=? WHERE intent_id=?", (utcnow(), str(intent_id)),
+            )
+            updated = con.execute(
+                "SELECT * FROM auto_order_intents WHERE intent_id=?", (str(intent_id),)
+            ).fetchone()
+        return self._auto_intent_dict(updated)
+
+    def mark_auto_intent_dispatching(self, intent_id: str, preview_id: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "DISPATCHING", preview_id=preview_id)
+
+    def mark_auto_intent_acked(self, intent_id: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "ACKED")
+
+    def mark_auto_intent_partial(self, intent_id: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "PARTIAL")
+
+    def mark_auto_intent_filled(self, intent_id: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "FILLED")
+
+    def mark_auto_intent_cancelled(self, intent_id: str,
+                                   error_code: str | None = None) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "CANCELLED", error_code=error_code)
+
+    def mark_auto_intent_failed(self, intent_id: str,
+                                error_code: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "FAILED", error_code=error_code)
+
+    def mark_auto_intent_unknown(self, intent_id: str,
+                                 error_code: str) -> dict[str, Any]:
+        return self._mark_auto_intent(intent_id, "UNKNOWN", error_code=error_code)
+
     def add_external_symbols(self, symbols: list[str], source: str) -> int:
         normalized = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
         if not normalized:
@@ -623,6 +978,30 @@ class LiveStrategyStore:
                     and hmac.compare_digest(str(runtime["fingerprint"]), fingerprint)
                     and hmac.compare_digest(str(proof["fingerprint"]), fingerprint)
                     and str(proof["synced_at"]) == str(state["last_sync_at"]))
+
+    @contextmanager
+    def final_dispatch_guard(self, config_version: int, *,
+                             auto_intent_id: str | None = None,
+                             preview_id: str | None = None):
+        """Hold the strategy DB write lock across the final Broker mutation."""
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            state = con.execute(
+                "SELECT lifecycle,config_version FROM strategy_state WHERE id=1"
+            ).fetchone()
+            if (not state or state["lifecycle"] != "ACTIVE"
+                    or int(state["config_version"]) != int(config_version)):
+                raise ControlRejected("Strategy lifecycle or configuration changed at dispatch")
+            if auto_intent_id is not None:
+                intent = con.execute(
+                    "SELECT config_version,status,preview_id FROM auto_order_intents WHERE intent_id=?",
+                    (str(auto_intent_id),),
+                ).fetchone()
+                if (not intent or int(intent["config_version"]) != int(config_version)
+                        or intent["status"] != "DISPATCHING"
+                        or str(intent["preview_id"] or "") != str(preview_id or "")):
+                    raise ControlRejected("Automatic intent changed at dispatch")
+            yield
 
     def pretrade_guard(self, side: str, symbol: str, quantity: float,
                        limit_price: float, pending_buy_notional: float = 0.0,

@@ -10,13 +10,14 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from core.moomoo_audit import (
-    append_audit, finalize_preview, known_module_order_ids,
+    append_audit, known_module_order_ids,
     nav_history, recent_audit, record_nav_snapshot, unresolved_preview_count,
 )
 from core.moomoo_client import (
     BrokerOutcomeUnknown, LiveTradeRejected, MoomooClient, MoomooUnavailable,
 )
 from core.live_strategy_control import ControlRejected
+from core.live_order_service import dispatch_signed_preview
 
 router = APIRouter(prefix="/api/live-account", tags=["live_account"])
 _client = MoomooClient()
@@ -301,37 +302,12 @@ async def place_order(req: OrderPlaceRequest, x_moomoo_trade_token: str = Header
     if req.confirmation != "PLACE LIVE ORDER":
         append_audit("place_rejected", False, {"error": "confirmation phrase mismatch"})
         raise HTTPException(status_code=400, detail="Type PLACE LIVE ORDER to confirm")
-    client = get_client()
-    preview = {}
     try:
-        preview = client.verify_preview(req.preview_token)
-        client.authenticate_trade_token(x_moomoo_trade_token)
-        # Durable attempt record is a prerequisite to any broker mutation.
-        append_audit("place_attempt", False, preview)
-        result = await asyncio.to_thread(client.place_order, req.preview_token, x_moomoo_trade_token)
-        order = result.get("order") or {}
-        try:
-            finalize_preview(preview["preview_id"], "accepted", str(order.get("order_id") or ""))
-            append_audit("place", True, {**preview, "order_id": order.get("order_id")})
-            result["audit_status"] = "recorded"
-        except Exception:
-            result["audit_status"] = "pending_reconciliation"
-        return result
-    except BrokerOutcomeUnknown as exc:
-        if preview.get("preview_id"):
-            try:
-                finalize_preview(preview["preview_id"], "unknown")
-                append_audit("place_unknown", False, {**preview, "error": str(exc)})
-            except Exception:
-                pass
-        _error(exc)
-    except (MoomooUnavailable, LiveTradeRejected) as exc:
-        if preview.get("preview_id"):
-            try:
-                finalize_preview(preview["preview_id"], "failed")
-            except Exception:
-                pass
-        append_audit("place", False, {**preview, "error": str(exc)})
+        return await asyncio.to_thread(
+            dispatch_signed_preview, get_client(), req.preview_token,
+            x_moomoo_trade_token, source="manual_api",
+        )
+    except (BrokerOutcomeUnknown, MoomooUnavailable, LiveTradeRejected) as exc:
         _error(exc)
 
 

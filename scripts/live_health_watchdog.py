@@ -46,6 +46,21 @@ def unknown_mutations() -> int:
         con.close()
 
 
+def auto_intent_health_problems(intents: list[dict], now: datetime) -> list[str]:
+    problems = []
+    for intent in intents:
+        status = str(intent.get("status") or "")
+        updated = parse_time(intent.get("updated_at"))
+        age = (now - updated).total_seconds() if updated else float("inf")
+        if status == "UNKNOWN":
+            problems.append("AUTO_INTENT_OUTCOME_UNKNOWN")
+        elif status == "DISPATCHING" and age > 5 * 60:
+            problems.append("AUTO_INTENT_DISPATCH_STALE")
+        elif status in {"RESERVED", "ACKED", "PARTIAL"} and age > 20 * 60:
+            problems.append("AUTO_INTENT_STALE:" + status)
+    return problems
+
+
 def diagnose(mutate: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     store = LiveStrategyStore()
@@ -58,6 +73,7 @@ def diagnose(mutate: bool = True) -> dict:
         problems.append("EXPOSURE_CAP_BREACH")
     if unknown_mutations():
         problems.append("BROKER_OUTCOME_REQUIRES_RECONCILIATION")
+    problems.extend(auto_intent_health_problems(store.list_auto_order_intents(limit=1000), now))
     if state.lifecycle == "ACTIVE":
         synced = parse_time(state.last_sync_at)
         if not synced or (now - synced).total_seconds() > 7 * 60:
