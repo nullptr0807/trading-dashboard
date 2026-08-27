@@ -44,10 +44,16 @@ def number(row: dict[str, Any], *keys: str) -> float:
 def fee_total(row: dict[str, Any]) -> float:
     for key in ("total_fee", "fee_amount", "total_fees"):
         if row.get(key) is not None:
-            return max(0.0, number(row, key))
-    return max(0.0, sum(number(row, key) for key in (
+            value = number(row, key)
+            if value < 0:
+                raise ControlRejected("Moomoo fee record contains a negative amount")
+            return value
+    values = [number(row, key) for key in (
         "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee"
-    )))
+    )]
+    if any(value < 0 for value in values):
+        raise ControlRejected("Moomoo fee record contains a negative component")
+    return sum(values)
 
 
 def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> dict[str, Any]:
@@ -94,20 +100,29 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         oid = str(deal.get("order_id") or "")
         if oid in module_orders:
             deals_by_order.setdefault(oid, []).append(deal)
+    preview_finalizations = []
     if ownership_proof is None:
         for order_id, order in module_orders.items():
             preview_id = str(order.get("remark") or "").rsplit(":", 1)[-1]
             if is_module_preview(preview_id, account_id) and not is_module_order(order_id, account_id):
                 status = str(order.get("order_status") or "").upper()
                 failed = status in {"CANCELLED_ALL", "FAILED", "DISABLED", "DELETED"} and not deals_by_order.get(order_id)
-                finalize_preview(preview_id, "failed" if failed else "accepted",
-                                 None if failed else order_id)
-    applied = 0
+                preview_finalizations.append(
+                    (preview_id, "failed" if failed else "accepted", None if failed else order_id)
+                )
+    staged_fills = []
     for order_id, deals in deals_by_order.items():
         order = module_orders[order_id]
-        total_qty = number(order, "dealt_qty") or sum(number(d, "deal_qty", "qty") for d in deals)
-        if total_qty <= 0:
+        deal_qty_total = sum(number(d, "deal_qty", "qty") for d in deals)
+        dealt_qty = number(order, "dealt_qty")
+        order_qty = number(order, "qty")
+        if dealt_qty <= 0 or deal_qty_total <= 0:
             raise ControlRejected("Module order has deals but no valid dealt quantity")
+        if abs(dealt_qty - deal_qty_total) > 1e-9:
+            raise ControlRejected("Module order dealt quantity differs from deal detail total")
+        if order_qty <= 0 or dealt_qty > order_qty + 1e-9:
+            raise ControlRejected("Module order dealt quantity exceeds authorized order quantity")
+        total_qty = deal_qty_total
         total_fee = fee_by_order.get(order_id)
         if total_fee is None:
             raise ControlRejected("Moomoo fee record missing for a module order")
@@ -115,52 +130,113 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             deal_ref = deal.get("deal_id")
             qty = number(deal, "deal_qty", "qty")
             price = number(deal, "deal_price", "price")
-            side = str(deal.get("trd_side") or order.get("trd_side") or "").upper()
-            symbol = str(deal.get("code") or order.get("code") or "").upper()
+            side = str(deal.get("trd_side") or "").upper()
+            symbol = str(deal.get("code") or "").upper()
+            if not symbol or side not in {"BUY", "SELL"}:
+                raise ControlRejected("Moomoo deal must explicitly provide symbol and side")
+            if symbol != str(order.get("code") or "").upper():
+                raise ControlRejected("Moomoo deal symbol differs from its authorized order")
+            if side != str(order.get("trd_side") or "").upper():
+                raise ControlRejected("Moomoo deal side differs from its authorized order")
             if not deal_ref or side not in {"BUY", "SELL"} or not symbol or qty <= 0 or price <= 0:
                 raise ControlRejected("Malformed module-tagged Moomoo deal")
             allocated_fee = total_fee * qty / total_qty
-            if store.apply_fill(str(deal_ref), symbol, side, qty, price, allocated_fee):
-                applied += 1
-    owned = store.positions()
+            staged_fills.append({
+                "external_reference": str(deal_ref), "symbol": symbol,
+                "side": side, "quantity": qty, "price": price, "fee": allocated_fee,
+            })
     broker_positions = {str(row.get("code") or "").upper(): number(row, "qty")
                         for row in snapshot.get("positions", [])}
-    owned_symbols = {row["symbol"] for row in owned}
-    external = [symbol for symbol, qty in broker_positions.items()
-                if qty > 1e-9 and symbol not in owned_symbols]
     settings = getattr(client, "settings", None)
-    shared_read_only = bool(
-        settings
-        and not settings.dedicated_account_confirmed
-        and not settings.trading_enabled
-        and not settings.auto_trading_enabled
+    if not settings or not hasattr(settings, "account_mode"):
+        raise ControlRejected("Explicit Moomoo account_mode is required for reconciliation")
+    dedicated = bool(settings.dedicated_account_confirmed)
+    shared_accepted = bool(settings and getattr(settings, "shared_account_risk_accepted", False))
+    baseline_confirmed = bool(settings and getattr(settings, "shared_account_baseline_confirmed", False))
+    configured_mode = str(settings.account_mode).upper()
+    account_isolation_mode = (
+        "dedicated" if configured_mode == "DEDICATED" and dedicated
+        and not shared_accepted and not baseline_confirmed else
+        "shared_restricted" if configured_mode == "SHARED_RESTRICTED"
+        and shared_accepted and baseline_confirmed and not dedicated else
+        "unverified" if configured_mode == "UNVERIFIED"
+        and not dedicated and not shared_accepted and not baseline_confirmed else "invalid"
     )
-    if external and not shared_read_only:
+    shared_read_only = bool(
+        settings and account_isolation_mode == "unverified"
+        and not settings.trading_enabled and not settings.auto_trading_enabled
+    )
+    if account_isolation_mode == "invalid":
+        raise ControlRejected("Invalid account isolation configuration cannot produce a broker sync proof")
+    shared_external_allowed = shared_read_only or account_isolation_mode == "shared_restricted"
+    owned_before = {row["symbol"] for row in store.positions()}
+    nonmodule_order_ids = {
+        str(row.get("order_id") or "") for row in snapshot.get("orders", [])
+        if str(row.get("order_id") or "") not in module_orders
+    }
+    nonmodule_activity_symbols = {
+        str(row.get("code") or "").upper() for row in snapshot.get("orders", [])
+        if str(row.get("order_id") or "") in nonmodule_order_ids and row.get("code")
+    }
+    nonmodule_activity_symbols.update(
+        str(row.get("code") or "").upper() for row in snapshot.get("deals", [])
+        if str(row.get("order_id") or "") not in module_orders and row.get("code")
+    )
+    manual_owned_conflicts = owned_before & nonmodule_activity_symbols
+    if manual_owned_conflicts:
+        store.record_manual_conflicts(
+            sorted(manual_owned_conflicts), "non_module_activity_on_strategy_owned_symbol"
+        )
+        raise ControlRejected(
+            "Strategy-owned symbol has non-module broker activity; possible manual lot disturbance"
+        )
+    staged_symbols = {str(fill["symbol"]).upper() for fill in staged_fills}
+    if account_isolation_mode != "dedicated":
+        external_now = {
+            symbol for symbol, qty in broker_positions.items()
+            if qty > 1e-9 and symbol not in owned_before and symbol not in staged_symbols
+        }
+        store.add_external_symbols(
+            sorted(external_now | nonmodule_activity_symbols), "broker_external_history"
+        )
+    denied_staged = staged_symbols & store.denied_symbols()
+    if denied_staged:
+        raise ControlRejected("Module fill symbol belongs to persistent external-symbol denylist")
+    unrelated_external = [
+        symbol for symbol, qty in broker_positions.items()
+        if qty > 1e-9 and symbol not in owned_before and symbol not in staged_symbols
+    ]
+    if unrelated_external and not shared_external_allowed:
         raise ControlRejected(
             "Dedicated strategy account contains external holdings; strong isolation proof failed"
         )
-    if external:
-        store.event(
-            "shared_account_external_holdings", "moomoo_reconciler", "info",
-            "Shared-account holdings observed in read-only mode and excluded from the strategy ledger",
-            {"count": len(external)},
-        )
-    for row in owned:
-        broker_qty = broker_positions.get(row["symbol"], 0.0)
-        owned_qty = float(row["quantity"])
-        if abs(broker_qty - owned_qty) > 1e-9:
-            raise ControlRejected(
-                "Broker quantity differs from strategy-owned quantity; possible external lot overlap or corporate action"
-            )
-    prices = {row["symbol"]: client.quote(row["symbol"])["last_price"] for row in owned}
+    prospective_symbols = owned_before | staged_symbols
+    prices = {symbol: client.quote(symbol)["last_price"] for symbol in prospective_symbols}
     pending_buy = sum(
         max(0.0, number(row, "qty") - number(row, "dealt_qty")) * number(row, "price")
         for row in module_orders.values()
         if str(row.get("trd_side") or "").upper() == "BUY"
         and str(row.get("order_status") or "").upper() not in TERMINAL
     )
-    store.set_reserved_buy_notional(pending_buy)
-    state = store.mark_to_market(prices, sync_complete=True)
+    fingerprint_fn = getattr(client, "current_sync_fingerprint", None)
+    fingerprint = str(fingerprint_fn()) if callable(fingerprint_fn) else "test-sync-fingerprint"
+    store.observe_runtime_fingerprint(fingerprint)
+    applied = store.apply_fill_batch(
+        staged_fills, broker_positions, prices, pending_buy, fingerprint,
+    )
+    for preview_id, status, order_id in preview_finalizations:
+        finalize_preview(preview_id, status, order_id)
+    owned = store.positions()
+    owned_symbols = {row["symbol"] for row in owned}
+    external = [symbol for symbol, qty in broker_positions.items()
+                if qty > 1e-9 and symbol not in owned_symbols]
+    if external:
+        store.event(
+            "shared_account_external_holdings", "moomoo_reconciler", "info",
+            "Shared-account holdings observed in read-only mode and excluded from the strategy ledger",
+            {"count": len(external)},
+        )
+    state = store.snapshot()
     cancellation = None
     settings = getattr(client, "settings", None)
     if (state.lifecycle == "FROZEN" and settings
@@ -173,6 +249,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                         "Risk freeze could not confirm cancellation of module orders", {})
     result = {"ok": True, "applied_fills": applied, "owned_positions": len(owned),
               "external_positions": len(external), "shared_read_only": shared_read_only,
+              "account_isolation_mode": account_isolation_mode,
               "equity": state.strategy_equity, "market_value": state.owned_market_value,
               "lifecycle": state.lifecycle, "freeze_reason": state.freeze_reason,
               "cancellation": cancellation}

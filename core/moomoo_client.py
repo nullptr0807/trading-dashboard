@@ -22,7 +22,8 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from core.moomoo_audit import (
-    account_execution_lock, claim_preview, is_module_order, is_module_preview, register_preview,
+    account_execution_lock, claim_preview, is_module_order, is_module_preview,
+    module_preview_record, register_preview,
 )
 from core.live_strategy_control import ControlRejected, LiveStrategyStore
 from core.live_logging import get_live_logger, log_event
@@ -94,7 +95,10 @@ class MoomooSettings:
     activity_lookback_days: int = 90
     read_api_token: str = ""
     control_api_token: str = ""
+    account_mode: str = "UNVERIFIED"
     dedicated_account_confirmed: bool = False
+    shared_account_risk_accepted: bool = False
+    shared_account_baseline_confirmed: bool = False
 
     @classmethod
     def from_env(cls) -> "MoomooSettings":
@@ -128,8 +132,28 @@ class MoomooSettings:
             activity_lookback_days=_int_env("MOOMOO_ACTIVITY_LOOKBACK_DAYS", 90),
             read_api_token=os.getenv("MOOMOO_READ_API_TOKEN", ""),
             control_api_token=os.getenv("MOOMOO_CONTROL_API_TOKEN", ""),
+            account_mode=os.getenv("MOOMOO_ACCOUNT_MODE", "UNVERIFIED").strip().upper(),
             dedicated_account_confirmed=_bool_env("MOOMOO_DEDICATED_ACCOUNT_CONFIRMED", False),
+            shared_account_risk_accepted=_bool_env("MOOMOO_SHARED_ACCOUNT_RISK_ACCEPTED", False),
+            shared_account_baseline_confirmed=_bool_env("MOOMOO_SHARED_ACCOUNT_BASELINE_CONFIRMED", False),
         )
+
+    @property
+    def account_isolation_mode(self) -> str:
+        mode = self.account_mode.upper()
+        if (mode == "DEDICATED" and self.dedicated_account_confirmed
+                and not self.shared_account_risk_accepted
+                and not self.shared_account_baseline_confirmed):
+            return "dedicated"
+        if (mode == "SHARED_RESTRICTED" and self.shared_account_risk_accepted
+                and self.shared_account_baseline_confirmed
+                and not self.dedicated_account_confirmed):
+            return "shared_restricted"
+        if (mode == "UNVERIFIED" and not self.dedicated_account_confirmed
+                and not self.shared_account_risk_accepted
+                and not self.shared_account_baseline_confirmed):
+            return "unverified"
+        return "invalid"
 
     def public_policy(self) -> dict[str, Any]:
         return {
@@ -161,6 +185,9 @@ class MoomooSettings:
             "activity_lookback_days": self.activity_lookback_days,
             "strategy_capital_limit": 10_000.0,
             "strategy_loss_floor": 7_500.0,
+            "account_isolation_mode": self.account_isolation_mode,
+            "shared_account_residual_risk": self.account_isolation_mode == "shared_restricted",
+            "shared_account_baseline_confirmed": self.shared_account_baseline_confirmed,
         }
 
     def configuration_errors(self) -> list[str]:
@@ -185,6 +212,12 @@ class MoomooSettings:
             errors.append("Invalid max_quote_age_seconds")
         if self.account_id < 0:
             errors.append("Invalid account_id")
+        if self.account_mode.upper() not in {"UNVERIFIED", "DEDICATED", "SHARED_RESTRICTED"}:
+            errors.append("Invalid explicit account mode")
+        if self.account_isolation_mode == "invalid":
+            errors.append("Account mode, dedicated evidence, shared risk acceptance, and baseline must agree")
+        if self.auto_trading_enabled and not self.trading_enabled:
+            errors.append("Auto trading requires the real-order master switch")
         if not self.rth_only:
             errors.append("Regular-hours-only trading is immutable")
         if not 1 <= self.top_n <= 50:
@@ -225,6 +258,34 @@ class MoomooClient:
                 return True
         except OSError:
             return False
+
+    def _control_sync_is_fresh(self, state: Any) -> bool:
+        try:
+            synced = datetime.fromisoformat(str(state.last_sync_at).replace("Z", "+00:00"))
+            if synced.tzinfo is None:
+                synced = synced.replace(tzinfo=timezone.utc)
+            age = (self._clock().astimezone(timezone.utc) - synced.astimezone(timezone.utc)).total_seconds()
+            return -60 <= age <= 7 * 60
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def current_sync_fingerprint(self) -> str:
+        state = self.control.snapshot()
+        payload = {
+            "account_id": int(self.settings.account_id),
+            "configured_account_mode": self.settings.account_mode,
+            "account_isolation_mode": self.settings.account_isolation_mode,
+            "shared_account_risk_accepted": self.settings.shared_account_risk_accepted,
+            "shared_account_baseline_confirmed": self.settings.shared_account_baseline_confirmed,
+            "trading_enabled": self.settings.trading_enabled,
+            "auto_trading_enabled": self.settings.auto_trading_enabled,
+            "config_version": int(state.config_version),
+            "denylist_hash": self.control.denylist_hash(),
+            "manual_conflict_hash": self.control.manual_conflict_hash(),
+        }
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        self.control.observe_runtime_fingerprint(fingerprint)
+        return fingerprint
 
     def _enum(self, group: str, value: str):
         sdk = self._load_sdk()
@@ -314,6 +375,7 @@ class MoomooClient:
         return int(real[0]["acc_id"])
 
     def status(self) -> dict[str, Any]:
+        fingerprint = self.current_sync_fingerprint()
         control = self.control.snapshot()
         base = {
             "sdk_installed": True,
@@ -332,6 +394,15 @@ class MoomooClient:
             "configuration_errors": self.settings.configuration_errors(),
             "control_token_configured": bool(self.settings.control_api_token),
             "dedicated_account_confirmed": self.settings.dedicated_account_confirmed,
+            "shared_account_risk_accepted": self.settings.shared_account_risk_accepted,
+            "shared_account_baseline_confirmed": self.settings.shared_account_baseline_confirmed,
+            "configured_account_mode": self.settings.account_mode,
+            "account_isolation_mode": self.settings.account_isolation_mode,
+            "control_sync_fresh": self._control_sync_is_fresh(control),
+            "sync_proof_current": self.control.broker_sync_proof_matches(fingerprint),
+            "control_generation": self.control.current_control_generation(),
+            "external_symbol_denylist_count": len(self.control.denied_symbols()),
+            "manual_symbol_conflict_count": len(self.control.manual_conflict_symbols()),
             "strategy_control": control.__dict__,
             "place_order_ready": False,
             "message": None,
@@ -358,10 +429,18 @@ class MoomooClient:
             self.settings.trading_enabled, not base["configuration_errors"],
             bool(self.settings.read_api_token), bool(self.settings.trade_api_token),
             bool(self.settings.password_md5),
-            self.settings.dedicated_account_confirmed,
+            self.settings.account_isolation_mode in {"dedicated", "shared_restricted"},
+            base["control_sync_fresh"],
+            base["sync_proof_current"],
+            base["manual_symbol_conflict_count"] == 0,
             control.lifecycle == "ACTIVE",
         ])
-        if not base["place_order_ready"]:
+        if self.settings.account_isolation_mode == "shared_restricted":
+            base["message"] = (
+                "Restricted shared-account mode: logical isolation only; "
+                "manual broker activity can disturb strategy lots"
+            )
+        elif not base["place_order_ready"]:
             base["message"] = "Read-only mode: real-order safety gates are not fully enabled"
         return base
 
@@ -525,6 +604,24 @@ class MoomooClient:
             raise LiveTradeRejected(f"Moomoo account field {key} is invalid")
         return value
 
+    def _broker_order_is_proven_module(self, order: dict[str, Any], account_id: int) -> bool:
+        order_id = str(order.get("order_id") or "")
+        remark = str(order.get("remark") or "")
+        preview_id = remark.rsplit(":", 1)[-1] if remark.startswith("dashboard:") else ""
+        record = module_preview_record(preview_id, account_id) if preview_id else None
+        if not record:
+            return False
+        if record.get("order_id") and str(record["order_id"]) != order_id:
+            return False
+        payload = record["payload"]
+        return all([
+            str(order.get("code") or "").upper() == str(payload.get("code") or "").upper(),
+            str(order.get("trd_side") or "").upper() == str(payload.get("side") or "").upper(),
+            abs(self._number(order, "qty") - self._number(payload, "qty")) <= 1e-9,
+            abs(self._number(order, "price") - self._number(payload, "limit_price")) <= 1e-6,
+            int(payload.get("account_id") or 0) == int(account_id),
+        ])
+
     def preview_order(self, *, code: str, side: str, qty: int, limit_price: float,
                       _register: bool = True) -> dict[str, Any]:
         config_errors = self.settings.configuration_errors()
@@ -540,6 +637,14 @@ class MoomooClient:
         code = self.normalize_code(code)
         policy = self.public_policy()
         now = self._clock().astimezone(timezone.utc)
+        control_state = self.control.snapshot()
+        if self.settings.trading_enabled and not self._control_sync_is_fresh(control_state):
+            raise LiveTradeRejected("A fresh Moomoo reconciliation within 7 minutes is required")
+        if (self.settings.trading_enabled
+                and not self.control.broker_sync_proof_matches(self.current_sync_fingerprint())):
+            raise LiveTradeRejected("Current account isolation generation requires a new broker reconciliation")
+        if self.settings.trading_enabled and self.control.manual_conflict_symbols():
+            raise LiveTradeRejected("Persistent manual broker activity conflict blocks trading")
         eastern = now.astimezone(ZoneInfo("America/New_York"))
         minute = eastern.hour * 60 + eastern.minute
         if eastern.weekday() >= 5 or not (570 <= minute < 960):
@@ -583,6 +688,32 @@ class MoomooClient:
             raise LiveTradeRejected(
                 f"Account NAV ${nav:,.2f} is below the required ${self.settings.minimum_nav:,.2f}"
             )
+        terminal_statuses = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
+        if self.settings.account_isolation_mode == "shared_restricted":
+            if code in self.control.denied_symbols():
+                raise LiveTradeRejected(
+                    "Symbol is permanently denied because it belongs to external/personal account history"
+                )
+            proven_order_ids = set()
+            for order in snap["orders"]:
+                if str(order.get("code") or "") != code:
+                    continue
+                order_id = str(order.get("order_id") or "")
+                proven = self._broker_order_is_proven_module(order, self.settings.account_id)
+                if not proven:
+                    raise LiveTradeRejected(
+                        "Shared-account symbol has unproven broker activity; trading is blocked"
+                    )
+                proven_order_ids.add(order_id)
+            for deal in snap["deals"]:
+                if str(deal.get("code") or "") != code:
+                    continue
+                order_id = str(deal.get("order_id") or "")
+                if order_id not in proven_order_ids and not is_module_order(
+                        order_id, self.settings.account_id):
+                    raise LiveTradeRejected(
+                        "Shared-account symbol has unproven broker activity; trading is blocked"
+                    )
         if side == "BUY":
             broker_position = next((p for p in snap["positions"] if str(p.get("code")) == code), None)
             broker_qty = self._number(broker_position or {}, "qty")
@@ -592,7 +723,6 @@ class MoomooClient:
                     "Symbol overlaps pre-existing/external Moomoo holdings; use a physically isolated symbol or account"
                 )
             cash = self._required_number(account, "cash")
-            terminal_statuses = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
             reserved = sum(
                 max(0.0, self._number(order, "qty") - self._number(order, "dealt_qty"))
                 * self._number(order, "price")
@@ -607,7 +737,6 @@ class MoomooClient:
             if not held:
                 raise LiveTradeRejected("No Moomoo position is available to sell")
             sellable = self._required_number(held, "can_sell_qty")
-            terminal_statuses = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
             reserved_sell = sum(
                 self._number(order, "qty") - self._number(order, "dealt_qty")
                 for order in snap["orders"]
@@ -653,7 +782,9 @@ class MoomooClient:
                    "limit_price": round(float(limit_price), 6),
                    "account_id": int(snap["account_id"]), "issued_at": int(time.time()),
                    "preview_id": secrets.token_hex(16),
-                   "config_version": int(self.control.snapshot().config_version)}
+                   "config_version": int(control_state.config_version),
+                   "account_isolation_mode": self.settings.account_isolation_mode,
+                   "sync_fingerprint": self.current_sync_fingerprint()}
         token = self._sign_preview(payload)
         # A durable ready record is required before the preview can leave the
         # server. If the audit DB is unavailable, preview fails closed.
@@ -698,8 +829,8 @@ class MoomooClient:
             raise LiveTradeRejected("Real trading is disabled on the server")
         if self.settings.account_id <= 0:
             raise LiveTradeRejected("MOOMOO_ACCOUNT_ID must explicitly select a real account")
-        if not self.settings.dedicated_account_confirmed:
-            raise LiveTradeRejected("Real trading requires a verified dedicated Moomoo account or sub-account")
+        if self.settings.account_isolation_mode not in {"dedicated", "shared_restricted"}:
+            raise LiveTradeRejected("Real trading requires an accepted account isolation mode")
         config_errors = self.settings.configuration_errors()
         if config_errors:
             raise LiveTradeRejected("Invalid live-trade configuration: " + "; ".join(config_errors))
@@ -718,6 +849,10 @@ class MoomooClient:
                                        _register=False)
             if int(payload.get("config_version", -1)) != int(fresh.get("config_version", -2)):
                 raise LiveTradeRejected("Strategy configuration changed after order preview")
+            if payload.get("account_isolation_mode") != fresh.get("account_isolation_mode"):
+                raise LiveTradeRejected("Account isolation mode changed after order preview")
+            if payload.get("sync_fingerprint") != fresh.get("sync_fingerprint"):
+                raise LiveTradeRejected("Account isolation generation changed after order preview")
             if int(payload["account_id"]) != int(fresh["account_id"]):
                 raise LiveTradeRejected("Moomoo account changed after order preview")
             with self._trade_context() as ctx:

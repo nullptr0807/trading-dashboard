@@ -64,6 +64,8 @@ def diagnose(mutate: bool = True) -> dict:
             problems.append("FIVE_MINUTE_SYNC_STALE")
         try:
             client = MoomooClient(control_store=store)
+            if not store.broker_sync_proof_matches(client.current_sync_fingerprint()):
+                problems.append("ACCOUNT_ISOLATION_SYNC_PROOF_MISMATCH")
             snapshot = client.snapshot()
             if snapshot.get("activity_warnings"):
                 problems.append("MOOMOO_HISTORY_INCOMPLETE")

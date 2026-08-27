@@ -46,6 +46,34 @@ def test_unfreeze_requires_reconciliation_within_seven_minutes(tmp_path):
         s.unfreeze("stale")
 
 
+def test_direct_store_unfreeze_requires_matching_generation_proof(tmp_path):
+    s = store(tmp_path)
+    state = s.mark_to_market({}, sync_complete=True)
+    s.observe_runtime_fingerprint("old-generation")
+    s.record_broker_sync_proof("old-generation", str(state.last_sync_at))
+    s.observe_runtime_fingerprint("current-generation")
+    state = s.mark_to_market({}, sync_complete=True)
+    with pytest.raises(ControlRejected, match="matching broker sync proof"):
+        s.unfreeze("stale generation")
+    s.record_broker_sync_proof("current-generation", str(state.last_sync_at))
+    active = s.unfreeze("verified generation")
+    assert active.lifecycle == "ACTIVE"
+
+
+def test_config_change_immediately_rotates_generation_and_deletes_proof(tmp_path):
+    s = store(tmp_path)
+    fingerprint = "runtime-v1"
+    generation = s.observe_runtime_fingerprint(fingerprint)
+    state = s.mark_to_market({}, sync_complete=True)
+    s.record_broker_sync_proof(fingerprint, str(state.last_sync_at))
+    assert s.broker_sync_proof_matches(fingerprint)
+    current = s.config()
+    s.update_config({"stop_cooldown_hours": 48}, current["version"], "test", "generation test")
+    assert s.current_control_generation() == generation + 1
+    assert not s.broker_sync_proof_matches(fingerprint)
+    assert s.snapshot().lifecycle == "FROZEN"
+
+
 def test_only_module_confirmed_fills_create_sellable_ownership(tmp_path):
     s = store(tmp_path)
     make_active(s)

@@ -158,10 +158,11 @@ async def unfreeze_live_system(req: ControlActionRequest,
         raise HTTPException(status_code=400, detail="Type UNFREEZE LIVE TRADING to confirm")
     try:
         client = get_client()
-        if not client.settings.dedicated_account_confirmed:
-            raise ControlRejected("A verified dedicated Moomoo account is required before unfreezing")
+        if client.settings.account_isolation_mode not in {"dedicated", "shared_restricted"}:
+            raise ControlRejected("An accepted Moomoo account isolation mode is required before unfreezing")
         if await asyncio.to_thread(unresolved_preview_count):
             raise ControlRejected("Broker outcomes require reconciliation before unfreezing")
+        await asyncio.to_thread(client.current_sync_fingerprint)
         state = await asyncio.to_thread(client.control.unfreeze, req.reason, "dashboard")
         return {"state": asdict(state)}
     except ControlRejected as exc:

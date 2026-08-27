@@ -60,12 +60,24 @@ function laPolicyCard(policy) {
 }
 
 function laSetup(status) {
+  const isolationMode=status.account_isolation_mode||'unverified';
+  const isolationText=isolationMode==='dedicated'
+    ? laT('专用账户已验收','Dedicated account verified')
+    : isolationMode==='shared_restricted'
+      ? laT('受限共享账户；仅逻辑隔离','Restricted shared account; logical isolation only')
+      : laT('未验收；真实下单禁止','Unverified; live orders blocked');
   return `<section class="la-panel la-setup"><div class="la-section-head"><div><span class="la-kicker">CONNECTION</span><h2>${laT('连接Moomoo OpenD', 'Connect Moomoo OpenD')}</h2></div></div>
   <div class="la-check-grid">
     ${laStatusItem(status.sdk_installed, laT('官方Python SDK','Official Python SDK'), status.sdk_installed ? laT('已安装','Installed') : laT('未安装','Missing'))}
     ${laStatusItem(status.opend_connected, 'Moomoo OpenD', status.opend_connected ? laT('已连接','Connected') : (status.message || '127.0.0.1:11111'))}
     ${laStatusItem(status.real_account_selected, laT('真实账户','Real account'), status.account_id ? `ID ${status.account_id}` : laT('尚未选择','Not selected'))}
-    ${laStatusItem(status.dedicated_account_confirmed, laT('专用策略子账户','Dedicated strategy account'), status.dedicated_account_confirmed ? laT('已验收','Verified') : laT('未验收；真实下单禁止','Not verified; live orders blocked'))}
+    ${laStatusItem(isolationMode!=='unverified'&&isolationMode!=='invalid', laT('账户隔离模式','Account isolation mode'), isolationText)}
+    ${laStatusItem(status.shared_account_risk_accepted, laT('共享账户剩余风险接受','Shared-account residual-risk acceptance'), status.shared_account_risk_accepted ? laT('已明确接受','Explicitly accepted') : laT('未接受','Not accepted'))}
+    ${laStatusItem(status.shared_account_baseline_confirmed, laT('完整个人标的历史基线','Complete personal-symbol history baseline'), status.shared_account_baseline_confirmed ? laT('已确认','Confirmed') : laT('未确认；共享实盘禁止','Not confirmed; shared live blocked'))}
+    ${laStatusItem(true, laT('个人标的永久禁买清单','Permanent personal-symbol denylist'), `${Number(status.external_symbol_denylist_count||0)} ${laT('个标的','symbols')}`)}
+    ${laStatusItem(Number(status.manual_symbol_conflict_count||0)===0, laT('持久手工交易冲突','Persistent manual-trade conflicts'), `${Number(status.manual_symbol_conflict_count||0)} ${laT('个冲突','conflicts')}`)}
+    ${laStatusItem(true, laT('控制代际','Control generation'), `v${Number(status.control_generation||0)}`)}
+    ${laStatusItem(status.sync_proof_current, laT('当前隔离代际同步证明','Current isolation-generation sync proof'), status.sync_proof_current ? laT('匹配','Current') : laT('缺失或已失效','Missing or stale'))}
     ${laStatusItem(status.trade_token_configured, laT('交易授权令牌','Trade authorization token'), status.trade_token_configured ? laT('已配置','Configured') : laT('未配置；只能读取','Missing; read-only'))}
     ${laStatusItem(status.read_token_configured, laT('账户读取授权','Account read authorization'), status.read_access_granted ? laT('本次页面已授权','Authorized for this page') : status.read_token_configured ? laT('需要输入读取令牌','Token required') : laT('服务器尚未配置','Not configured on server'))}
     ${laStatusItem(status.unlock_secret_configured, laT('交易解锁密文','Trade unlock secret'), status.unlock_secret_configured ? laT('已配置','Configured') : laT('未配置；无法下单','Missing; ordering blocked'))}
@@ -109,7 +121,7 @@ function laControlPanel(control) {
 
 function laOwnedPositions(control) {
   const items=control.owned_positions||[];
-  if(!items.length)return `<div class="la-empty">${laT('尚无本系统拥有的仓位；Moomoo原有股票全部隔离。','No strategy-owned positions. Existing Moomoo holdings are isolated.')}</div>`;
+  if(!items.length)return `<div class="la-empty">${laT('尚无本系统拥有的仓位；Moomoo原有股票按外部只读处理，共享账户仅为逻辑隔离。','No strategy-owned positions. Existing Moomoo holdings are external read-only; shared accounts have logical isolation only.')}</div>`;
   return `<div class="la-table-wrap"><table class="la-table"><thead><tr><th>${laT('标的','Symbol')}</th><th>${laT('系统拥有数量','Owned qty')}</th><th>${laT('均价','Average cost')}</th><th>${laT('现价','Last')}</th><th>${laT('市值','Market value')}</th><th>${laT('已实现盈亏','Realized P&L')}</th></tr></thead><tbody>${items.map(p=>`<tr><td><b>${laEsc(p.symbol)}</b></td><td>${laNum(p,'quantity')}</td><td>${laMoney(p.average_cost)}</td><td>${laMoney(p.market_price)}</td><td>${laMoney(p.market_value)}</td><td class="${laClass(p.realized_pnl)}">${laMoney(p.realized_pnl)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
@@ -178,6 +190,7 @@ function laRenderChart(control) {
 
 async function renderLiveAccountPage(token) {
   if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
+  _laPreview=null;
   const app=document.getElementById('app');
   app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('Moomoo整账户只读；交易仅使用独立$10,000子账本和系统拥有的股份。','The full Moomoo account is read-only; trading is restricted to the independent $10,000 sub-ledger and system-owned shares.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section><div class="la-loading">${laT('正在检查Moomoo连接…','Checking Moomoo connection…')}</div></div>`;
   try {
@@ -188,6 +201,7 @@ async function renderLiveAccountPage(token) {
     if(token && !isRouteCurrent(token,'/live-account'))return;
     app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('Moomoo整账户只读；交易仅使用独立$10,000子账本和系统拥有的股份。','The full Moomoo account is read-only; trading is restricted to the independent $10,000 sub-ledger and system-owned shares.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section>
       <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)}</span><button class="la-link" id="la-refresh">${laT('刷新','Refresh')}</button></div>
+      ${st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：仅逻辑隔离，不是物理隔离。','RESTRICTED SHARED ACCOUNT: logical isolation only, not physical isolation.')}</b> ${laT('个人现有股票不可由策略买卖；Moomoo App手工操作仍可能扰动系统持仓，系统只能在后续对账发现并冻结。','Existing personal holdings are ineligible for strategy trading. Manual Moomoo App activity can still disturb strategy lots; the system can only detect it during reconciliation and freeze afterward.')}</div>`:''}
       ${(st.read_token_configured&&!st.read_access_granted)?laReadAuthCard():''}
       ${control?laControlPanel(control):''}
       ${control?`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>`:''}

@@ -13,11 +13,16 @@ from server import app
 def setup_client(tmp_path, monkeypatch):
     store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
     settings = MoomooSettings(read_api_token="r", control_api_token="c",
-                              dedicated_account_confirmed=True)
+                              account_mode="DEDICATED", dedicated_account_confirmed=True)
     client = MoomooClient(settings=settings, control_store=store)
     monkeypatch.setattr(live_api, "_client", client)
     monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
     return TestClient(app), store
+
+
+def record_current_proof(client, store):
+    fingerprint = client.current_sync_fingerprint()
+    store.record_broker_sync_proof(fingerprint, store.snapshot().last_sync_at)
 
 
 def test_control_read_requires_separate_read_token(tmp_path, monkeypatch):
@@ -77,6 +82,7 @@ def test_one_click_freeze_and_guarded_unfreeze(tmp_path, monkeypatch):
                       json={"confirmation": "wrong", "reason": "operator review complete"})
     assert wrong.status_code == 400
     store.mark_to_market({}, sync_complete=True)
+    record_current_proof(live_api.get_client(), store)
     active = http.post("/api/live-account/control/unfreeze", headers=headers,
                        json={"confirmation": "UNFREEZE LIVE TRADING",
                              "reason": "operator review complete"})
@@ -115,8 +121,31 @@ def test_unfreeze_rejects_shared_account_even_after_fresh_read_only_sync(tmp_pat
     )
 
     assert result.status_code == 409
-    assert "dedicated Moomoo account" in result.json()["detail"]
+    assert "accepted Moomoo account isolation mode" in result.json()["detail"]
     assert store.snapshot().lifecycle == "FROZEN"
+
+
+def test_unfreeze_allows_explicit_shared_risk_acceptance_after_fresh_sync(tmp_path, monkeypatch):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    settings = MoomooSettings(read_api_token="r", control_api_token="c",
+                              account_mode="SHARED_RESTRICTED",
+                              shared_account_risk_accepted=True,
+                              shared_account_baseline_confirmed=True)
+    client = MoomooClient(settings=settings, control_store=store)
+    monkeypatch.setattr(live_api, "_client", client)
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
+    store.mark_to_market({}, sync_complete=True)
+    record_current_proof(client, store)
+
+    result = TestClient(app).post(
+        "/api/live-account/control/unfreeze",
+        headers={"X-Moomoo-Control-Token": "c"},
+        json={"confirmation": "UNFREEZE LIVE TRADING",
+              "reason": "restricted shared-account review complete"},
+    )
+
+    assert result.status_code == 200
+    assert store.snapshot().lifecycle == "ACTIVE"
 
 
 def test_cleanup_fails_closed_when_strategy_owns_shares(tmp_path, monkeypatch):

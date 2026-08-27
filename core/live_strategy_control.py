@@ -7,6 +7,7 @@ positions are never imported as strategy-owned positions.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -178,6 +179,28 @@ class LiveStrategyStore:
                     fee REAL NOT NULL CHECK(fee>=0),
                     applied_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS external_symbol_denylist (
+                    symbol TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    source TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS broker_sync_proof (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    fingerprint TEXT NOT NULL,
+                    synced_at TEXT NOT NULL,
+                    control_generation INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS control_runtime (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    generation INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    changed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS manual_symbol_conflicts (
+                    symbol TEXT PRIMARY KEY,
+                    detected_at TEXT NOT NULL,
+                    reason TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS strategy_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT NOT NULL,
@@ -213,6 +236,9 @@ class LiveStrategyStore:
             if "required_sync_after" not in columns:
                 con.execute("ALTER TABLE strategy_state ADD COLUMN required_sync_after TEXT")
                 con.execute("UPDATE strategy_state SET required_sync_after=updated_at")
+            proof_columns = {row[1] for row in con.execute("PRAGMA table_info(broker_sync_proof)")}
+            if "control_generation" not in proof_columns:
+                con.execute("ALTER TABLE broker_sync_proof ADD COLUMN control_generation INTEGER NOT NULL DEFAULT 0")
             exists = con.execute("SELECT 1 FROM strategy_state WHERE id=1").fetchone()
             if not exists:
                 now = utcnow()
@@ -239,6 +265,27 @@ class LiveStrategyStore:
              json.dumps(_redact(details), ensure_ascii=False, sort_keys=True, default=str),
              int(row[0]) if row else None))
         return int(cur.lastrowid or 0)
+
+    def _invalidate_runtime_tx(self, con: sqlite3.Connection, reason: str) -> int:
+        row = con.execute("SELECT generation FROM control_runtime WHERE id=1").fetchone()
+        generation = (int(row["generation"]) + 1) if row else 1
+        now = utcnow()
+        pending = f"pending:{generation}:{reason}"
+        con.execute("INSERT INTO control_runtime VALUES(1,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,"
+                    "fingerprint=excluded.fingerprint,changed_at=excluded.changed_at",
+                    (generation, pending, now))
+        con.execute("DELETE FROM broker_sync_proof")
+        state = con.execute("SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1").fetchone()
+        freeze_reason = (str(state["freeze_reason"]) if state and state["lifecycle"] == "FROZEN"
+                         and state["freeze_reason"] else "control_generation_changed_requires_sync")
+        con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                    "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                    (freeze_reason, now, now))
+        self._event_tx(con, "control_generation_invalidated", "control", "critical",
+                       "Control generation changed; broker sync proof invalidated",
+                       {"generation": generation, "reason": reason})
+        return generation
 
     def event(self, event_type: str, source: str, severity: str,
               message: str, details: dict[str, Any] | None = None) -> int:
@@ -332,6 +379,7 @@ class LiveStrategyStore:
             con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
                         "freeze_reason='config_changed_requires_review',updated_at=?,"
                         "required_sync_after=? WHERE id=1", (now, now))
+            self._invalidate_runtime_tx(con, "strategy_config_changed")
             self._event_tx(con, "config_reloaded", "dashboard", "warning",
                            "Strategy parameters hot-reloaded; trading frozen for review",
                            {"version": version, "changed_fields": sorted(patch), "reason": reason})
@@ -383,6 +431,16 @@ class LiveStrategyStore:
                         raise ControlRejected("A post-freeze Moomoo reconciliation is required")
             except ValueError:
                 raise ControlRejected("A fresh Moomoo reconciliation within 7 minutes is required")
+            if con.execute("SELECT 1 FROM manual_symbol_conflicts LIMIT 1").fetchone():
+                raise ControlRejected("Persistent manual broker activity conflict requires cleanup/reprovision")
+            proof = con.execute("SELECT fingerprint,synced_at,control_generation "
+                                "FROM broker_sync_proof WHERE id=1").fetchone()
+            runtime = con.execute("SELECT generation,fingerprint FROM control_runtime WHERE id=1").fetchone()
+            if (not proof or not runtime
+                    or int(proof["control_generation"]) != int(runtime["generation"])
+                    or not hmac.compare_digest(str(proof["fingerprint"]), str(runtime["fingerprint"]))
+                    or str(proof["synced_at"]) != str(row["last_sync_at"])):
+                raise ControlRejected("Current account isolation generation lacks a matching broker sync proof")
             con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
                         "freeze_reason=NULL,updated_at=? WHERE id=1", (utcnow(),))
             self._event_tx(con, "system_unfrozen", actor, "critical", "Trading system unfrozen", {"reason": reason})
@@ -397,6 +455,115 @@ class LiveStrategyStore:
         with self.connect() as con:
             row = con.execute("SELECT quantity FROM owned_positions WHERE symbol=?", (symbol.upper(),)).fetchone()
         return float(row[0]) if row else 0.0
+
+    def add_external_symbols(self, symbols: list[str], source: str) -> int:
+        normalized = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+        if not normalized:
+            return 0
+        with self.connect() as con:
+            before = con.total_changes
+            now = utcnow()
+            for symbol in normalized:
+                con.execute("INSERT OR IGNORE INTO external_symbol_denylist VALUES(?,?,?)",
+                            (symbol, now, str(source)))
+            inserted = con.total_changes - before
+            if inserted:
+                self._invalidate_runtime_tx(con, "external_symbol_denylist_changed")
+            return inserted
+
+    def denied_symbols(self) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute("SELECT symbol FROM external_symbol_denylist ORDER BY symbol").fetchall()
+        return {str(row[0]) for row in rows}
+
+    def denylist_hash(self) -> str:
+        payload = "\n".join(sorted(self.denied_symbols())).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def record_manual_conflicts(self, symbols: list[str], reason: str) -> int:
+        normalized = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+        if not normalized:
+            return 0
+        with self.connect() as con:
+            before = con.total_changes
+            now = utcnow()
+            for symbol in normalized:
+                con.execute("INSERT OR IGNORE INTO manual_symbol_conflicts VALUES(?,?,?)",
+                            (symbol, now, str(reason)))
+            inserted = con.total_changes - before
+            if inserted:
+                self._invalidate_runtime_tx(con, "manual_symbol_conflict_added")
+            return inserted
+
+    def manual_conflict_symbols(self) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute("SELECT symbol FROM manual_symbol_conflicts ORDER BY symbol").fetchall()
+        return {str(row[0]) for row in rows}
+
+    def manual_conflict_hash(self) -> str:
+        payload = "\n".join(sorted(self.manual_conflict_symbols())).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def observe_runtime_fingerprint(self, fingerprint: str) -> int:
+        if not fingerprint:
+            raise ControlRejected("Runtime fingerprint is required")
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT generation,fingerprint FROM control_runtime WHERE id=1").fetchone()
+            now = utcnow()
+            if not row:
+                con.execute("INSERT INTO control_runtime VALUES(1,1,?,?)", (fingerprint, now))
+                return 1
+            if hmac.compare_digest(str(row["fingerprint"]), fingerprint):
+                return int(row["generation"])
+            if str(row["fingerprint"]).startswith("pending:"):
+                con.execute("UPDATE control_runtime SET fingerprint=?,changed_at=? WHERE id=1",
+                            (fingerprint, now))
+                return int(row["generation"])
+            generation = int(row["generation"]) + 1
+            con.execute("UPDATE control_runtime SET generation=?,fingerprint=?,changed_at=? WHERE id=1",
+                        (generation, fingerprint, now))
+            con.execute("DELETE FROM broker_sync_proof")
+            state = con.execute("SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1").fetchone()
+            freeze_reason = (str(state["freeze_reason"]) if state and state["lifecycle"] == "FROZEN"
+                             and state["freeze_reason"] else "runtime_identity_changed_requires_sync")
+            con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                        "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                        (freeze_reason, now, now))
+            self._event_tx(con, "control_generation_changed", "runtime", "critical",
+                           "Account isolation runtime identity changed; trading frozen",
+                           {"generation": generation})
+            return generation
+
+    def current_control_generation(self) -> int:
+        with self.connect() as con:
+            row = con.execute("SELECT generation FROM control_runtime WHERE id=1").fetchone()
+        return int(row[0]) if row else 0
+
+    def record_broker_sync_proof(self, fingerprint: str, synced_at: str) -> None:
+        if not fingerprint or not synced_at:
+            raise ControlRejected("Broker sync proof requires fingerprint and timestamp")
+        with self.connect() as con:
+            runtime = con.execute("SELECT generation,fingerprint FROM control_runtime WHERE id=1").fetchone()
+            if not runtime or not hmac.compare_digest(str(runtime["fingerprint"]), fingerprint):
+                raise ControlRejected("Broker sync proof does not match current control generation")
+            con.execute("INSERT INTO broker_sync_proof "
+                        "(id,fingerprint,synced_at,control_generation) VALUES(1,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,"
+                        "synced_at=excluded.synced_at,control_generation=excluded.control_generation",
+                        (fingerprint, synced_at, int(runtime["generation"])))
+
+    def broker_sync_proof_matches(self, fingerprint: str) -> bool:
+        with self.connect() as con:
+            proof = con.execute("SELECT fingerprint,synced_at,control_generation "
+                                "FROM broker_sync_proof WHERE id=1").fetchone()
+            runtime = con.execute("SELECT generation,fingerprint FROM control_runtime WHERE id=1").fetchone()
+            state = con.execute("SELECT last_sync_at FROM strategy_state WHERE id=1").fetchone()
+        return bool(proof and runtime and state and state["last_sync_at"]
+                    and int(proof["control_generation"]) == int(runtime["generation"])
+                    and hmac.compare_digest(str(runtime["fingerprint"]), fingerprint)
+                    and hmac.compare_digest(str(proof["fingerprint"]), fingerprint)
+                    and str(proof["synced_at"]) == str(state["last_sync_at"]))
 
     def pretrade_guard(self, side: str, symbol: str, quantity: float,
                        limit_price: float, pending_buy_notional: float = 0.0,
@@ -476,6 +643,146 @@ class LiveStrategyStore:
                            f"Strategy {side.lower()} fill reconciled", {"symbol": symbol, "quantity": quantity})
         self.mark_to_market({symbol: price}, sync_complete=False)
         return True
+
+    def apply_fill_batch(self, fills: list[dict[str, Any]],
+                         broker_quantities: dict[str, float], prices: dict[str, float],
+                         reserved_buy_notional: float, sync_fingerprint: str) -> int:
+        """Atomically apply fills, marks, reservations, risk state, and sync proof."""
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            state = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
+            position_rows = con.execute("SELECT * FROM owned_positions").fetchall()
+            positions = {str(row["symbol"]): dict(row) for row in position_rows}
+            cash = float(state["allocated_cash"])
+            reserved_buy_notional = _finite(reserved_buy_notional, "reserved_buy_notional")
+            if reserved_buy_notional < 0 or not sync_fingerprint:
+                raise ControlRejected("Invalid reconciliation reservation or sync fingerprint")
+            staged: list[dict[str, Any]] = []
+
+            for fill in fills:
+                reference_hash = hashlib.sha256(str(fill["external_reference"]).encode()).hexdigest()
+                if con.execute("SELECT 1 FROM applied_fills WHERE fill_hash=?",
+                               (reference_hash,)).fetchone():
+                    continue
+                symbol = str(fill["symbol"]).upper()
+                side = str(fill["side"]).upper()
+                quantity = _finite(fill["quantity"], "quantity")
+                price = _finite(fill["price"], "price")
+                fee = _finite(fill.get("fee", 0.0), "fee")
+                if side not in {"BUY", "SELL"} or quantity <= 0 or price <= 0 or fee < 0:
+                    raise ControlRejected("Invalid fill in reconciliation batch")
+
+                position = positions.get(symbol, {
+                    "symbol": symbol, "quantity": 0.0, "average_cost": 0.0,
+                    "market_price": 0.0, "market_value": 0.0, "realized_pnl": 0.0,
+                })
+                old_qty = float(position["quantity"])
+                old_cost = float(position["average_cost"])
+                realized = float(position["realized_pnl"])
+                if side == "BUY":
+                    cost = quantity * price + fee
+                    if cost > cash + 1e-6:
+                        raise ControlRejected("Fill batch exceeds strategy sub-ledger cash")
+                    new_qty = old_qty + quantity
+                    new_cost = ((old_qty * old_cost) + quantity * price + fee) / new_qty
+                    cash -= cost
+                else:
+                    if quantity > old_qty + 1e-9:
+                        raise ControlRejected("Sell fill batch exceeds strategy-owned quantity")
+                    new_qty = max(0.0, old_qty - quantity)
+                    realized += quantity * (price - old_cost) - fee
+                    new_cost = old_cost if new_qty else 0.0
+                    cash += quantity * price - fee
+                positions[symbol] = {
+                    **position, "symbol": symbol, "quantity": new_qty,
+                    "average_cost": new_cost, "market_price": price,
+                    "market_value": new_qty * price, "realized_pnl": realized,
+                }
+                staged.append({
+                    "fill_hash": reference_hash, "symbol": symbol, "side": side,
+                    "quantity": quantity, "price": price, "fee": fee,
+                })
+
+            for symbol, position in positions.items():
+                expected = float(position["quantity"])
+                actual = _finite(broker_quantities.get(symbol, 0.0), "broker_quantity")
+                if abs(actual - expected) > 1e-9:
+                    raise ControlRejected(
+                        "Broker quantity differs from staged strategy quantity; batch rolled back"
+                    )
+
+            market_value = unrealized = realized_total = 0.0
+            for symbol, position in positions.items():
+                quantity = float(position["quantity"])
+                if quantity > 0:
+                    if symbol not in prices:
+                        raise ControlRejected("Every staged strategy position requires a fresh Moomoo price")
+                    market_price = _finite(prices[symbol], "market_price")
+                    if market_price <= 0:
+                        raise ControlRejected("Invalid Moomoo market price in reconciliation batch")
+                    position["market_price"] = market_price
+                    position["market_value"] = quantity * market_price
+                    market_value += float(position["market_value"])
+                    unrealized += quantity * (market_price - float(position["average_cost"]))
+                else:
+                    position["market_value"] = 0.0
+                realized_total += float(position["realized_pnl"])
+            equity = cash + market_value
+            lifecycle, reason = state["lifecycle"], state["freeze_reason"]
+            required_sync_after = state["required_sync_after"]
+            breach = None
+            if equity <= LOSS_FLOOR:
+                breach = "strategy_equity_at_or_below_7500"
+            elif market_value + reserved_buy_notional > EXPOSURE_CAP + 1e-6:
+                breach = "strategy_exposure_above_10000"
+            if breach:
+                lifecycle, reason = "FROZEN", breach
+
+            now = utcnow()
+            for position in positions.values():
+                con.execute("""INSERT INTO owned_positions
+                    (symbol,quantity,average_cost,market_price,market_value,realized_pnl,updated_at)
+                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET
+                    quantity=excluded.quantity,average_cost=excluded.average_cost,
+                    market_price=excluded.market_price,market_value=excluded.market_value,
+                    realized_pnl=excluded.realized_pnl,updated_at=excluded.updated_at""",
+                            (position["symbol"], position["quantity"], position["average_cost"],
+                             position["market_price"], position["market_value"],
+                             position["realized_pnl"], now))
+            for fill in staged:
+                con.execute("INSERT INTO applied_fills VALUES(?,?,?,?,?,?,?)",
+                            (fill["fill_hash"], fill["symbol"], fill["side"],
+                             fill["quantity"], fill["price"], fill["fee"], now))
+                self._event_tx(con, "fill_applied", "moomoo_reconciler", "info",
+                               f"Strategy {fill['side'].lower()} fill reconciled",
+                               {"symbol": fill["symbol"], "quantity": fill["quantity"]})
+            if breach:
+                required_sync_after = now
+                self._event_tx(con, "risk_limit_breach", "risk_engine", "critical",
+                               "Immutable strategy risk limit breached",
+                               {"reason": breach, "equity": equity,
+                                "market_value": market_value})
+            con.execute("""UPDATE strategy_state SET lifecycle=?,freeze_latched=?,freeze_reason=?,
+                allocated_cash=?,owned_market_value=?,strategy_equity=?,realized_pnl=?,
+                unrealized_pnl=?,reserved_buy_notional=?,last_sync_at=?,updated_at=?,
+                required_sync_after=? WHERE id=1""",
+                        (lifecycle, 1 if lifecycle != "ACTIVE" else 0, reason, cash,
+                         market_value, equity, realized_total, unrealized,
+                         reserved_buy_notional, now, now, required_sync_after))
+            con.execute("INSERT OR REPLACE INTO strategy_equity VALUES(?,?,?,?,?,?,?)",
+                        (now, equity, cash, market_value, realized_total, unrealized, lifecycle))
+            runtime = con.execute("SELECT generation,fingerprint FROM control_runtime WHERE id=1").fetchone()
+            if not runtime or not hmac.compare_digest(str(runtime["fingerprint"]), sync_fingerprint):
+                raise ControlRejected("Reconciliation fingerprint changed before atomic commit")
+            con.execute("INSERT INTO broker_sync_proof "
+                        "(id,fingerprint,synced_at,control_generation) VALUES(1,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,"
+                        "synced_at=excluded.synced_at,control_generation=excluded.control_generation",
+                        (sync_fingerprint, now, int(runtime["generation"])))
+            self._event_tx(con, "account_sync", "moomoo_reconciler", "info",
+                           "Five-minute strategy reconciliation completed",
+                           {"equity": equity, "market_value": market_value})
+        return len(staged)
 
     def set_reserved_buy_notional(self, value: float) -> None:
         value = _finite(value, "reserved_buy_notional")
