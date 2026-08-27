@@ -155,6 +155,38 @@ def test_reconciliation_fails_if_fee_truth_is_missing(tmp_path):
     assert store.owned_quantity("US.AAPL") == 0
 
 
+def test_shared_partial_buy_without_deal_detail_is_rejected(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode="SHARED_RESTRICTED",
+        dedicated_account_confirmed=False,
+        shared_account_risk_accepted=True,
+        trading_enabled=True,
+        auto_trading_enabled=True,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["orders"] = [{
+        "order_id": "module-order", "code": "US.AAPL", "trd_side": "BUY",
+        "order_status": "CANCELLED_PART", "qty": 10, "dealt_qty": 6,
+        "price": 100, "remark": "dashboard:B16:preview",
+    }]
+    data["deals"] = []
+    data["order_fees"] = []
+    data["positions"] = [{"code": "US.AAPL", "qty": 6}]
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="differs from deal detail total"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.owned_quantity("US.AAPL") == 0
+    assert store.snapshot().allocated_cash == pytest.approx(10_000)
+    with store.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 0
+
+
 def test_negative_fee_is_rejected_without_ledger_mutation(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
@@ -254,7 +286,9 @@ def test_broker_cannot_have_fewer_shares_than_strategy_ledger(tmp_path):
     store.apply_fill("existing", "US.AAPL", "BUY", 5, 100)
     client = FakeClient()
     data = client.snapshot()
+    data["orders"] = []
     data["deals"] = []
+    data["order_fees"] = []
     data["positions"][0]["qty"] = 4
     client.snapshot = lambda: data
     with pytest.raises(ControlRejected, match="differs from staged strategy quantity"):

@@ -100,6 +100,23 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         oid = str(deal.get("order_id") or "")
         if oid in module_orders:
             deals_by_order.setdefault(oid, []).append(deal)
+
+    # Broker order rows can lead deal-detail rows. Never publish a sync proof
+    # until both views agree, including when no deal row has arrived at all.
+    for order_id, order in module_orders.items():
+        order_qty = number(order, "qty")
+        dealt_qty = number(order, "dealt_qty")
+        deal_qty_total = sum(
+            number(deal, "deal_qty", "qty")
+            for deal in deals_by_order.get(order_id, [])
+        )
+        if order_qty <= 0 or dealt_qty < 0 or dealt_qty > order_qty + 1e-9:
+            raise ControlRejected("Module order has an invalid authorized or dealt quantity")
+        if abs(dealt_qty - deal_qty_total) > 1e-9:
+            raise ControlRejected("Module order dealt quantity differs from deal detail total")
+        if dealt_qty > 0 and order_id not in fee_by_order:
+            raise ControlRejected("Moomoo fee record missing for a module order")
+
     preview_finalizations = []
     if ownership_proof is None:
         for order_id, order in module_orders.items():
