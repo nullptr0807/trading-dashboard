@@ -21,11 +21,57 @@ from core.live_logging import get_live_logger, log_event
 from core.live_strategy_control import ControlRejected, LiveStrategyStore
 from core.moomoo_audit import (
     finalize_preview, is_module_order, is_module_preview, module_preview_record,
+    unresolved_preview_count,
 )
 from core.moomoo_client import MoomooClient
 
 TERMINAL = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
 logger = get_live_logger("live.moomoo.sync", "moomoo-sync.jsonl")
+
+_RECOVERABLE_AUTO_FREEZE = "auto_post_broker_reconciliation_failed"
+_WATCHDOG_FREEZE_PREFIX = "health_watchdog:SYSTEM_FROZEN:"
+
+
+def _base_freeze_reason(reason: str | None) -> str:
+    value = str(reason or "")
+    while value.startswith(_WATCHDOG_FREEZE_PREFIX):
+        value = value[len(_WATCHDOG_FREEZE_PREFIX):]
+    return value
+
+
+def _recover_intents_and_transient_freeze(
+    store: LiveStrategyStore,
+    snapshot: dict[str, Any],
+    *,
+    account_isolation_mode: str,
+) -> bool:
+    """Recover proven intents; release only the narrow transient auto freeze."""
+    from core.live_auto_executor import recover_auto_intents
+
+    blocker = recover_auto_intents(store, snapshot)
+    state = store.snapshot()
+    if state.lifecycle != "FROZEN":
+        return False
+    if _base_freeze_reason(state.freeze_reason) != _RECOVERABLE_AUTO_FREEZE:
+        return False
+    if blocker is not None or store.auto_intent_reservations()["reserved_buy_notional"] > 1e-9:
+        return False
+    if account_isolation_mode not in {"dedicated", "shared_restricted"}:
+        return False
+    if unresolved_preview_count():
+        return False
+    active_module_orders = [
+        row for row in snapshot.get("orders", [])
+        if str(row.get("remark") or "").startswith("dashboard:")
+        and str(row.get("order_status") or "").upper() not in TERMINAL
+    ]
+    if active_module_orders:
+        return False
+    store.unfreeze(
+        "Automatic recovery after Broker order and strategy ledger fully reconciled",
+        "moomoo_reconciler",
+    )
+    return True
 
 
 def number(row: dict[str, Any], *keys: str) -> float:
@@ -212,6 +258,9 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     )
     for preview_id, status, order_id in preview_finalizations:
         finalize_preview(preview_id, status, order_id)
+    auto_recovered = _recover_intents_and_transient_freeze(
+        store, snapshot, account_isolation_mode=account_isolation_mode,
+    )
     owned = store.positions()
     owned_symbols = {row["symbol"] for row in owned}
     external = [symbol for symbol, qty in broker_positions.items()
@@ -236,6 +285,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     result = {"ok": True, "applied_fills": applied, "owned_positions": len(owned),
               "external_positions": len(external), "shared_read_only": shared_read_only,
               "account_isolation_mode": account_isolation_mode,
+              "auto_recovered": auto_recovered,
               "equity": state.strategy_equity, "market_value": state.owned_market_value,
               "lifecycle": state.lifecycle, "freeze_reason": state.freeze_reason,
               "cancellation": cancellation}

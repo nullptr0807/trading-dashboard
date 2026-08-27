@@ -10,7 +10,7 @@ import core.live_auto_executor as module
 from core.live_auto_executor import AutoExecutionError, LiveAutoExecutor, recover_auto_intents
 from core.live_signal_adapter import RankedSignal, SignalBatch
 from core.live_strategy_control import ControlRejected, LiveStrategyStore
-from core.moomoo_client import BrokerOutcomeUnknown
+from core.moomoo_client import BrokerOutcomeUnknown, MoomooUnavailable
 
 
 NOW = datetime(2026, 8, 27, 14, 0, tzinfo=timezone.utc)
@@ -58,6 +58,8 @@ def active_store(tmp_path):
     store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
     store.apply_fill("verified", "US.DRAM", "BUY", 1, 100)
     with store.connect() as con:
+        # Keep the fixed-clock tests deterministic even when run later on NOW's date.
+        con.execute("UPDATE applied_fills SET applied_at=?", ((NOW.replace(hour=13)).isoformat(),))
         con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
                     "freeze_reason=NULL,last_sync_at=? WHERE id=1", (NOW.isoformat(),))
     return store
@@ -143,6 +145,33 @@ def test_post_broker_reconciliation_failure_freezes_without_failed_retry(tmp_pat
     assert intent["status"] == "ACKED"
     assert intent["reserved_sell_qty"] == 1
     assert store.snapshot().lifecycle == "FROZEN"
+
+
+def test_transient_post_broker_api_failure_defers_without_global_freeze(tmp_path, monkeypatch):
+    count = 0
+
+    def reconcile(_client, _store):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise MoomooUnavailable("transient market-state lookup failure")
+        return {"ok": True}
+
+    ex, _, store = executor(tmp_path, reconcile)
+    monkeypatch.setattr(
+        module, "dispatch_signed_preview",
+        lambda *args, **kwargs: {"accepted": True, "order": {
+            "order_id": "raw", "order_status": "SUBMITTED",
+        }},
+    )
+
+    with pytest.raises(MoomooUnavailable):
+        ex.execute_one(now=NOW)
+
+    intent = store.list_auto_order_intents()[0]
+    assert intent["status"] == "ACKED"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.snapshot().freeze_reason is None
 
 
 def test_recovery_missing_dispatched_broker_order_becomes_unknown_and_frozen(tmp_path):

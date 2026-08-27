@@ -265,6 +265,58 @@ def test_quote_failure_rolls_back_entire_reconciliation_batch(tmp_path):
         assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 0
 
 
+def _acked_intent_for_fake_order(store):
+    intent = store.create_auto_order_intent(
+        strategy_id="B16", config_version=1, signal_batch_id="b" * 64,
+        signal_source_date="2026-08-26", factor_set_hash="f" * 64,
+        symbol="US.AAPL", side="BUY", purpose="TARGET_BUY", target_qty=2,
+        order_qty=2, limit_price=100,
+    )
+    store.mark_auto_intent_dispatching(intent["intent_id"], "preview")
+    store.mark_auto_intent_acked(intent["intent_id"])
+    return intent
+
+
+def test_confirmed_fill_auto_recovers_transient_post_broker_freeze(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
+
+    result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
+
+    assert result["auto_recovered"] is True
+    assert store.get_auto_order_intent(intent["intent_id"])["status"] == "FILLED"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.snapshot().freeze_reason is None
+
+
+def test_auto_recovery_waits_if_any_broker_preview_is_unresolved(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 1)
+
+    result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
+
+    assert result["auto_recovered"] is False
+    assert store.get_auto_order_intent(intent["intent_id"])["status"] == "FILLED"
+    assert store.snapshot().lifecycle == "FROZEN"
+
+
+def test_auto_recovery_never_releases_an_unrelated_freeze(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    store.freeze("manual_freeze", "dashboard")
+    monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
+
+    result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
+
+    assert result["auto_recovered"] is False
+    assert store.get_auto_order_intent(intent["intent_id"])["status"] == "FILLED"
+    assert store.snapshot().freeze_reason == "manual_freeze"
+
+
 def test_fill_batch_is_atomic_when_final_broker_quantity_mismatches(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()

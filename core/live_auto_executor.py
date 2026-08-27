@@ -344,7 +344,21 @@ class LiveAutoExecutor:
             self.store.mark_auto_intent_unknown(intent_row["intent_id"], "BROKER_OUTCOME_UNKNOWN")
             self.store.freeze("auto_broker_outcome_unknown", "auto_executor")
             raise
-        except (LiveTradeRejected, MoomooUnavailable, ControlRejected):
+        except MoomooUnavailable:
+            current_intent = self.store.get_auto_order_intent(intent_row["intent_id"])
+            if broker_accepted:
+                # ACKED remains the global order blocker until the scheduled
+                # reconciler proves the final Broker result. A transient API or
+                # quote miss after acceptance must not freeze the whole strategy.
+                self.store.event(
+                    "auto_post_broker_reconciliation_deferred", "auto_executor", "warning",
+                    "Broker accepted an order; final reconciliation deferred after transient API failure",
+                    {"symbol": chosen.symbol, "side": chosen.side},
+                )
+            elif current_intent and current_intent["status"] in {"RESERVED", "DISPATCHING"}:
+                self.store.mark_auto_intent_failed(intent_row["intent_id"], "PRE_BROKER_REJECTED")
+            raise
+        except (LiveTradeRejected, ControlRejected):
             current_intent = self.store.get_auto_order_intent(intent_row["intent_id"])
             if broker_accepted:
                 if current_intent and current_intent["status"] == "DISPATCHING":
