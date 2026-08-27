@@ -312,7 +312,6 @@ class MoomooClient:
         ctx = sdk.OpenQuoteContext(
             host=self.settings.host,
             port=self.settings.port,
-            security_firm=self._enum("SecurityFirm", self.settings.security_firm),
         )
         try:
             yield ctx

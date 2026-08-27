@@ -100,9 +100,12 @@ class FakeSDK:
     def __init__(self):
         self.trade = FakeTradeContext()
         self.quote = FakeQuoteContext()
+        self.quote_context_kwargs = None
 
     def OpenSecTradeContext(self, **kwargs): return self.trade
-    def OpenQuoteContext(self, **kwargs): return self.quote
+    def OpenQuoteContext(self, **kwargs):
+        self.quote_context_kwargs = kwargs
+        return self.quote
 
 
 class FakeControl:
@@ -198,6 +201,7 @@ def test_snapshot_and_quote_are_moomoo_only():
     assert snap["deals"][0]["deal_id"] == TEST_DEAL
     assert quote["last_price"] == 100.0
     assert quote["source"] == "Moomoo OpenD"
+    assert "security_firm" not in c._sdk.quote_context_kwargs
 
 
 def test_browser_snapshot_uses_five_minute_server_cache():
