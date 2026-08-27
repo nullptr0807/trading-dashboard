@@ -155,10 +155,12 @@ function navigate() {
   // instead of leaving its label clipped at the viewport edge.
   const navStrip = document.querySelector('.nav-links');
   if (navStrip && activeNavLink && navStrip.scrollWidth > navStrip.clientWidth) {
-    navStrip.scrollTo({
-      left: activeNavLink.offsetLeft - navStrip.clientWidth / 2 + activeNavLink.clientWidth / 2,
-      behavior: 'smooth',
-    });
+    const links = Array.from(navStrip.querySelectorAll('.nav-link'));
+    const index = links.indexOf(activeNavLink);
+    const before = links.slice(0, index).reduce((sum, link) => sum + link.getBoundingClientRect().width, 0);
+    const gap = Number.parseFloat(getComputedStyle(navStrip).columnGap || getComputedStyle(navStrip).gap) || 0;
+    const target = before + Math.max(0, index) * gap;
+    navStrip.scrollLeft = Math.max(0, target - 8);
   }
 
   if (_navTimer) clearTimeout(_navTimer);

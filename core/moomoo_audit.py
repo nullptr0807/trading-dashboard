@@ -172,7 +172,7 @@ def finalize_preview(preview_id: str, outcome: str, order_id: str | None = None,
     with _connect(path) as con:
         con.execute(
             "UPDATE live_order_previews SET status=?,completed_at=?,order_id=?,outcome=? "
-            "WHERE preview_id=? AND status='claimed'",
+            "WHERE preview_id=? AND status IN ('claimed','reconcile')",
             ("accepted" if outcome == "accepted" else "reconcile" if outcome == "unknown" else "failed",
              datetime.now(timezone.utc).isoformat(), order_id, outcome, str(preview_id)),
         )
@@ -187,6 +187,52 @@ def is_module_order(order_id: str, account_id: int | str,
             (str(order_id), str(account_id)),
         ).fetchone()
     return row is not None
+
+
+def is_module_preview(preview_id: str, account_id: int | str,
+                      *, path: str | Path = AUDIT_DB_PATH) -> bool:
+    with _connect(path) as con:
+        row = con.execute(
+            "SELECT 1 FROM live_order_previews WHERE preview_id=? AND account_id=? "
+            "AND status IN ('claimed','accepted','reconcile') LIMIT 1",
+            (str(preview_id), str(account_id)),
+        ).fetchone()
+    return row is not None
+
+
+def module_preview_record(preview_id: str, account_id: int | str,
+                          *, path: str | Path = AUDIT_DB_PATH) -> dict[str, Any] | None:
+    with _connect(path) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT preview_id,account_id,status,order_id,payload FROM live_order_previews "
+            "WHERE preview_id=? AND account_id=? AND status IN ('claimed','accepted','reconcile') LIMIT 1",
+            (str(preview_id), str(account_id)),
+        ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["payload"] = json.loads(result["payload"])
+    return result
+
+
+def unresolved_preview_count(*, path: str | Path = AUDIT_DB_PATH) -> int:
+    with _connect(path) as con:
+        row = con.execute(
+            "SELECT COUNT(*) FROM live_order_previews WHERE status='reconcile'"
+        ).fetchone()
+    return int(row[0])
+
+
+def known_module_order_ids(account_id: int | str,
+                           *, path: str | Path = AUDIT_DB_PATH) -> set[str]:
+    with _connect(path) as con:
+        rows = con.execute(
+            "SELECT order_id FROM live_order_previews WHERE account_id=? "
+            "AND order_id IS NOT NULL AND status IN ('accepted','reconcile')",
+            (str(account_id),),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 @contextmanager

@@ -15,6 +15,7 @@ venv/
 
 # 数据文件
 data/
+logs/
 *.parquet
 *.csv
 *.json

@@ -21,7 +21,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-from core.moomoo_audit import account_execution_lock, claim_preview, register_preview
+from core.moomoo_audit import (
+    account_execution_lock, claim_preview, is_module_order, is_module_preview, register_preview,
+)
+from core.live_strategy_control import ControlRejected, LiveStrategyStore
+from core.live_logging import get_live_logger, log_event
+
+_moomoo_logger = get_live_logger("live.moomoo.api", "moomoo-api.jsonl")
 
 
 class MoomooUnavailable(RuntimeError):
@@ -87,6 +93,8 @@ class MoomooSettings:
     rebalance_hours: int = 12
     activity_lookback_days: int = 90
     read_api_token: str = ""
+    control_api_token: str = ""
+    dedicated_account_confirmed: bool = False
 
     @classmethod
     def from_env(cls) -> "MoomooSettings":
@@ -119,6 +127,8 @@ class MoomooSettings:
             rebalance_hours=_int_env("MOOMOO_REBALANCE_HOURS", 12),
             activity_lookback_days=_int_env("MOOMOO_ACTIVITY_LOOKBACK_DAYS", 90),
             read_api_token=os.getenv("MOOMOO_READ_API_TOKEN", ""),
+            control_api_token=os.getenv("MOOMOO_CONTROL_API_TOKEN", ""),
+            dedicated_account_confirmed=_bool_env("MOOMOO_DEDICATED_ACCOUNT_CONFIRMED", False),
         )
 
     def public_policy(self) -> dict[str, Any]:
@@ -149,6 +159,8 @@ class MoomooSettings:
             "trailing_stop_pct": None,
             "auto_trading_enabled": self.auto_trading_enabled,
             "activity_lookback_days": self.activity_lookback_days,
+            "strategy_capital_limit": 10_000.0,
+            "strategy_loss_floor": 7_500.0,
         }
 
     def configuration_errors(self) -> list[str]:
@@ -173,6 +185,8 @@ class MoomooSettings:
             errors.append("Invalid max_quote_age_seconds")
         if self.account_id < 0:
             errors.append("Invalid account_id")
+        if not self.rth_only:
+            errors.append("Regular-hours-only trading is immutable")
         if not 1 <= self.top_n <= 50:
             errors.append("Invalid top_n")
         if not 1 <= self.hold_band_mult <= 10:
@@ -185,12 +199,16 @@ class MoomooSettings:
 
 
 class MoomooClient:
-    def __init__(self, settings: MoomooSettings | None = None, sdk: Any = None, clock=None):
+    def __init__(self, settings: MoomooSettings | None = None, sdk: Any = None, clock=None,
+                 control_store: Any | None = None):
         self.settings = settings or MoomooSettings.from_env()
         self._sdk = sdk
         self._preview_secret = secrets.token_bytes(32)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._trade_lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_cache: dict[str, Any] | None = None
+        self.control = control_store or LiveStrategyStore()
 
     def _load_sdk(self):
         if self._sdk is None:
@@ -245,9 +263,14 @@ class MoomooClient:
     def _result(self, result: Any, action: str):
         sdk = self._load_sdk()
         if not isinstance(result, tuple) or len(result) < 2 or result[0] != sdk.RET_OK:
-            detail = result[1] if isinstance(result, tuple) and len(result) > 1 else result
-            raise MoomooUnavailable(f"Moomoo {action} failed: {detail}")
-        return result[1]
+            log_event(_moomoo_logger, "error", "moomoo_api_failed", action=action)
+            raise MoomooUnavailable(
+                f"Moomoo {action} failed; inspect protected broker diagnostics locally"
+            )
+        data = result[1]
+        rows = len(data) if hasattr(data, "__len__") and not isinstance(data, str) else None
+        log_event(_moomoo_logger, "info", "moomoo_api_ok", action=action, rows=rows)
+        return data
 
     @staticmethod
     def _records(frame: Any) -> list[dict[str, Any]]:
@@ -291,6 +314,7 @@ class MoomooClient:
         return int(real[0]["acc_id"])
 
     def status(self) -> dict[str, Any]:
+        control = self.control.snapshot()
         base = {
             "sdk_installed": True,
             "opend_connected": False,
@@ -306,6 +330,9 @@ class MoomooClient:
             "unlock_secret_configured": bool(self.settings.password_md5),
             "explicit_account_configured": self.settings.account_id > 0,
             "configuration_errors": self.settings.configuration_errors(),
+            "control_token_configured": bool(self.settings.control_api_token),
+            "dedicated_account_confirmed": self.settings.dedicated_account_confirmed,
+            "strategy_control": control.__dict__,
             "place_order_ready": False,
             "message": None,
         }
@@ -331,10 +358,26 @@ class MoomooClient:
             self.settings.trading_enabled, not base["configuration_errors"],
             bool(self.settings.read_api_token), bool(self.settings.trade_api_token),
             bool(self.settings.password_md5),
+            self.settings.dedicated_account_confirmed,
+            control.lifecycle == "ACTIVE",
         ])
         if not base["place_order_ready"]:
             base["message"] = "Read-only mode: real-order safety gates are not fully enabled"
         return base
+
+    def public_policy(self) -> dict[str, Any]:
+        policy = self.settings.public_policy()
+        try:
+            runtime = self.control.config()
+            policy.update(runtime.get("values") or {})
+            policy["config_version"] = runtime.get("version")
+        except Exception:
+            policy["config_version"] = None
+        policy["strategy_capital_limit"] = 10_000.0
+        policy["strategy_loss_floor"] = 7_500.0
+        policy["rth_only"] = True
+        policy["fill_outside_rth"] = False
+        return policy
 
     def _account_snapshot_with_ctx(self, ctx: Any, account_id: int) -> dict[str, Any]:
         sdk = self._load_sdk()
@@ -378,8 +421,20 @@ class MoomooClient:
             return list(merged.values())
         orders = merge(current_orders, history_orders, "order_id")
         deals = merge(current_deals, history_deals, "deal_id")
+        module_order_ids = [str(row.get("order_id")) for row in orders
+                            if row.get("order_id") is not None
+                            and str(row.get("remark") or "").startswith("dashboard:")]
+        order_fees: list[dict[str, Any]] = []
+        if module_order_ids:
+            try:
+                order_fees = self._records(self._result(ctx.order_fee_query(
+                    order_id_list=module_order_ids, trd_env=env, acc_id=account_id,
+                ), "order fees"))
+            except MoomooUnavailable as exc:
+                warnings.append(str(exc))
         return {"account": accinfo[0] if accinfo else {}, "positions": positions,
-                "orders": orders, "deals": deals, "activity_warnings": warnings}
+                "orders": orders, "deals": deals, "order_fees": order_fees,
+                "activity_warnings": warnings}
 
     def snapshot(self) -> dict[str, Any]:
         if not self._port_open():
@@ -388,7 +443,20 @@ class MoomooClient:
             account_id = self._select_account_id(self._account_rows(ctx))
             data = self._account_snapshot_with_ctx(ctx, account_id)
         data.update(account_id=account_id, source="Moomoo OpenD", fetched_at=time.time())
+        log_event(_moomoo_logger, "info", "moomoo_snapshot",
+                  positions=len(data.get("positions", [])), orders=len(data.get("orders", [])),
+                  deals=len(data.get("deals", [])), warnings=len(data.get("activity_warnings", [])))
         return data
+
+    def snapshot_cached(self, max_age_seconds: int = 300) -> dict[str, Any]:
+        now = time.time()
+        with self._snapshot_lock:
+            cached = self._snapshot_cache
+            if cached and now - float(cached.get("fetched_at") or 0) <= max_age_seconds:
+                return cached
+            fresh = self.snapshot()
+            self._snapshot_cache = fresh
+            return fresh
 
     @staticmethod
     def normalize_code(code: str) -> str:
@@ -405,9 +473,11 @@ class MoomooClient:
             raise MoomooUnavailable("Moomoo OpenD is not connected")
         with self._quote_context() as ctx:
             rows = self._records(self._result(ctx.get_market_snapshot([code]), "market snapshot"))
+            market_rows = self._records(self._result(ctx.get_market_state([code]), "market state"))
         if not rows:
             raise MoomooUnavailable(f"No Moomoo quote for {code}")
         row = rows[0]
+        market_row = market_rows[0] if market_rows else {}
         if str(row.get("code") or "").upper() != code:
             raise MoomooUnavailable("Moomoo returned a quote for the wrong symbol")
         prices = {}
@@ -419,13 +489,18 @@ class MoomooClient:
             if not math.isfinite(value) or value < 0:
                 raise MoomooUnavailable(f"Moomoo returned invalid {key}")
             prices[key] = value
-        return {
+        quote = {
             "code": code,
             **prices,
             "update_time": row.get("update_time"),
             "sec_status": row.get("sec_status"),
+            "market_state": market_row.get("market_state"),
             "source": "Moomoo OpenD",
         }
+        log_event(_moomoo_logger, "info", "moomoo_quote", symbol=code,
+                  last_price=prices["last_price"], market_state=quote["market_state"],
+                  update_time=quote["update_time"])
+        return quote
 
     @staticmethod
     def _number(row: dict[str, Any], *keys: str) -> float:
@@ -463,25 +538,27 @@ class MoomooClient:
         if not math.isfinite(limit_price) or limit_price <= 0:
             raise LiveTradeRejected("A positive limit price is required")
         code = self.normalize_code(code)
+        policy = self.public_policy()
         now = self._clock().astimezone(timezone.utc)
-        if self.settings.rth_only:
-            eastern = now.astimezone(ZoneInfo("America/New_York"))
-            minute = eastern.hour * 60 + eastern.minute
-            if eastern.weekday() >= 5 or not (570 <= minute < 960):
-                raise LiveTradeRejected("Real orders are restricted to US regular trading hours")
+        eastern = now.astimezone(ZoneInfo("America/New_York"))
+        minute = eastern.hour * 60 + eastern.minute
+        if eastern.weekday() >= 5 or not (570 <= minute < 960):
+            raise LiveTradeRejected("Real orders are restricted to US regular trading hours")
         snap = self.snapshot()
         if snap.get("activity_warnings"):
             raise LiveTradeRejected("Moomoo order/deal history is incomplete; trading is blocked")
         quote = self.quote(code)
         if str(quote.get("sec_status") or "").upper() != "NORMAL":
             raise LiveTradeRejected("Moomoo does not report the symbol as normally tradable")
+        if str(quote.get("market_state") or "").upper() not in {"MORNING", "AFTERNOON"}:
+            raise LiveTradeRejected("Moomoo market state is not regular-hours trading")
         quote_time = quote.get("update_time")
         try:
             parsed = datetime.fromisoformat(str(quote_time).replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=ZoneInfo("America/New_York"))
             age = (now - parsed.astimezone(timezone.utc)).total_seconds()
-            if age < -60 or age > self.settings.max_quote_age_seconds:
+            if age < -60 or age > float(policy["max_quote_age_seconds"]):
                 raise ValueError
         except (TypeError, ValueError):
             raise LiveTradeRejected("Moomoo quote timestamp is missing or stale")
@@ -489,16 +566,16 @@ class MoomooClient:
         if last <= 0:
             raise LiveTradeRejected("Moomoo returned an invalid last price")
         deviation = abs(limit_price / last - 1)
-        if deviation > self.settings.max_limit_deviation_pct:
+        if deviation > float(policy["max_limit_deviation_pct"]):
             raise LiveTradeRejected(
                 f"Limit price deviates {deviation:.2%} from Moomoo last price; "
-                f"maximum is {self.settings.max_limit_deviation_pct:.2%}"
+                f"maximum is {float(policy['max_limit_deviation_pct']):.2%}"
             )
         notional = qty * limit_price
-        if notional > self.settings.max_order_notional:
+        if notional > float(policy["max_order_notional"]):
             raise LiveTradeRejected(
                 f"Order notional ${notional:,.2f} exceeds the server limit "
-                f"${self.settings.max_order_notional:,.2f}"
+                f"${float(policy['max_order_notional']):,.2f}"
             )
         account = snap["account"]
         nav = self._required_number(account, "total_assets")
@@ -507,10 +584,18 @@ class MoomooClient:
                 f"Account NAV ${nav:,.2f} is below the required ${self.settings.minimum_nav:,.2f}"
             )
         if side == "BUY":
+            broker_position = next((p for p in snap["positions"] if str(p.get("code")) == code), None)
+            broker_qty = self._number(broker_position or {}, "qty")
+            strategy_qty = self.control.owned_quantity(code)
+            if broker_qty > strategy_qty + 1e-9:
+                raise LiveTradeRejected(
+                    "Symbol overlaps pre-existing/external Moomoo holdings; use a physically isolated symbol or account"
+                )
             cash = self._required_number(account, "cash")
             terminal_statuses = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
             reserved = sum(
-                self._number(order, "qty") * self._number(order, "price")
+                max(0.0, self._number(order, "qty") - self._number(order, "dealt_qty"))
+                * self._number(order, "price")
                 for order in snap["orders"]
                 if str(order.get("trd_side") or "").upper() == "BUY"
                 and str(order.get("order_status") or "").upper() not in terminal_statuses
@@ -538,14 +623,37 @@ class MoomooClient:
             created = str(order.get("create_time") or order.get("create_time_str") or "")
             if created[:10] == today:
                 daily_notional += self._number(order, "qty") * self._number(order, "price")
-        if daily_notional + notional > self.settings.max_daily_order_notional:
+        if daily_notional + notional > float(policy["max_daily_order_notional"]):
             raise LiveTradeRejected(
-                f"Daily order notional would exceed ${self.settings.max_daily_order_notional:,.2f}"
+                f"Daily order notional would exceed ${float(policy['max_daily_order_notional']):,.2f}"
             )
+        pending_buy = sum(
+            max(0.0, self._number(order, "qty") - self._number(order, "dealt_qty"))
+            * self._number(order, "price")
+            for order in snap["orders"]
+            if str(order.get("trd_side") or "").upper() == "BUY"
+            and str(order.get("order_status") or "").upper() not in terminal_statuses
+            and str(order.get("remark") or "").startswith("dashboard:")
+        )
+        pending_sell = sum(
+            max(0.0, self._number(order, "qty") - self._number(order, "dealt_qty"))
+            for order in snap["orders"]
+            if str(order.get("code") or "") == code
+            and str(order.get("trd_side") or "").upper() == "SELL"
+            and str(order.get("order_status") or "").upper() not in terminal_statuses
+            and str(order.get("remark") or "").startswith("dashboard:")
+        )
+        try:
+            self.control.pretrade_guard(side, code, qty, limit_price,
+                                        pending_buy_notional=pending_buy,
+                                        pending_sell_qty=pending_sell)
+        except ControlRejected as exc:
+            raise LiveTradeRejected(str(exc)) from exc
         payload = {"code": code, "side": side, "qty": int(qty),
                    "limit_price": round(float(limit_price), 6),
                    "account_id": int(snap["account_id"]), "issued_at": int(time.time()),
-                   "preview_id": secrets.token_hex(16)}
+                   "preview_id": secrets.token_hex(16),
+                   "config_version": int(self.control.snapshot().config_version)}
         token = self._sign_preview(payload)
         # A durable ready record is required before the preview can leave the
         # server. If the audit DB is unavailable, preview fails closed.
@@ -590,6 +698,8 @@ class MoomooClient:
             raise LiveTradeRejected("Real trading is disabled on the server")
         if self.settings.account_id <= 0:
             raise LiveTradeRejected("MOOMOO_ACCOUNT_ID must explicitly select a real account")
+        if not self.settings.dedicated_account_confirmed:
+            raise LiveTradeRejected("Real trading requires a verified dedicated Moomoo account or sub-account")
         config_errors = self.settings.configuration_errors()
         if config_errors:
             raise LiveTradeRejected("Invalid live-trade configuration: " + "; ".join(config_errors))
@@ -606,6 +716,8 @@ class MoomooClient:
             fresh = self.preview_order(code=payload["code"], side=payload["side"],
                                        qty=payload["qty"], limit_price=payload["limit_price"],
                                        _register=False)
+            if int(payload.get("config_version", -1)) != int(fresh.get("config_version", -2)):
+                raise LiveTradeRejected("Strategy configuration changed after order preview")
             if int(payload["account_id"]) != int(fresh["account_id"]):
                 raise LiveTradeRejected("Moomoo account changed after order preview")
             with self._trade_context() as ctx:
@@ -631,8 +743,8 @@ class MoomooClient:
 
     def cancel_order(self, order_id: str, auth_token: str) -> dict[str, Any]:
         self.authenticate_trade_token(auth_token)
-        if not self.settings.trading_enabled or not self.settings.password_md5:
-            raise LiveTradeRejected("Real trading cancellation is disabled")
+        if not self.settings.password_md5:
+            raise LiveTradeRejected("Moomoo cancellation unlock secret is not configured")
         if self.settings.account_id <= 0:
             raise LiveTradeRejected("MOOMOO_ACCOUNT_ID must explicitly select a real account")
         if not str(order_id).strip():
@@ -669,3 +781,41 @@ class MoomooClient:
                     ) from exc
                 rows = self._records(self._result(broker_result, "cancel order"))
         return {"accepted": True, "source": "Moomoo OpenD", "order": rows[0] if rows else {}}
+
+    def cancel_all_module_orders(self, auth_token: str) -> dict[str, Any]:
+        self.authenticate_trade_token(auth_token)
+        snapshot = self.snapshot()
+        terminal = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
+        candidates = [row for row in snapshot.get("orders", [])
+                      if str(row.get("remark") or "").startswith("dashboard:")
+                      and str(row.get("order_status") or "").upper() not in terminal]
+        cancelled, errors = [], []
+        for row in candidates:
+            order_id = str(row.get("order_id") or "")
+            remark = str(row.get("remark") or "")
+            preview_id = remark.rsplit(":", 1)[-1] if remark.startswith("dashboard:") else ""
+            authorized = (is_module_order(order_id, self.settings.account_id)
+                          or is_module_preview(preview_id, self.settings.account_id))
+            if not order_id or not authorized:
+                errors.append("module_order_not_reconciled")
+                continue
+            try:
+                self.cancel_order(order_id, auth_token)
+                cancelled.append(hashlib.sha256(order_id.encode()).hexdigest()[:12])
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        return {"requested": len(candidates), "cancelled": len(cancelled),
+                "cancelled_refs": cancelled, "errors": errors}
+
+    def module_order_authorized(self, order_id: str) -> bool:
+        snapshot = self.snapshot()
+        row = next((item for item in snapshot.get("orders", [])
+                    if str(item.get("order_id") or "") == str(order_id)), None)
+        if not row:
+            return False
+        remark = str(row.get("remark") or "")
+        if not remark.startswith("dashboard:"):
+            return False
+        preview_id = remark.rsplit(":", 1)[-1]
+        return (is_module_order(order_id, self.settings.account_id)
+                or is_module_preview(preview_id, self.settings.account_id))

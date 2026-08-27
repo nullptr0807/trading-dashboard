@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi.testclient import TestClient
+
+import api.live_account as live_api
+from core.live_strategy_control import LiveStrategyStore
+from core.moomoo_client import MoomooClient, MoomooSettings
+from server import app
+
+
+def setup_client(tmp_path, monkeypatch):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    settings = MoomooSettings(read_api_token="r", control_api_token="c")
+    client = MoomooClient(settings=settings, control_store=store)
+    monkeypatch.setattr(live_api, "_client", client)
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
+    return TestClient(app), store
+
+
+def test_control_read_requires_separate_read_token(tmp_path, monkeypatch):
+    http, _ = setup_client(tmp_path, monkeypatch)
+    assert http.get("/api/live-account/control").status_code == 401
+    result = http.get("/api/live-account/control",
+                      headers={"X-Moomoo-Read-Token": "r"})
+    assert result.status_code == 200
+    body = result.json()
+    assert body["hard_limits"] == {"initial_capital": 10_000, "exposure_cap": 10_000,
+                                   "loss_floor": 7_500, "regular_hours_only": True}
+    assert body["state"]["lifecycle"] == "FROZEN"
+
+
+def test_cors_rejects_untrusted_origins_and_allows_dashboard_origin(tmp_path, monkeypatch):
+    http, _ = setup_client(tmp_path, monkeypatch)
+    preflight = {"Access-Control-Request-Method": "GET"}
+    evil = http.options("/api/live-account/status",
+                        headers={"Origin": "https://untrusted.invalid", **preflight})
+    assert evil.headers.get("access-control-allow-origin") is None
+    trusted = http.options("/api/live-account/status",
+                           headers={"Origin": "https://www.gexinhub.com", **preflight})
+    assert trusted.headers.get("access-control-allow-origin") == "https://www.gexinhub.com"
+
+
+def test_config_hot_reload_requires_control_token_and_version(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    version = store.config()["version"]
+    payload = {"expected_version": version,
+               "patch": {"top_n": 5, "position_target_pct": 0.17,
+                         "stop_cooldown_hours": 48},
+               "reason": "paper candidate promotion"}
+    assert http.put("/api/live-account/control/config", json=payload).status_code == 401
+    result = http.put("/api/live-account/control/config", json=payload,
+                      headers={"X-Moomoo-Control-Token": "c"})
+    assert result.status_code == 200
+    assert result.json()["version"] == version + 1
+    assert store.config()["values"]["stop_cooldown_hours"] == 48
+    stale = http.put("/api/live-account/control/config", json=payload,
+                     headers={"X-Moomoo-Control-Token": "c"})
+    assert stale.status_code == 409
+
+
+def test_one_click_freeze_and_guarded_unfreeze(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    with store.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+                    "freeze_reason=NULL,last_sync_at=? WHERE id=1",
+                    (datetime.now(timezone.utc).isoformat(),))
+    headers = {"X-Moomoo-Control-Token": "c"}
+    frozen = http.post("/api/live-account/control/freeze", headers=headers,
+                       json={"confirmation": "FREEZE LIVE TRADING", "reason": "user switch"})
+    assert frozen.status_code == 200
+    assert store.snapshot().frozen
+    assert frozen.json()["cancellation"]["attempted"] is False
+    wrong = http.post("/api/live-account/control/unfreeze", headers=headers,
+                      json={"confirmation": "wrong", "reason": "operator review complete"})
+    assert wrong.status_code == 400
+    store.mark_to_market({}, sync_complete=True)
+    active = http.post("/api/live-account/control/unfreeze", headers=headers,
+                       json={"confirmation": "UNFREEZE LIVE TRADING",
+                             "reason": "operator review complete"})
+    assert active.status_code == 200
+    assert store.snapshot().lifecycle == "ACTIVE"
+
+
+def test_unfreeze_rejects_unknown_broker_outcome(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    with store.connect() as con:
+        con.execute("UPDATE strategy_state SET last_sync_at=? WHERE id=1",
+                    (datetime.now(timezone.utc).isoformat(),))
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 1)
+    result = http.post("/api/live-account/control/unfreeze",
+                       headers={"X-Moomoo-Control-Token": "c"},
+                       json={"confirmation": "UNFREEZE LIVE TRADING",
+                             "reason": "operator review complete"})
+    assert result.status_code == 409
+    assert store.snapshot().lifecycle == "FROZEN"
+
+
+def test_cleanup_fails_closed_when_strategy_owns_shares(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    with store.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+                    "freeze_reason=NULL,last_sync_at='synced' WHERE id=1")
+    store.apply_fill("runtime-fill", "US.AAPL", "BUY", 1, 100)
+    result = http.post("/api/live-account/control/cleanup",
+                       headers={"X-Moomoo-Control-Token": "c"},
+                       json={"confirmation": "FREEZE ARCHIVE AND CLEAN STRATEGY",
+                             "reason": "candidate failed"})
+    assert result.status_code == 409
+    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().strategy_id == "B16"
+
+
+def test_cleanup_rejects_active_broker_module_order(tmp_path, monkeypatch):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    settings = MoomooSettings(account_id=1, control_api_token="c")
+    client = MoomooClient(settings=settings, control_store=store)
+    client.snapshot = lambda: {
+        "activity_warnings": [],
+        "orders": [{"order_id": "runtime", "order_status": "SUBMITTED",
+                    "remark": "dashboard:B16:runtime"}],
+    }
+    monkeypatch.setattr(live_api, "_client", client)
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
+    monkeypatch.setattr(live_api, "known_module_order_ids", lambda *_: set())
+    result = TestClient(app).post(
+        "/api/live-account/control/cleanup",
+        headers={"X-Moomoo-Control-Token": "c"},
+        json={"confirmation": "FREEZE ARCHIVE AND CLEAN STRATEGY",
+              "reason": "candidate failed"},
+    )
+    assert result.status_code == 409
+    assert store.snapshot().strategy_id == "B16"
+
+
+def test_cleanup_rejects_when_broker_account_is_not_configured(tmp_path, monkeypatch):
+    store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    client = MoomooClient(
+        settings=MoomooSettings(account_id=0, control_api_token="c"),
+        control_store=store,
+    )
+    monkeypatch.setattr(live_api, "_client", client)
+    monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
+    result = TestClient(app).post(
+        "/api/live-account/control/cleanup",
+        headers={"X-Moomoo-Control-Token": "c"},
+        json={"confirmation": "FREEZE ARCHIVE AND CLEAN STRATEGY",
+              "reason": "candidate failed"},
+    )
+    assert result.status_code == 409
+    assert "configured Moomoo account" in result.json()["detail"]
+    assert store.snapshot().strategy_id == "B16"

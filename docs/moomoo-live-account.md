@@ -46,6 +46,7 @@ MOOMOO_SECURITY_FIRM=FUTUAU
 MOOMOO_TRADE_MARKET=US
 MOOMOO_CURRENCY=USD
 MOOMOO_ACCOUNT_ID=<真实账户ID>
+MOOMOO_DEDICATED_ACCOUNT_CONFIRMED=false
 
 # 第一阶段保持关闭
 MOOMOO_TRADING_ENABLED=false
@@ -154,3 +155,103 @@ MOOMOO_AUTO_TRADING_ENABLED=false
 - 预览被篡改或过期；
 - Moomoo实时行情失效；
 - 净值、现金、持仓或价格门禁失败。
+
+## 不可突破的$10,000子账本
+
+Moomoo整账户资金和持仓只作为券商事实展示，不能直接形成策略购买力。实盘策略使用独立数据库`data/live_strategy.db`：
+
+```text
+初始策略资金：         USD 10,000
+最大策略持仓+BUY预留： USD 10,000
+强制冻结权益：         USD 7,500
+交易时段：             美股正常盘中9:30–16:00 ET
+```
+
+这些值是数据库CHECK约束和服务端常量，不属于Dashboard可编辑参数。账户里超过USD 10,000的现金不能增加策略购买力。
+
+只有下列股份属于本系统：
+
+1. 订单备注由服务端生成`dashboard:<strategy>:<preview>`；
+2. Moomoo返回该订单的真实成交；
+3. 五分钟对账器取得费用记录并成功应用该成交；
+4. 成交外部引用只以SHA-256用于幂等，原始引用不进入源码。
+
+其他Moomoo股票显示为`EXTERNAL READ-ONLY`，系统SELL预览会拒绝出售它们。若账户中同一股票同时含系统股份和外部股份，可卖上限仍取独立子账本数量。
+
+市场跳空可能令已持有股票的市值瞬间超过USD 10,000，这是交易系统无法在价格跳变前物理阻止的市场机制。发生后系统禁止加仓、立即freeze并要求在正常交易时段处理减仓。
+
+共享Moomoo账户只能做逻辑隔离：系统能拒绝外部lot并检测手工改动，但无法阻止用户在Moomoo App中手工卖出策略股份。为满足“绝不交易个人原有股票”的强约束，真实下单还必须设置并验收专用券商子账户/独立账户；`MOOMOO_DEDICATED_ACCOUNT_CONFIRMED=true`是不可缺少的下单门禁。共享账户可以只读连接，但不得设置该值。
+
+## Freeze状态机
+
+```text
+FROZEN -> ACTIVE     仅在Moomoo成功对账、权益高于USD 7,500、明确确认及控制令牌通过后
+ACTIVE -> FROZEN     一键手工freeze或任一确定性风险异常
+FROZEN -> CLEANED    仅空仓且无BUY预留；先归档，再删除有效策略配置
+```
+
+权益小于等于USD 7,500时，loss-floor freeze被锁定；参数修改不能重置。Freeze禁止新订单，但允许系统识别和报告待撤订单。是否在loss-floor触发时强制卖出持仓，需上线前由用户明确决定；当前安全默认是不自动产生新的卖出成交。
+
+Unfreeze要求对账时间晚于最近一次freeze/参数更新且不超过7分钟；freeze前的旧同步不能复用。关闭新订单总开关不会关闭紧急撤单能力，撤单仍仅限本模块经本地preview证明的订单。
+
+## 参数热更新
+
+Dashboard可编辑：持仓数、单股目标、总目标敞口、止损、冷却、最短持仓、持有缓冲、再平衡、订单金额、每日金额、限价偏离、行情最大年龄。
+
+每次更新必须提供：
+
+- 独立`MOOMOO_CONTROL_API_TOKEN`；
+- 当前配置版本；
+- 变更原因。
+
+服务端采用乐观版本锁并持久化新版本。订单预览每次从SQLite重新读取活动版本，不依赖进程缓存。更新立即写入并自动freeze为`config_changed_requires_review`；旧订单预览绑定旧版本而失效，人工复核后才能unfreeze。`USD 10,000 / USD 7,500 / RTH only / 禁止卖空融资`不可编辑。
+
+## 本地日志与对账
+
+本地权限目录：
+
+```text
+logs/live_account/dashboard-api.jsonl
+logs/live_account/moomoo-sync.jsonl
+logs/live_account/health-watchdog.jsonl
+data/live_strategy.db
+data/moomoo_live_audit.db
+```
+
+结构化日志不记录请求头、正文、令牌或密码。事件表记录因子计算、信号、成交、freeze、参数reload、同步和cleanup。日志文件轮转，权限为`0600`；目录为`0700`。
+
+## 调度模块
+
+以下永久调度已创建但在连接验收前全部暂停：
+
+- 每5分钟：Moomoo成交/费用/持仓/价格对账；
+- 每10分钟：确定性健康检测，异常直接freeze并Telegram告警；
+- 每10分钟：GPT-5.6健康归因；
+- 美股盘中每10分钟：GPT-5.6只读Paper候选研究；
+- 工作日22:15 UTC：GPT-5.6盘后报告。
+
+AI没有unfreeze、实盘配置修改或broker mutation权限。确定性watchdog先于AI执行，避免模型/网络失效导致风险门禁失效。
+
+健康AI使用只读诊断快照；只有确定性watchdog可以写freeze或执行紧急撤单。
+
+Cleanup必须同时证明本地零持仓/零BUY预留、Moomoo零本模块活动订单且没有未知Broker结果。SQLite归档使用online backup合并WAL后再打包，不能直接复制运行中的主文件。
+
+## Paper对照
+
+页面实线为USD 10,000实盘子账本；虚线明确标记`PAPER`。当前只读同步包括：
+
+- A02 paper账户参考曲线；
+- A09 paper账户参考曲线；
+- B16调参候选：8%止损、72小时冷却、Top 6、无移动止损的1小时研究回放。
+
+Paper数据永远不能直接进入实盘执行器。任何候选晋级都必须另行通过时间切分、交易成本、换手、回撤和影子运行门槛。
+
+## 凭据存储
+
+systemd只读取仓库外的可选文件：
+
+```text
+/home/gexin/.config/trading-dashboard/moomoo.env
+```
+
+上线时该文件必须为`0600`，仅由`gexin`拥有。禁止把真实账户ID、交易流水号、密码、MD5、令牌或密钥写入源码、Git、文档、Telegram摘要或普通日志。连接阶段再通过私密交互逐项提供，不提前收集。

@@ -2,7 +2,9 @@
 (()=>{
 let _laPreview = null;
 let _laReadToken = '';
+let _laControlToken = '';
 let _laChart = null;
+let _laRefreshTimer = null;
 
 function laLang() { return (typeof getLang === 'function' && getLang() === 'zh') ? 'zh' : 'en'; }
 function laT(zh, en) { return laLang() === 'zh' ? zh : en; }
@@ -12,6 +14,7 @@ function laNum(row, ...keys) {
   return 0;
 }
 function laMoney(v) { return '$' + Number(v || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function laTime(v) { if(!v)return '—'; const d=new Date(v); return Number.isNaN(d.getTime())?String(v):d.toLocaleString(); }
 function laPct(v) { const n = Number(v || 0); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`; }
 function laClass(v) { return Number(v) > 0 ? 'la-positive' : Number(v) < 0 ? 'la-negative' : '' ; }
 async function laFetch(path, options) {
@@ -31,6 +34,9 @@ function laStatusItem(ok, label, detail) {
 function laPolicyCard(policy) {
   const rows = [
     [laT('策略', 'Strategy'), policy.strategy_id],
+    [laT('独立初始本金', 'Independent initial capital'), '$10,000.00'],
+    [laT('不可变仓位上限', 'Immutable exposure cap'), laMoney(policy.strategy_capital_limit)],
+    [laT('25%损失冻结线', '25% loss freeze floor'), laMoney(policy.strategy_loss_floor)],
     [laT('目标持仓', 'Target positions'), `${policy.top_n} ${laT('只', 'stocks')}`],
     [laT('单股目标', 'Target per position'), `${(policy.position_target_pct*100).toFixed(1)}%`],
     [laT('总目标敞口', 'Target gross exposure'), `${(policy.gross_target_pct*100).toFixed(0)}%`],
@@ -59,6 +65,7 @@ function laSetup(status) {
     ${laStatusItem(status.sdk_installed, laT('官方Python SDK','Official Python SDK'), status.sdk_installed ? laT('已安装','Installed') : laT('未安装','Missing'))}
     ${laStatusItem(status.opend_connected, 'Moomoo OpenD', status.opend_connected ? laT('已连接','Connected') : (status.message || '127.0.0.1:11111'))}
     ${laStatusItem(status.real_account_selected, laT('真实账户','Real account'), status.account_id ? `ID ${status.account_id}` : laT('尚未选择','Not selected'))}
+    ${laStatusItem(status.dedicated_account_confirmed, laT('专用策略子账户','Dedicated strategy account'), status.dedicated_account_confirmed ? laT('已验收','Verified') : laT('未验收；真实下单禁止','Not verified; live orders blocked'))}
     ${laStatusItem(status.trade_token_configured, laT('交易授权令牌','Trade authorization token'), status.trade_token_configured ? laT('已配置','Configured') : laT('未配置；只能读取','Missing; read-only'))}
     ${laStatusItem(status.read_token_configured, laT('账户读取授权','Account read authorization'), status.read_access_granted ? laT('本次页面已授权','Authorized for this page') : status.read_token_configured ? laT('需要输入读取令牌','Token required') : laT('服务器尚未配置','Not configured on server'))}
     ${laStatusItem(status.unlock_secret_configured, laT('交易解锁密文','Trade unlock secret'), status.unlock_secret_configured ? laT('已配置','Configured') : laT('未配置；无法下单','Missing; ordering blocked'))}
@@ -74,6 +81,42 @@ function laSetup(status) {
 
 function laReadAuthCard() {
   return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">PRIVATE DATA</span><h2>${laT('解锁真实账户只读数据','Unlock private account data')}</h2></div></div><p class="la-note">${laT('读取令牌只保留在当前页面内存，不写入浏览器存储。','The read token stays in this page memory and is not written to browser storage.')}</p><div class="la-order-form"><label>${laT('账户读取令牌','Account read token')}<input id="la-read-token" type="password" autocomplete="off"></label><button class="la-btn" id="la-read-unlock">${laT('读取Moomoo账户','Load Moomoo account')}</button></div></section>`;
+}
+
+function laControlPanel(control) {
+  const s=control.state||{}, c=(control.config||{}).values||{}, frozen=s.lifecycle!=='ACTIVE';
+  const ret=(Number(s.strategy_equity||10000)/10000-1)*100;
+  const fields=[
+    ['top_n',laT('最大持仓股票数','Max positions'),'number','1'],
+    ['position_target_pct',laT('单股目标比例','Target per position'),'number','0.001'],
+    ['gross_target_pct',laT('目标总敞口','Target gross exposure'),'number','0.01'],
+    ['stop_loss_pct',laT('固定止损','Fixed stop'),'number','0.01'],
+    ['stop_cooldown_hours',laT('止损冷却小时','Cooldown hours'),'number','1'],
+    ['min_hold_days',laT('最小持仓日','Minimum hold days'),'number','1'],
+    ['hold_band_mult',laT('持有缓冲倍数','Hold-band multiple'),'number','1'],
+    ['rebalance_hours',laT('再平衡小时','Rebalance hours'),'number','1'],
+    ['max_order_notional',laT('单笔上限USD','Max order USD'),'number','1'],
+    ['max_daily_order_notional',laT('每日订单上限USD','Daily order USD'),'number','1'],
+    ['max_limit_deviation_pct',laT('限价偏离','Limit deviation'),'number','0.001'],
+    ['max_quote_age_seconds',laT('行情最大年龄秒','Max quote age seconds'),'number','1'],
+  ];
+  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">$10K STRATEGY SUB-LEDGER</span><h2>${laT('独立策略资金与交易总开关','Independent capital & master switch')}</h2></div><span class="la-risk-badge ${frozen?'':'ok'}">${laEsc(s.lifecycle||'UNKNOWN')}</span></div>
+  <div class="la-metrics"><div class="la-metric hero"><small>${laT('策略权益（不是整账户）','Strategy equity — not account NAV')}</small><b>${laMoney(s.strategy_equity)}</b><span class="${laClass(ret)}">${laPct(ret)}</span></div><div class="la-metric"><small>${laT('策略现金','Strategy cash')}</small><b>${laMoney(s.allocated_cash)}</b></div><div class="la-metric"><small>${laT('系统持仓市值','Owned market value')}</small><b>${laMoney(s.owned_market_value)}</b></div><div class="la-metric"><small>${laT('不可变仓位上限','Immutable exposure cap')}</small><b>$10,000.00</b></div><div class="la-metric"><small>${laT('不可变停机线','Immutable loss floor')}</small><b>$7,500.00</b></div><div class="la-metric"><small>${laT('最后5分钟对账','Last reconciliation')}</small><b>${laEsc(laTime(s.last_sync_at))}</b></div></div>
+  <div class="la-order-warning">${frozen?laT(`系统已冻结：${s.freeze_reason||'未启用'}`,`System frozen: ${s.freeze_reason||'not armed'}`):laT('系统ACTIVE；所有订单仍需通过$10k、持仓归属和盘中门禁。','System ACTIVE; every order still passes capital, ownership and RTH gates.')}</div>
+  <div class="la-order-form"><label>${laT('控制令牌（仅页面内存）','Control token — page memory only')}<input id="la-control-token" type="password" autocomplete="off"></label><label>${laT('操作原因','Action reason')}<input id="la-control-reason" maxlength="500" autocomplete="off"></label><button class="la-btn danger" id="la-freeze">FREEZE</button><button class="la-btn" id="la-unfreeze">UNFREEZE</button><button class="la-link danger" id="la-cleanup">${laT('冻结、归档并清理策略','Freeze, archive & clean')}</button></div>
+  <details class="la-config"><summary>${laT('编辑并立即热更新交易参数','Edit and hot-reload trading parameters')} · v${control.config&&control.config.version||'—'}</summary><form id="la-config-form" class="la-order-form">${fields.map(([k,label,type,step])=>`<label>${laEsc(label)}<input data-la-param="${k}" type="${type}" step="${step}" value="${laEsc(c[k])}"></label>`).join('')}<label>${laT('变更原因','Change reason')}<input id="la-config-reason" required maxlength="500"></label><button class="la-btn" type="submit">${laT('验证并立即Reload','Validate & reload now')}</button></form></details></section>`;
+}
+
+function laOwnedPositions(control) {
+  const items=control.owned_positions||[];
+  if(!items.length)return `<div class="la-empty">${laT('尚无本系统拥有的仓位；Moomoo原有股票全部隔离。','No strategy-owned positions. Existing Moomoo holdings are isolated.')}</div>`;
+  return `<div class="la-table-wrap"><table class="la-table"><thead><tr><th>${laT('标的','Symbol')}</th><th>${laT('系统拥有数量','Owned qty')}</th><th>${laT('均价','Average cost')}</th><th>${laT('现价','Last')}</th><th>${laT('市值','Market value')}</th><th>${laT('已实现盈亏','Realized P&L')}</th></tr></thead><tbody>${items.map(p=>`<tr><td><b>${laEsc(p.symbol)}</b></td><td>${laNum(p,'quantity')}</td><td>${laMoney(p.average_cost)}</td><td>${laMoney(p.market_price)}</td><td>${laMoney(p.market_value)}</td><td class="${laClass(p.realized_pnl)}">${laMoney(p.realized_pnl)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function laEvents(control) {
+  const items=control.events||[];
+  if(!items.length)return `<div class="la-empty">${laT('暂无事件','No events')}</div>`;
+  return `<div class="la-table-wrap"><table class="la-table compact"><thead><tr><th>${laT('时间','Time')}</th><th>${laT('类型','Type')}</th><th>${laT('来源','Source')}</th><th>${laT('事件','Event')}</th></tr></thead><tbody>${items.slice(0,200).map(e=>`<tr><td>${laEsc(laTime(e.ts))}</td><td><b>${laEsc(e.event_type)}</b><small>${laEsc(e.severity)}</small></td><td>${laEsc(e.source)}</td><td>${laEsc(e.message)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function laMetrics(snapshot) {
@@ -95,11 +138,12 @@ function laMetrics(snapshot) {
   </div>`;
 }
 
-function laPositions(items, accountNav) {
+function laPositions(items, accountNav, ownedPositions=[]) {
+  const owned=Object.fromEntries(ownedPositions.map(p=>[p.symbol,Number(p.quantity||0)]));
   if (!items.length) return `<div class="la-empty">${laT('当前没有持仓','No open positions')}</div>`;
-  return `<div class="la-table-wrap"><table class="la-table"><thead><tr><th>${laT('标的','Symbol')}</th><th>${laT('数量/可卖','Qty / sellable')}</th><th>${laT('现价','Last')}</th><th>${laT('成本','Cost')}</th><th>${laT('市值','Market value')}</th><th>${laT('盈亏','P&L')}</th><th>${laT('组合占比','Weight')}</th></tr></thead><tbody>${items.map(p=>{
-    const pl=laNum(p,'pl_val'), ratio=laNum(p,'pl_ratio'), mv=laNum(p,'market_val');
-    return `<tr><td><b>${laEsc(p.code)}</b><small>${laEsc(p.stock_name||p.name||'')}</small></td><td>${laNum(p,'qty').toLocaleString()}<small>${laT('可卖','sell')} ${laNum(p,'can_sell_qty','qty').toLocaleString()}</small></td><td>${laMoney(laNum(p,'nominal_price','last_price'))}</td><td>${laMoney(laNum(p,'cost_price'))}</td><td>${laMoney(mv)}</td><td class="${laClass(pl)}"><b>${laMoney(pl)}</b><small>${laPct(ratio)}</small></td><td>${accountNav>0?(mv/accountNav*100).toFixed(1)+'%':'—'}</td></tr>`;
+  return `<div class="la-table-wrap"><table class="la-table"><thead><tr><th>${laT('标的','Symbol')}</th><th>${laT('数量/可卖','Qty / sellable')}</th><th>${laT('归属','Ownership')}</th><th>${laT('现价','Last')}</th><th>${laT('成本','Cost')}</th><th>${laT('市值','Market value')}</th><th>${laT('盈亏','P&L')}</th><th>${laT('组合占比','Weight')}</th></tr></thead><tbody>${items.map(p=>{
+    const pl=laNum(p,'pl_val'), ratio=laNum(p,'pl_ratio'), mv=laNum(p,'market_val'), own=owned[p.code]||0, external=Math.max(0,laNum(p,'qty')-own);
+    return `<tr><td><b>${laEsc(p.code)}</b><small>${laEsc(p.stock_name||p.name||'')}</small></td><td>${laNum(p,'qty').toLocaleString()}<small>${laT('可卖','sell')} ${laNum(p,'can_sell_qty','qty').toLocaleString()}</small></td><td>${own?`<b>${laT('系统','SYSTEM')} ${own}</b>`:''}${external?`<small>${laT('外部只读','EXTERNAL READ-ONLY')} ${external}</small>`:''}</td><td>${laMoney(laNum(p,'nominal_price','last_price'))}</td><td>${laMoney(laNum(p,'cost_price'))}</td><td>${laMoney(mv)}</td><td class="${laClass(pl)}"><b>${laMoney(pl)}</b><small>${laPct(ratio)}</small></td><td>${accountNav>0?(mv/accountNav*100).toFixed(1)+'%':'—'}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -121,43 +165,57 @@ function laOrderTicket(ready) {
   </form><div id="la-preview"></div></section>`;
 }
 
-function laRenderChart(history) {
-  const el=document.getElementById('la-nav-chart'); if(!el || !history || history.length<2 || !window.LightweightCharts) return;
+function laRenderChart(control) {
+  const el=document.getElementById('la-nav-chart'), history=control&&control.equity||[]; if(!el || !window.LightweightCharts) return;
   if(_laChart){try{_laChart.remove();}catch{} _laChart=null;}
-  _laChart=LightweightCharts.createChart(el,{width:el.clientWidth,height:230,layout:{background:{color:'#111827'},textColor:'#9fb0c7'},grid:{vertLines:{color:'#223049'},horzLines:{color:'#223049'}},rightPriceScale:{borderColor:'#34445e'},timeScale:{borderColor:'#34445e',timeVisible:true}});
-  const series=_laChart.addAreaSeries({lineColor:'#33e3a2',topColor:'rgba(51,227,162,.35)',bottomColor:'rgba(51,227,162,.02)',lineWidth:2});
-  const byDay={}; history.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.total_assets)});
-  series.setData(Object.entries(byDay).map(([time,value])=>({time,value})));_laChart.timeScale().fitContent();
-  new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}}).observe(el);
+  el.textContent='';
+  _laChart=LightweightCharts.createChart(el,{width:el.clientWidth,height:260,layout:{background:{color:'#111827'},textColor:'#9fb0c7'},grid:{vertLines:{color:'#223049'},horzLines:{color:'#223049'}},rightPriceScale:{borderColor:'#34445e'},timeScale:{borderColor:'#34445e',timeVisible:true}});
+  if(history.length){const series=_laChart.addAreaSeries({lineColor:'#33e3a2',topColor:'rgba(51,227,162,.35)',bottomColor:'rgba(51,227,162,.02)',lineWidth:2,title:laT('实盘$10k子账本','Live $10k sub-ledger')});const byDay={};history.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});series.setData(Object.entries(byDay).map(([time,value])=>({time,value})));}
+  const grouped={};(control.paper_series||[]).forEach(x=>(grouped[x.series_id]??=[]).push(x));
+  const colors=['#6aa9ff','#f4b860','#c792ea','#ff6b8a'];Object.entries(grouped).forEach(([id,rows],i)=>{const line=_laChart.addLineSeries({color:colors[i%colors.length],lineWidth:2,lineStyle:2,title:`PAPER · ${rows[0].label}`});const byDay={};rows.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});line.setData(Object.entries(byDay).map(([time,value])=>({time,value})));});
+  _laChart.timeScale().fitContent();new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}}).observe(el);
 }
 
 async function renderLiveAccountPage(token) {
+  if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
   const app=document.getElementById('app');
-  app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('账户、行情、持仓、订单和成交全部直接来自Moomoo OpenD；不混用模拟账本。','Account, quotes, positions, orders and deals come directly from Moomoo OpenD—never the paper ledger.')}</p></div><div class="la-hero-mark">$10K<span>${laT('最低净值门槛','MIN NAV GATE')}</span></div></section><div class="la-loading">${laT('正在检查Moomoo连接…','Checking Moomoo connection…')}</div></div>`;
+  app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('Moomoo整账户只读；交易仅使用独立$10,000子账本和系统拥有的股份。','The full Moomoo account is read-only; trading is restricted to the independent $10,000 sub-ledger and system-owned shares.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section><div class="la-loading">${laT('正在检查Moomoo连接…','Checking Moomoo connection…')}</div></div>`;
   try {
     const root=await laFetch('/status'); if(token && !isRouteCurrent(token,'/live-account'))return;
-    const st=root.status,p=root.policy; let snapshot=null;
+    const st=root.status,p=root.policy; let snapshot=null,control=null;
+    if(st.read_access_granted){try{control=await laFetch('/control');}catch(e){st.message=e.message;}}
     if(st.opend_connected&&st.real_account_selected&&st.read_access_granted){try{snapshot=await laFetch('/snapshot');}catch(e){st.message=e.message;}}
     if(token && !isRouteCurrent(token,'/live-account'))return;
-    app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('账户、行情、持仓、订单和成交全部直接来自Moomoo OpenD；不混用模拟账本。','Account, quotes, positions, orders and deals come directly from Moomoo OpenD—never the paper ledger.')}</p></div><div class="la-hero-mark">$10K<span>${laT('最低净值门槛','MIN NAV GATE')}</span></div></section>
-      <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读安全模式','READ-ONLY SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)}</span><button class="la-link" onclick="renderLiveAccountPage(window.__activeRouteToken)">${laT('刷新','Refresh')}</button></div>
-      ${laSetup(st)}${(st.read_token_configured&&!st.read_access_granted)?laReadAuthCard():''}${snapshot?laMetrics(snapshot):''}
-      ${snapshot?`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">NAV HISTORY</span><h2>${laT('连接后净值轨迹','NAV since connection')}</h2></div><span class="la-source">Moomoo snapshots</span></div><div id="la-nav-chart" class="la-chart">${(snapshot.nav_history||[]).length<2?laT('收集第二个快照后显示曲线','Chart appears after a second snapshot'):''}</div></section>`:''}
+    app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · LIVE CAPITAL</span><h1>${laT('真实账户','Live Account')}</h1><p>${laT('Moomoo整账户只读；交易仅使用独立$10,000子账本和系统拥有的股份。','The full Moomoo account is read-only; trading is restricted to the independent $10,000 sub-ledger and system-owned shares.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section>
+      <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)}</span><button class="la-link" id="la-refresh">${laT('刷新','Refresh')}</button></div>
+      ${(st.read_token_configured&&!st.read_access_granted)?laReadAuthCard():''}
+      ${control?laControlPanel(control):''}
+      ${control?`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>`:''}
+      ${control?`<section class="la-panel"><div class="la-section-head"><h2>${laT('本系统可交易持仓','Strategy-owned tradable positions')}</h2><span class="la-source">SYSTEM OWNED ONLY</span></div>${laOwnedPositions(control)}</section>`:''}
+      ${laSetup(st)}${snapshot?laMetrics(snapshot):''}
       ${laPolicyCard(p)}
-      ${snapshot?`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">POSITIONS</span><h2>${laT('当前持仓','Current positions')}</h2></div><span class="la-source">${snapshot.positions.length} ${laT('只','positions')}</span></div>${laPositions(snapshot.positions||[],laNum(snapshot.account,'total_assets','total_asset','net_asset'))}</section>`:''}
+      ${snapshot?`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">BROKER ACCOUNT · READ ONLY</span><h2>${laT('Moomoo整账户持仓','Full Moomoo account positions')}</h2></div><span class="la-source">${snapshot.positions.length} ${laT('只','positions')}</span></div>${laPositions(snapshot.positions||[],laNum(snapshot.account,'total_assets','total_asset','net_asset'),control&&control.owned_positions||[])}</section>`:''}
       ${snapshot?laOrderTicket(st.place_order_ready):''}
       ${(snapshot&&snapshot.activity_warnings&&snapshot.activity_warnings.length)?`<div class="la-error">${laT('部分历史流水读取失败：','Some activity history could not be loaded: ')} ${laEsc(snapshot.activity_warnings.join(' · '))}</div>`:''}
       ${snapshot?`<div class="la-two"><section class="la-panel"><div class="la-section-head"><h2>${laT('订单','Orders')}</h2></div>${laActivity(snapshot.orders||[],'order',st.place_order_ready)}</section><section class="la-panel"><div class="la-section-head"><h2>${laT('成交','Deals')}</h2></div>${laActivity(snapshot.deals||[],'deal',false)}</section></div>`:''}
-      <section class="la-panel"><details><summary>${laT('完整原始账户字段与数据来源','All raw account fields and provenance')}</summary><pre class="la-raw">${laEsc(JSON.stringify(snapshot?{source:snapshot.source,account_id:snapshot.account_id,fetched_at:snapshot.fetched_at,account:snapshot.account}:root,null,2))}</pre></details></section>
+      ${control?`<section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section>`:''}
+      <section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:snapshot&&snapshot.source||root.data_source,fetched_at:snapshot&&snapshot.fetched_at||null,state:control&&control.state||st},null,2))}</pre></details></section>
     </div>`;
-    if(snapshot){
-      laRenderChart(snapshot.nav_history||[]);
-      const form=document.getElementById('la-order-form');if(form)form.addEventListener('submit',laPreviewOrder);
-      document.querySelectorAll('[data-la-cancel]').forEach(btn=>btn.addEventListener('click',()=>laCancelOrder(decodeURIComponent(btn.dataset.laCancel||''))));
-    }
-    const readUnlock=document.getElementById('la-read-unlock');
-    if(readUnlock)readUnlock.addEventListener('click',()=>{_laReadToken=document.getElementById('la-read-token').value||'';renderLiveAccountPage(window.__activeRouteToken);});
+    if(control){laRenderChart(control);laBindControls(control);}
+    if(snapshot){const form=document.getElementById('la-order-form');if(form)form.addEventListener('submit',laPreviewOrder);document.querySelectorAll('[data-la-cancel]').forEach(btn=>btn.addEventListener('click',()=>laCancelOrder(decodeURIComponent(btn.dataset.laCancel||''))));}
+    const readUnlock=document.getElementById('la-read-unlock');if(readUnlock)readUnlock.addEventListener('click',()=>{_laReadToken=document.getElementById('la-read-token').value||'';renderLiveAccountPage(window.__activeRouteToken);});
+    const refresh=document.getElementById('la-refresh');if(refresh)refresh.addEventListener('click',()=>renderLiveAccountPage(window.__activeRouteToken));
+    _laRefreshTimer=setTimeout(()=>{if(isRouteCurrent(window.__activeRouteToken,'/live-account'))renderLiveAccountPage(window.__activeRouteToken);},300000);
   } catch(e){app.innerHTML=`<div class="la-shell"><div class="la-fatal"><h2>${laT('真实账户模块不可用','Live account module unavailable')}</h2><p>${laEsc(e.message)}</p></div></div>`;}
+}
+
+function laControlAuth(){const input=document.getElementById('la-control-token');if(input&&input.value)_laControlToken=input.value;return _laControlToken;}
+async function laControlCall(path,method,body){const token=laControlAuth();if(!token)throw new Error(laT('请输入控制令牌','Enter the control token'));return laFetch(path,{method,headers:{'Content-Type':'application/json','X-Moomoo-Control-Token':token},body:JSON.stringify(body)});}
+function laBindControls(control){
+  const freeze=document.getElementById('la-freeze');if(freeze)freeze.addEventListener('click',async()=>{try{const reason=document.getElementById('la-control-reason').value||'dashboard_one_click_freeze';await laControlCall('/control/freeze','POST',{confirmation:'FREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const unfreeze=document.getElementById('la-unfreeze');if(unfreeze)unfreeze.addEventListener('click',async()=>{if(prompt(laT('输入 UNFREEZE LIVE TRADING 确认','Type UNFREEZE LIVE TRADING to confirm'))!=='UNFREEZE LIVE TRADING')return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/unfreeze','POST',{confirmation:'UNFREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const cleanup=document.getElementById('la-cleanup');if(cleanup)cleanup.addEventListener('click',async()=>{if(prompt(laT('此操作只允许空仓执行。输入 FREEZE ARCHIVE AND CLEAN STRATEGY','Flat strategy only. Type FREEZE ARCHIVE AND CLEAN STRATEGY'))!=='FREEZE ARCHIVE AND CLEAN STRATEGY')return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/cleanup','POST',{confirmation:'FREEZE ARCHIVE AND CLEAN STRATEGY',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const form=document.getElementById('la-config-form');if(form)form.addEventListener('submit',async ev=>{ev.preventDefault();const patch={};form.querySelectorAll('[data-la-param]').forEach(el=>{patch[el.dataset.laParam]=Number(el.value);});try{await laControlCall('/control/config','PUT',{expected_version:control.config.version,patch,reason:document.getElementById('la-config-reason').value});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
 }
 
 async function laPreviewOrder(ev){ev.preventDefault();const out=document.getElementById('la-preview');out.innerHTML='<div class="la-loading">Checking Moomoo quote…</div>';_laPreview=null;
