@@ -48,6 +48,8 @@ def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):
     assert body["execution_summary"]["total_fees"] == 0.99
     assert body["owned_positions"][0]["symbol"] == "US.DRAM"
     assert set(body["fills"][0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
+    assert all(set(event) == {"ts", "event_type", "source", "severity", "message"}
+               for event in body["events"])
     for forbidden in ("account", "account_id", "positions", "orders", "deals", "order_fees"):
         assert forbidden not in body
 

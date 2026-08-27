@@ -122,6 +122,11 @@ async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
     """Public strategy sub-ledger only; never returns broker account data."""
     store = get_client().control
     try:
+        events = await asyncio.to_thread(store.recent_events, event_limit)
+        public_events = [
+            {key: row.get(key) for key in ("ts", "event_type", "source", "severity", "message")}
+            for row in events
+        ]
         return {
             "state": asdict(await asyncio.to_thread(store.snapshot)),
             "config": await asyncio.to_thread(store.config),
@@ -130,7 +135,7 @@ async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
             "fills": await asyncio.to_thread(store.fills, fill_limit),
             "equity": await asyncio.to_thread(store.equity_history),
             "paper_series": await asyncio.to_thread(store.paper_series),
-            "events": await asyncio.to_thread(store.recent_events, event_limit),
+            "events": public_events,
             "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
                             "loss_floor": 7_500, "regular_hours_only": True},
             "data_scope": "strategy_subledger_only",
