@@ -634,3 +634,8 @@ def test_live_dashboard_uses_strategy_only_public_view():
     assert "la-read-token" not in js
     assert "Full Moomoo account positions" not in js
     assert "Personal account cash, holdings and activity are never sent to this page." in js
+    assert "Live order ticket" not in js
+    assert "laFetch('/orders/place')" not in js
+    assert "Server setup" not in js
+    assert "la-event-scroll" in js
+    assert "Save & reload — control token required" in js
