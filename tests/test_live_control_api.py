@@ -37,6 +37,25 @@ def test_control_read_requires_separate_read_token(tmp_path, monkeypatch):
     assert body["state"]["lifecycle"] == "FROZEN"
 
 
+def test_preview_api_forwards_explicit_overnight_session(tmp_path, monkeypatch):
+    http, _ = setup_client(tmp_path, monkeypatch)
+    seen = {}
+
+    def fake_preview(**payload):
+        seen.update(payload)
+        return {**payload, "preview_token": "x" * 32}
+
+    monkeypatch.setattr(live_api.get_client(), "preview_order", fake_preview)
+    result = http.post(
+        "/api/live-account/orders/preview",
+        headers={"X-Moomoo-Read-Token": "r"},
+        json={"code": "DRAM", "side": "BUY", "qty": 1,
+              "limit_price": 58.5, "session": "OVERNIGHT"},
+    )
+    assert result.status_code == 200
+    assert seen["session"] == "OVERNIGHT"
+
+
 def test_cors_rejects_untrusted_origins_and_allows_dashboard_origin(tmp_path, monkeypatch):
     http, _ = setup_client(tmp_path, monkeypatch)
     preflight = {"Access-Control-Request-Method": "GET"}

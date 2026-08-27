@@ -32,6 +32,8 @@ class _Enum:
     SELL = "SELL"
     NORMAL = "NORMAL"
     CANCEL = "CANCEL"
+    RTH = "RTH"
+    OVERNIGHT = "OVERNIGHT"
 
 
 class FakeTradeContext:
@@ -93,7 +95,7 @@ class FakeQuoteContext:
 
 class FakeSDK:
     RET_OK = 0
-    TrdMarket = TrdEnv = SecurityFirm = TrdSide = OrderType = ModifyOrderOp = _Enum
+    TrdMarket = TrdEnv = SecurityFirm = TrdSide = OrderType = ModifyOrderOp = Session = _Enum
 
     def __init__(self):
         self.trade = FakeTradeContext()
@@ -251,6 +253,72 @@ def test_preview_rejects_outside_rth_and_stale_moomoo_quote():
     ]))
     with pytest.raises(LiveTradeRejected, match="market state"):
         closed.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100)
+
+
+def overnight_client(**overrides):
+    overrides.setdefault("manual_overnight_test_enabled", True)
+    c = client(**overrides)
+    c._clock = lambda: datetime(2026, 8, 27, 7, 16, 30, tzinfo=timezone.utc)
+    state = c.control.snapshot()
+    object.__setattr__(state, "last_sync_at", "2026-08-27T07:16:14+00:00")
+    c.control.snapshot = lambda: state
+    c._sdk.quote.get_market_snapshot = lambda codes: (0, pd.DataFrame([{
+        "code": codes[0], "last_price": 56.39, "bid_price": 58.91,
+        "ask_price": 58.97, "update_time": "2026-08-27 03:16:01",
+        "sec_status": "NORMAL",
+    }]))
+    c._sdk.quote.get_market_state = lambda codes: (0, pd.DataFrame([{
+        "code": codes[0], "market_state": "OVERNIGHT",
+    }]))
+    return c
+
+
+def test_overnight_acceptance_is_disabled_by_default():
+    c = overnight_client(manual_overnight_test_enabled=False)
+    with pytest.raises(LiveTradeRejected, match="overnight acceptance mode is disabled"):
+        c.preview_order(code="DRAM", side="BUY", qty=1, limit_price=58.5,
+                        session="OVERNIGHT")
+
+
+def test_overnight_acceptance_is_manual_long_one_share_only():
+    c = overnight_client()
+    with pytest.raises(LiveTradeRejected, match="BUY-only.*one share"):
+        c.preview_order(code="DRAM", side="SELL", qty=1, limit_price=58.5,
+                        session="OVERNIGHT")
+    with pytest.raises(LiveTradeRejected, match="BUY-only.*one share"):
+        c.preview_order(code="DRAM", side="BUY", qty=2, limit_price=58.5,
+                        session="OVERNIGHT")
+    invalid = overnight_client(auto_trading_enabled=True)
+    with pytest.raises(LiveTradeRejected, match="requires auto trading disabled"):
+        invalid.preview_order(code="DRAM", side="BUY", qty=1, limit_price=58.5,
+                              session="OVERNIGHT")
+
+
+def test_overnight_preview_and_place_bind_broker_session():
+    c = overnight_client(trading_enabled=True)
+    preview = c.preview_order(code="DRAM", side="BUY", qty=1,
+                              limit_price=58.5, session="OVERNIGHT")
+    assert preview["session"] == "OVERNIGHT"
+    assert preview["fill_outside_rth"] is True
+    assert preview["quote"]["ask_price"] == 58.97
+    result = c.place_order(preview["preview_token"], "t")
+    assert result["accepted"] is True
+    assert result["order"]["session"] == "OVERNIGHT"
+    assert bool(result["order"]["fill_outside_rth"]) is True
+
+
+def test_overnight_place_rejects_signed_fill_policy_mismatch():
+    c = overnight_client(trading_enabled=True)
+    preview = c.preview_order(code="DRAM", side="BUY", qty=1,
+                              limit_price=58.5, session="OVERNIGHT")
+    payload = c.verify_preview(preview["preview_token"])
+    payload["preview_id"] = uuid.uuid4().hex
+    payload["fill_outside_rth"] = False
+    register_preview(payload, c.settings.preview_ttl_seconds)
+    forged = c._sign_preview(payload)
+    with pytest.raises(LiveTradeRejected, match="fill policy changed"):
+        c.place_order(forged, "t")
+    assert c._sdk.trade.place_calls == 0
 
 
 def test_external_broker_position_is_never_strategy_sellable(tmp_path):

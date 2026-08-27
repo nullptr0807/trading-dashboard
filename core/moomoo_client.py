@@ -82,6 +82,7 @@ class MoomooSettings:
     max_limit_deviation_pct: float = 0.02
     preview_ttl_seconds: int = 90
     rth_only: bool = True
+    manual_overnight_test_enabled: bool = False
     max_quote_age_seconds: int = 120
     strategy_id: str = "B16"
     top_n: int = 6
@@ -118,6 +119,7 @@ class MoomooSettings:
             max_limit_deviation_pct=_float_env("MOOMOO_MAX_LIMIT_DEVIATION_PCT", 0.02),
             preview_ttl_seconds=_int_env("MOOMOO_PREVIEW_TTL_SECONDS", 90),
             rth_only=_bool_env("MOOMOO_RTH_ONLY", True),
+            manual_overnight_test_enabled=_bool_env("MOOMOO_MANUAL_OVERNIGHT_TEST_ENABLED", False),
             max_quote_age_seconds=_int_env("MOOMOO_MAX_QUOTE_AGE_SECONDS", 120),
             strategy_id=os.getenv("MOOMOO_STRATEGY_ID", "B16"),
             top_n=_int_env("MOOMOO_TOP_N", 6),
@@ -163,6 +165,7 @@ class MoomooSettings:
             "short_selling": False,
             "margin_orders": False,
             "rth_only": self.rth_only,
+            "manual_overnight_test_enabled": self.manual_overnight_test_enabled,
             "max_quote_age_seconds": self.max_quote_age_seconds,
             "fill_outside_rth": False,
             "top_n": self.top_n,
@@ -215,6 +218,8 @@ class MoomooSettings:
             errors.append("Auto trading requires the real-order master switch")
         if not self.rth_only:
             errors.append("Regular-hours-only trading is immutable")
+        if self.manual_overnight_test_enabled and self.auto_trading_enabled:
+            errors.append("Manual overnight acceptance mode requires auto trading disabled")
         if not 1 <= self.top_n <= 50:
             errors.append("Invalid top_n")
         if not 1 <= self.hold_band_mult <= 10:
@@ -273,6 +278,7 @@ class MoomooClient:
             "shared_account_risk_accepted": self.settings.shared_account_risk_accepted,
             "trading_enabled": self.settings.trading_enabled,
             "auto_trading_enabled": self.settings.auto_trading_enabled,
+            "manual_overnight_test_enabled": self.settings.manual_overnight_test_enabled,
             "config_version": int(state.config_version),
         }
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -612,11 +618,13 @@ class MoomooClient:
         ])
 
     def preview_order(self, *, code: str, side: str, qty: int, limit_price: float,
+                      session: str = "RTH",
                       _register: bool = True) -> dict[str, Any]:
         config_errors = self.settings.configuration_errors()
         if config_errors:
             raise LiveTradeRejected("Invalid live-trade configuration: " + "; ".join(config_errors))
         side = side.upper()
+        session = str(session or "RTH").upper()
         if side not in {"BUY", "SELL"}:
             raise LiveTradeRejected("Only BUY and SELL are supported")
         if int(qty) != qty or qty <= 0:
@@ -633,9 +641,16 @@ class MoomooClient:
                 and not self.control.broker_sync_proof_matches(self.current_sync_fingerprint())):
             raise LiveTradeRejected("Current account isolation generation requires a new broker reconciliation")
 
+        if session not in {"RTH", "OVERNIGHT"}:
+            raise LiveTradeRejected("Only RTH and OVERNIGHT sessions are supported")
+        if session == "OVERNIGHT":
+            if not self.settings.manual_overnight_test_enabled:
+                raise LiveTradeRejected("Manual overnight acceptance mode is disabled")
+            if self.settings.auto_trading_enabled or side != "BUY" or int(qty) != 1:
+                raise LiveTradeRejected("Overnight acceptance is manual BUY-only and limited to one share")
         eastern = now.astimezone(ZoneInfo("America/New_York"))
         minute = eastern.hour * 60 + eastern.minute
-        if eastern.weekday() >= 5 or not (570 <= minute < 960):
+        if session == "RTH" and (eastern.weekday() >= 5 or not (570 <= minute < 960)):
             raise LiveTradeRejected("Real orders are restricted to US regular trading hours")
         snap = self.snapshot()
         if snap.get("activity_warnings"):
@@ -643,8 +658,11 @@ class MoomooClient:
         quote = self.quote(code)
         if str(quote.get("sec_status") or "").upper() != "NORMAL":
             raise LiveTradeRejected("Moomoo does not report the symbol as normally tradable")
-        if str(quote.get("market_state") or "").upper() not in {"MORNING", "AFTERNOON"}:
+        market_state = str(quote.get("market_state") or "").upper()
+        if session == "RTH" and market_state not in {"MORNING", "AFTERNOON"}:
             raise LiveTradeRejected("Moomoo market state is not regular-hours trading")
+        if session == "OVERNIGHT" and market_state != "OVERNIGHT":
+            raise LiveTradeRejected("Moomoo market state is not overnight trading")
         quote_time = quote.get("update_time")
         try:
             parsed = datetime.fromisoformat(str(quote_time).replace("Z", "+00:00"))
@@ -655,13 +673,13 @@ class MoomooClient:
                 raise ValueError
         except (TypeError, ValueError):
             raise LiveTradeRejected("Moomoo quote timestamp is missing or stale")
-        last = quote["last_price"]
-        if last <= 0:
-            raise LiveTradeRejected("Moomoo returned an invalid last price")
-        deviation = abs(limit_price / last - 1)
+        reference_price = quote["last_price"] if session == "RTH" else quote["ask_price"]
+        if reference_price <= 0:
+            raise LiveTradeRejected("Moomoo returned an invalid session reference price")
+        deviation = abs(limit_price / reference_price - 1)
         if deviation > float(policy["max_limit_deviation_pct"]):
             raise LiveTradeRejected(
-                f"Limit price deviates {deviation:.2%} from Moomoo last price; "
+                f"Limit price deviates {deviation:.2%} from Moomoo session reference price; "
                 f"maximum is {float(policy['max_limit_deviation_pct']):.2%}"
             )
         notional = qty * limit_price
@@ -744,6 +762,7 @@ class MoomooClient:
             raise LiveTradeRejected(str(exc)) from exc
         payload = {"code": code, "side": side, "qty": int(qty),
                    "limit_price": round(float(limit_price), 6),
+                   "session": session, "fill_outside_rth": session == "OVERNIGHT",
                    "account_id": int(snap["account_id"]), "issued_at": int(time.time()),
                    "preview_id": secrets.token_hex(16),
                    "config_version": int(control_state.config_version),
@@ -756,7 +775,7 @@ class MoomooClient:
             register_preview(payload, self.settings.preview_ttl_seconds)
         return {**payload, "notional": notional, "quote": quote,
                 "order_type": "LIMIT", "time_in_force": "DAY",
-                "fill_outside_rth": False, "preview_token": token,
+                "preview_token": token,
                 "expires_in_seconds": self.settings.preview_ttl_seconds,
                 "place_order_ready": self.status()["place_order_ready"]}
 
@@ -810,6 +829,7 @@ class MoomooClient:
         with self._trade_lock, account_execution_lock(self.settings.account_id):
             fresh = self.preview_order(code=payload["code"], side=payload["side"],
                                        qty=payload["qty"], limit_price=payload["limit_price"],
+                                       session=payload.get("session", "RTH"),
                                        _register=False)
             if int(payload.get("config_version", -1)) != int(fresh.get("config_version", -2)):
                 raise LiveTradeRejected("Strategy configuration changed after order preview")
@@ -819,6 +839,11 @@ class MoomooClient:
                 raise LiveTradeRejected("Account isolation generation changed after order preview")
             if int(payload["account_id"]) != int(fresh["account_id"]):
                 raise LiveTradeRejected("Moomoo account changed after order preview")
+            if payload.get("session", "RTH") != fresh.get("session"):
+                raise LiveTradeRejected("Order session changed after order preview")
+            if ("fill_outside_rth" not in payload
+                    or bool(payload["fill_outside_rth"]) != bool(fresh["fill_outside_rth"])):
+                raise LiveTradeRejected("Extended-hours fill policy changed after order preview")
             with self._trade_context() as ctx:
                 account_id = self._select_account_id(self._account_rows(ctx))
                 if account_id != self.settings.account_id or account_id != int(payload["account_id"]):
@@ -829,7 +854,10 @@ class MoomooClient:
                         price=fresh["limit_price"], qty=fresh["qty"], code=fresh["code"],
                         trd_side=getattr(sdk.TrdSide, fresh["side"]),
                         order_type=sdk.OrderType.NORMAL, trd_env=sdk.TrdEnv.REAL,
-                        acc_id=account_id, time_in_force="DAY", fill_outside_rth=False,
+                        acc_id=account_id, time_in_force="DAY",
+                        fill_outside_rth=bool(fresh["fill_outside_rth"]),
+                        session=(sdk.Session.OVERNIGHT if fresh["session"] == "OVERNIGHT"
+                                 else sdk.Session.RTH),
                         remark=f"dashboard:{self.settings.strategy_id}:{payload['preview_id']}",
                     )
                 except Exception as exc:

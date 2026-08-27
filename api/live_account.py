@@ -46,6 +46,7 @@ class OrderPreviewRequest(BaseModel):
     side: Literal["BUY", "SELL", "buy", "sell"]
     qty: int = Field(gt=0, le=1_000_000)
     limit_price: float = Field(gt=0, le=1_000_000)
+    session: Literal["RTH", "OVERNIGHT", "rth", "overnight"] = "RTH"
 
 
 class OrderPlaceRequest(BaseModel):

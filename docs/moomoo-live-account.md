@@ -138,6 +138,15 @@ MOOMOO_AUTO_TRADING_ENABLED=false
 - 预览90秒内有效；
 - 输入`PLACE LIVE ORDER`和独立交易令牌后才能提交。
 
+一次性的隔夜验收可由操作者明确授权后临时设置：
+
+```text
+MOOMOO_MANUAL_OVERNIGHT_TEST_ENABLED=true
+MOOMOO_AUTO_TRADING_ENABLED=false
+```
+
+该门禁仅允许`OVERNIGHT`市场状态下的`BUY 1股`、`DAY LIMIT`，signed preview绑定session；Broker提交必须使用`Session.OVERNIGHT`和`fill_outside_rth=true`。价格偏离以新鲜隔夜ask为基准。验收结束后立即恢复为false。SELL、多股、自动交易、其他扩展时段均拒绝。
+
 ### 阶段三：自动量化交易
 
 当前模块展示自动交易参数和独立开关，但**没有开启生产自动下单调度**。在完成至少一次人工小额订单、撤单、成交和审计核对前，不应打开`MOOMOO_AUTO_TRADING_ENABLED`。后续自动执行器应独立完成：冻结信号、幂等订单ID、部分成交处理、订单对账、断线恢复、日内风险预算和kill switch。
