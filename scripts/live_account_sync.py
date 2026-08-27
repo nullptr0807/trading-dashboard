@@ -152,15 +152,14 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         raise ControlRejected("Explicit Moomoo account_mode is required for reconciliation")
     dedicated = bool(settings.dedicated_account_confirmed)
     shared_accepted = bool(settings and getattr(settings, "shared_account_risk_accepted", False))
-    baseline_confirmed = bool(settings and getattr(settings, "shared_account_baseline_confirmed", False))
     configured_mode = str(settings.account_mode).upper()
     account_isolation_mode = (
         "dedicated" if configured_mode == "DEDICATED" and dedicated
-        and not shared_accepted and not baseline_confirmed else
+        and not shared_accepted else
         "shared_restricted" if configured_mode == "SHARED_RESTRICTED"
-        and shared_accepted and baseline_confirmed and not dedicated else
+        and shared_accepted and not dedicated else
         "unverified" if configured_mode == "UNVERIFIED"
-        and not dedicated and not shared_accepted and not baseline_confirmed else "invalid"
+        and not dedicated and not shared_accepted else "invalid"
     )
     shared_read_only = bool(
         settings and account_isolation_mode == "unverified"
@@ -170,38 +169,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         raise ControlRejected("Invalid account isolation configuration cannot produce a broker sync proof")
     shared_external_allowed = shared_read_only or account_isolation_mode == "shared_restricted"
     owned_before = {row["symbol"] for row in store.positions()}
-    nonmodule_order_ids = {
-        str(row.get("order_id") or "") for row in snapshot.get("orders", [])
-        if str(row.get("order_id") or "") not in module_orders
-    }
-    nonmodule_activity_symbols = {
-        str(row.get("code") or "").upper() for row in snapshot.get("orders", [])
-        if str(row.get("order_id") or "") in nonmodule_order_ids and row.get("code")
-    }
-    nonmodule_activity_symbols.update(
-        str(row.get("code") or "").upper() for row in snapshot.get("deals", [])
-        if str(row.get("order_id") or "") not in module_orders and row.get("code")
-    )
-    manual_owned_conflicts = owned_before & nonmodule_activity_symbols
-    if manual_owned_conflicts:
-        store.record_manual_conflicts(
-            sorted(manual_owned_conflicts), "non_module_activity_on_strategy_owned_symbol"
-        )
-        raise ControlRejected(
-            "Strategy-owned symbol has non-module broker activity; possible manual lot disturbance"
-        )
     staged_symbols = {str(fill["symbol"]).upper() for fill in staged_fills}
-    if account_isolation_mode != "dedicated":
-        external_now = {
-            symbol for symbol, qty in broker_positions.items()
-            if qty > 1e-9 and symbol not in owned_before and symbol not in staged_symbols
-        }
-        store.add_external_symbols(
-            sorted(external_now | nonmodule_activity_symbols), "broker_external_history"
-        )
-    denied_staged = staged_symbols & store.denied_symbols()
-    if denied_staged:
-        raise ControlRejected("Module fill symbol belongs to persistent external-symbol denylist")
     unrelated_external = [
         symbol for symbol, qty in broker_positions.items()
         if qty > 1e-9 and symbol not in owned_before and symbol not in staged_symbols
@@ -223,6 +191,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     store.observe_runtime_fingerprint(fingerprint)
     applied = store.apply_fill_batch(
         staged_fills, broker_positions, prices, pending_buy, fingerprint,
+        allow_external_overlap=account_isolation_mode == "shared_restricted",
     )
     for preview_id, status, order_id in preview_finalizations:
         finalize_preview(preview_id, status, order_id)

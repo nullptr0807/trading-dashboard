@@ -646,7 +646,8 @@ class LiveStrategyStore:
 
     def apply_fill_batch(self, fills: list[dict[str, Any]],
                          broker_quantities: dict[str, float], prices: dict[str, float],
-                         reserved_buy_notional: float, sync_fingerprint: str) -> int:
+                         reserved_buy_notional: float, sync_fingerprint: str,
+                         allow_external_overlap: bool = False) -> int:
         """Atomically apply fills, marks, reservations, risk state, and sync proof."""
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -706,7 +707,9 @@ class LiveStrategyStore:
             for symbol, position in positions.items():
                 expected = float(position["quantity"])
                 actual = _finite(broker_quantities.get(symbol, 0.0), "broker_quantity")
-                if abs(actual - expected) > 1e-9:
+                mismatch = (actual + 1e-9 < expected if allow_external_overlap
+                            else abs(actual - expected) > 1e-9)
+                if mismatch:
                     raise ControlRejected(
                         "Broker quantity differs from staged strategy quantity; batch rolled back"
                     )

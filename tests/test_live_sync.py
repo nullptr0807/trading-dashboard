@@ -24,7 +24,6 @@ class FakeClient:
         account_mode="DEDICATED",
         dedicated_account_confirmed=True,
         shared_account_risk_accepted=False,
-        shared_account_baseline_confirmed=False,
         trading_enabled=False,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -88,17 +87,42 @@ def test_shared_first_module_buy_is_not_misclassified_as_external(tmp_path):
         account_mode="SHARED_RESTRICTED",
         dedicated_account_confirmed=False,
         shared_account_risk_accepted=True,
-        shared_account_baseline_confirmed=True,
         trading_enabled=True,
         auto_trading_enabled=False,
         trade_api_token="",
         password_md5="",
     )
+    data = client.snapshot()
+    data["positions"][0]["qty"] = 12  # 10 personal + 2 strategy
+    client.snapshot = lambda: data
     result = reconcile(client, store, ownership_proof=lambda *_: True)
     assert result["applied_fills"] == 1
     assert store.owned_quantity("US.AAPL") == 2
-    assert "US.AAPL" not in store.denied_symbols()
-    assert "US.MSFT" in store.denied_symbols()
+    assert store.owned_quantity("US.MSFT") == 0
+
+
+def test_shared_manual_sell_cannot_reduce_broker_below_strategy_owned_qty(tmp_path):
+    store = active_store(tmp_path)
+    store.apply_fill("strategy-owned", "US.AAPL", "BUY", 2, 100)
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode="SHARED_RESTRICTED",
+        dedicated_account_confirmed=False,
+        shared_account_risk_accepted=True,
+        trading_enabled=True,
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["orders"] = []
+    data["deals"] = []
+    data["order_fees"] = []
+    data["positions"] = [{"code": "US.AAPL", "qty": 1}]
+    client.snapshot = lambda: data
+    with pytest.raises(ControlRejected, match="staged strategy quantity"):
+        reconcile(client, store)
+    assert store.owned_quantity("US.AAPL") == 2
 
 
 def test_forged_dashboard_remark_without_local_proof_is_rejected(tmp_path):
@@ -172,7 +196,6 @@ def test_reconciliation_rejects_legacy_settings_without_explicit_account_mode(tm
     client.settings = SimpleNamespace(
         dedicated_account_confirmed=True,
         shared_account_risk_accepted=False,
-        shared_account_baseline_confirmed=False,
         trading_enabled=False,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -183,18 +206,17 @@ def test_reconciliation_rejects_legacy_settings_without_explicit_account_mode(tm
     assert store.positions() == []
 
 
-def test_shared_baseline_false_is_invalid_and_cannot_import_first_fill(tmp_path):
+def test_shared_mode_requires_explicit_mode_and_risk_acceptance(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
     client.settings = MoomooSettings(  # type: ignore[assignment]
         account_mode="SHARED_RESTRICTED",
         shared_account_risk_accepted=True,
-        shared_account_baseline_confirmed=False,
         trading_enabled=True,
     )
-    with pytest.raises(ControlRejected):
-        reconcile(client, store, ownership_proof=lambda *_: True)
-    assert store.positions() == []
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+    assert result["account_isolation_mode"] == "shared_restricted"
+    assert store.owned_quantity("US.AAPL") == 2
 
 
 def test_quote_failure_rolls_back_entire_reconciliation_batch(tmp_path):
@@ -256,7 +278,6 @@ def test_shared_account_read_only_observes_but_never_imports_external_holdings(t
         account_mode="UNVERIFIED",
         dedicated_account_confirmed=False,
         shared_account_risk_accepted=False,
-        shared_account_baseline_confirmed=False,
         trading_enabled=False,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -287,7 +308,6 @@ def test_shared_account_external_holdings_fail_if_trading_is_enabled(tmp_path):
         account_mode="UNVERIFIED",
         dedicated_account_confirmed=False,
         shared_account_risk_accepted=False,
-        shared_account_baseline_confirmed=False,
         trading_enabled=True,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -311,7 +331,6 @@ def test_shared_restricted_trading_observes_unrelated_external_holdings(tmp_path
         account_mode="SHARED_RESTRICTED",
         dedicated_account_confirmed=False,
         shared_account_risk_accepted=True,
-        shared_account_baseline_confirmed=True,
         trading_enabled=True,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -331,7 +350,7 @@ def test_shared_restricted_trading_observes_unrelated_external_holdings(tmp_path
     assert store.positions() == []
 
 
-def test_external_symbol_denylist_is_append_only_across_clear_and_restart(tmp_path):
+def test_external_personal_symbol_remains_transparent_but_not_strategy_owned(tmp_path):
     db = tmp_path / "strategy.db"
     archives = tmp_path / "archives"
     store = LiveStrategyStore(db, archives)
@@ -340,7 +359,6 @@ def test_external_symbol_denylist_is_append_only_across_clear_and_restart(tmp_pa
         account_mode="UNVERIFIED",
         dedicated_account_confirmed=False,
         shared_account_risk_accepted=False,
-        shared_account_baseline_confirmed=False,
         trading_enabled=False,
         auto_trading_enabled=False,
         trade_api_token="",
@@ -353,18 +371,17 @@ def test_external_symbol_denylist_is_append_only_across_clear_and_restart(tmp_pa
     data["positions"] = [{"code": "US.MSFT", "qty": 1}]
     client.snapshot = lambda: data
     reconcile(client, store)
-    assert "US.MSFT" in store.denied_symbols()
+    assert store.owned_quantity("US.MSFT") == 0
 
     restarted = LiveStrategyStore(db, archives)
-    assert "US.MSFT" in restarted.denied_symbols()
     cleared = dict(data)
     cleared["positions"] = []
     client.snapshot = lambda: cleared
     reconcile(client, restarted)
-    assert "US.MSFT" in restarted.denied_symbols()
+    assert restarted.owned_quantity("US.MSFT") == 0
 
 
-def test_net_zero_manual_activity_on_owned_symbol_is_rejected(tmp_path):
+def test_net_zero_manual_activity_is_allowed_when_broker_still_covers_owned_qty(tmp_path):
     store = active_store(tmp_path)
     store.apply_fill("existing", "US.AAPL", "BUY", 2, 100)
     client = FakeClient()
@@ -387,7 +404,7 @@ def test_net_zero_manual_activity_on_owned_symbol_is_rejected(tmp_path):
     data["positions"] = [{"code": "US.AAPL", "qty": 2}]
     client.snapshot = lambda: data
 
-    with pytest.raises(ControlRejected, match="non-module broker activity"):
-        reconcile(client, store)
+    result = reconcile(client, store)
+    assert result["ok"] is True
     assert store.owned_quantity("US.AAPL") == 2
-    assert store.manual_conflict_symbols() == {"US.AAPL"}
+    assert store.manual_conflict_symbols() == set()

@@ -143,7 +143,6 @@ def client(control_store=None, **overrides):
                 max_order_notional=2_500, max_limit_deviation_pct=.02)
     if overrides.get("shared_account_risk_accepted"):
         overrides.setdefault("account_mode", "SHARED_RESTRICTED")
-        overrides.setdefault("shared_account_baseline_confirmed", True)
     elif overrides.get("dedicated_account_confirmed") is False:
         overrides.setdefault("account_mode", "UNVERIFIED")
     base.update(overrides)
@@ -176,12 +175,10 @@ def test_settings_default_to_fail_closed(monkeypatch):
 def test_account_isolation_modes_are_explicit_and_mutually_exclusive():
     dedicated = MoomooSettings(account_mode="DEDICATED", dedicated_account_confirmed=True)
     shared = MoomooSettings(account_mode="SHARED_RESTRICTED",
-                            shared_account_risk_accepted=True,
-                            shared_account_baseline_confirmed=True)
+                            shared_account_risk_accepted=True)
     invalid = MoomooSettings(account_mode="SHARED_RESTRICTED",
                              dedicated_account_confirmed=True,
-                             shared_account_risk_accepted=True,
-                             shared_account_baseline_confirmed=True)
+                             shared_account_risk_accepted=True)
     assert dedicated.account_isolation_mode == "dedicated"
     assert shared.account_isolation_mode == "shared_restricted"
     assert invalid.account_isolation_mode == "invalid"
@@ -270,6 +267,25 @@ def test_external_broker_position_is_never_strategy_sellable(tmp_path):
         c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100)
 
 
+def test_shared_same_symbol_sell_is_bounded_to_strategy_owned_quantity(tmp_path):
+    control = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
+    with control.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+                    "freeze_reason=NULL,last_sync_at=? WHERE id=1",
+                    (datetime.now(timezone.utc).isoformat(),))
+    control.apply_fill("strategy-buy", "US.AAPL", "BUY", 2, 100)
+    c = client(control_store=control, trading_enabled=False,
+               dedicated_account_confirmed=False, shared_account_risk_accepted=True)
+    c._sdk.trade.position_list_query = lambda **kwargs: (0, pd.DataFrame([{
+        "code": "US.AAPL", "qty": 12, "can_sell_qty": 12,
+        "market_val": 1_200, "cost_price": 95, "nominal_price": 100,
+    }]))
+    preview = c.preview_order(code="AAPL", side="SELL", qty=2, limit_price=100)
+    assert preview["qty"] == 2
+    with pytest.raises(LiveTradeRejected, match="not acquired"):
+        c.preview_order(code="AAPL", side="SELL", qty=3, limit_price=100)
+
+
 def test_regular_hours_only_cannot_be_disabled():
     c = client(rth_only=False)
     with pytest.raises(LiveTradeRejected, match="Regular-hours-only"):
@@ -318,14 +334,13 @@ def test_isolation_mode_change_invalidates_old_preview():
     preview = c.preview_order(code="NVDA", side="BUY", qty=1, limit_price=100)
     c.settings = replace(c.settings, account_mode="DEDICATED",
                          dedicated_account_confirmed=True,
-                         shared_account_risk_accepted=False,
-                         shared_account_baseline_confirmed=False)
+                         shared_account_risk_accepted=False)
     with pytest.raises(LiveTradeRejected, match="reconciliation|isolation"):
         c.place_order(preview["preview_token"], "t")
     assert c._sdk.trade.place_calls == 0
 
 
-def test_shared_account_blocks_symbol_with_unproven_active_broker_order():
+def test_shared_account_allows_transparent_manual_order_on_same_symbol():
     c = client(trading_enabled=True, dedicated_account_confirmed=False,
                shared_account_risk_accepted=True)
     c._sdk.trade.order_list_query = lambda **kwargs: (0, pd.DataFrame([{
@@ -333,11 +348,12 @@ def test_shared_account_blocks_symbol_with_unproven_active_broker_order():
         "order_status": "SUBMITTED", "qty": 1, "dealt_qty": 0,
         "price": 100, "remark": "manual",
     }]))
-    with pytest.raises(LiveTradeRejected, match="unproven broker activity"):
-        c.preview_order(code="NVDA", side="BUY", qty=1, limit_price=100)
+    preview = c.preview_order(code="NVDA", side="BUY", qty=1, limit_price=100)
+    assert preview["code"] == "US.NVDA"
+    assert c.control.owned_quantity("US.NVDA") == 0
 
 
-def test_known_order_id_cannot_bypass_exact_preview_field_proof(monkeypatch):
+def test_unproven_broker_order_never_creates_strategy_ownership(monkeypatch):
     import core.moomoo_client as client_module
     c = client(trading_enabled=True, dedicated_account_confirmed=False,
                shared_account_risk_accepted=True)
@@ -348,18 +364,19 @@ def test_known_order_id_cannot_bypass_exact_preview_field_proof(monkeypatch):
         "order_status": "SUBMITTED", "qty": 999, "dealt_qty": 0,
         "price": 0.01, "remark": "dashboard:B16:forged-preview",
     }]))
-    with pytest.raises(LiveTradeRejected, match="unproven broker activity"):
-        c.preview_order(code="NVDA", side="BUY", qty=1, limit_price=100)
+    preview = c.preview_order(code="NVDA", side="BUY", qty=1, limit_price=100)
+    assert preview["code"] == "US.NVDA"
+    assert c.control.owned_quantity("US.NVDA") == 0
     assert c._sdk.trade.place_calls == 0
 
 
-def test_shared_account_permanent_denylist_blocks_buy_after_position_is_gone():
+def test_shared_account_personal_history_does_not_block_strategy_buy():
     control = FakeControl()
     control.denied = {"US.MSFT"}
     c = client(control_store=control, trading_enabled=True,
                dedicated_account_confirmed=False, shared_account_risk_accepted=True)
-    with pytest.raises(LiveTradeRejected, match="permanently denied"):
-        c.preview_order(code="MSFT", side="BUY", qty=1, limit_price=100)
+    preview = c.preview_order(code="MSFT", side="BUY", qty=1, limit_price=100)
+    assert preview["code"] == "US.MSFT"
     assert c._sdk.trade.place_calls == 0
 
 

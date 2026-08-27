@@ -98,7 +98,6 @@ class MoomooSettings:
     account_mode: str = "UNVERIFIED"
     dedicated_account_confirmed: bool = False
     shared_account_risk_accepted: bool = False
-    shared_account_baseline_confirmed: bool = False
 
     @classmethod
     def from_env(cls) -> "MoomooSettings":
@@ -135,23 +134,19 @@ class MoomooSettings:
             account_mode=os.getenv("MOOMOO_ACCOUNT_MODE", "UNVERIFIED").strip().upper(),
             dedicated_account_confirmed=_bool_env("MOOMOO_DEDICATED_ACCOUNT_CONFIRMED", False),
             shared_account_risk_accepted=_bool_env("MOOMOO_SHARED_ACCOUNT_RISK_ACCEPTED", False),
-            shared_account_baseline_confirmed=_bool_env("MOOMOO_SHARED_ACCOUNT_BASELINE_CONFIRMED", False),
         )
 
     @property
     def account_isolation_mode(self) -> str:
         mode = self.account_mode.upper()
         if (mode == "DEDICATED" and self.dedicated_account_confirmed
-                and not self.shared_account_risk_accepted
-                and not self.shared_account_baseline_confirmed):
+                and not self.shared_account_risk_accepted):
             return "dedicated"
         if (mode == "SHARED_RESTRICTED" and self.shared_account_risk_accepted
-                and self.shared_account_baseline_confirmed
                 and not self.dedicated_account_confirmed):
             return "shared_restricted"
         if (mode == "UNVERIFIED" and not self.dedicated_account_confirmed
-                and not self.shared_account_risk_accepted
-                and not self.shared_account_baseline_confirmed):
+                and not self.shared_account_risk_accepted):
             return "unverified"
         return "invalid"
 
@@ -187,7 +182,7 @@ class MoomooSettings:
             "strategy_loss_floor": 7_500.0,
             "account_isolation_mode": self.account_isolation_mode,
             "shared_account_residual_risk": self.account_isolation_mode == "shared_restricted",
-            "shared_account_baseline_confirmed": self.shared_account_baseline_confirmed,
+
         }
 
     def configuration_errors(self) -> list[str]:
@@ -215,7 +210,7 @@ class MoomooSettings:
         if self.account_mode.upper() not in {"UNVERIFIED", "DEDICATED", "SHARED_RESTRICTED"}:
             errors.append("Invalid explicit account mode")
         if self.account_isolation_mode == "invalid":
-            errors.append("Account mode, dedicated evidence, shared risk acceptance, and baseline must agree")
+            errors.append("Account mode, dedicated evidence, and shared risk acceptance must agree")
         if self.auto_trading_enabled and not self.trading_enabled:
             errors.append("Auto trading requires the real-order master switch")
         if not self.rth_only:
@@ -276,12 +271,9 @@ class MoomooClient:
             "configured_account_mode": self.settings.account_mode,
             "account_isolation_mode": self.settings.account_isolation_mode,
             "shared_account_risk_accepted": self.settings.shared_account_risk_accepted,
-            "shared_account_baseline_confirmed": self.settings.shared_account_baseline_confirmed,
             "trading_enabled": self.settings.trading_enabled,
             "auto_trading_enabled": self.settings.auto_trading_enabled,
             "config_version": int(state.config_version),
-            "denylist_hash": self.control.denylist_hash(),
-            "manual_conflict_hash": self.control.manual_conflict_hash(),
         }
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         self.control.observe_runtime_fingerprint(fingerprint)
@@ -395,14 +387,11 @@ class MoomooClient:
             "control_token_configured": bool(self.settings.control_api_token),
             "dedicated_account_confirmed": self.settings.dedicated_account_confirmed,
             "shared_account_risk_accepted": self.settings.shared_account_risk_accepted,
-            "shared_account_baseline_confirmed": self.settings.shared_account_baseline_confirmed,
             "configured_account_mode": self.settings.account_mode,
             "account_isolation_mode": self.settings.account_isolation_mode,
             "control_sync_fresh": self._control_sync_is_fresh(control),
             "sync_proof_current": self.control.broker_sync_proof_matches(fingerprint),
             "control_generation": self.control.current_control_generation(),
-            "external_symbol_denylist_count": len(self.control.denied_symbols()),
-            "manual_symbol_conflict_count": len(self.control.manual_conflict_symbols()),
             "strategy_control": control.__dict__,
             "place_order_ready": False,
             "message": None,
@@ -432,7 +421,7 @@ class MoomooClient:
             self.settings.account_isolation_mode in {"dedicated", "shared_restricted"},
             base["control_sync_fresh"],
             base["sync_proof_current"],
-            base["manual_symbol_conflict_count"] == 0,
+
             control.lifecycle == "ACTIVE",
         ])
         if self.settings.account_isolation_mode == "shared_restricted":
@@ -643,8 +632,7 @@ class MoomooClient:
         if (self.settings.trading_enabled
                 and not self.control.broker_sync_proof_matches(self.current_sync_fingerprint())):
             raise LiveTradeRejected("Current account isolation generation requires a new broker reconciliation")
-        if self.settings.trading_enabled and self.control.manual_conflict_symbols():
-            raise LiveTradeRejected("Persistent manual broker activity conflict blocks trading")
+
         eastern = now.astimezone(ZoneInfo("America/New_York"))
         minute = eastern.hour * 60 + eastern.minute
         if eastern.weekday() >= 5 or not (570 <= minute < 960):
@@ -689,36 +677,12 @@ class MoomooClient:
                 f"Account NAV ${nav:,.2f} is below the required ${self.settings.minimum_nav:,.2f}"
             )
         terminal_statuses = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
-        if self.settings.account_isolation_mode == "shared_restricted":
-            if code in self.control.denied_symbols():
-                raise LiveTradeRejected(
-                    "Symbol is permanently denied because it belongs to external/personal account history"
-                )
-            proven_order_ids = set()
-            for order in snap["orders"]:
-                if str(order.get("code") or "") != code:
-                    continue
-                order_id = str(order.get("order_id") or "")
-                proven = self._broker_order_is_proven_module(order, self.settings.account_id)
-                if not proven:
-                    raise LiveTradeRejected(
-                        "Shared-account symbol has unproven broker activity; trading is blocked"
-                    )
-                proven_order_ids.add(order_id)
-            for deal in snap["deals"]:
-                if str(deal.get("code") or "") != code:
-                    continue
-                order_id = str(deal.get("order_id") or "")
-                if order_id not in proven_order_ids and not is_module_order(
-                        order_id, self.settings.account_id):
-                    raise LiveTradeRejected(
-                        "Shared-account symbol has unproven broker activity; trading is blocked"
-                    )
         if side == "BUY":
             broker_position = next((p for p in snap["positions"] if str(p.get("code")) == code), None)
             broker_qty = self._number(broker_position or {}, "qty")
             strategy_qty = self.control.owned_quantity(code)
-            if broker_qty > strategy_qty + 1e-9:
+            if (self.settings.account_isolation_mode == "dedicated"
+                    and broker_qty > strategy_qty + 1e-9):
                 raise LiveTradeRejected(
                     "Symbol overlaps pre-existing/external Moomoo holdings; use a physically isolated symbol or account"
                 )

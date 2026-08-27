@@ -8,6 +8,10 @@
 
 **Tech Stack:** Python 3.12, FastAPI, SQLite, Moomoo OpenD, pytest, vanilla JavaScript.
 
+## Operator amendment: fungible same-symbol inventory
+
+The operator explicitly chose logical sub-position accounting rather than symbol exclusion. Personal broker inventory is transparent background and does not block strategy BUY of the same symbol. Strategy ownership is only the cumulative locally proven module fills; strategy SELL remains capped at that owned quantity minus module reservations. In shared mode reconciliation requires `broker_total_qty >= strategy_owned_qty` rather than equality. Denylist and manual-activity conflict gates described in the original tasks below are superseded by this amendment; persistent generation, atomic reconciliation, strict module-fill proof, the USD 10,000 sub-ledger, and residual-risk disclosure remain required.
+
 ---
 
 ### Task 1: Add explicit isolation-mode configuration

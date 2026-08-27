@@ -180,30 +180,28 @@ Moomoo整账户资金和持仓只作为券商事实展示，不能直接形成�
 
 市场跳空可能令已持有股票的市值瞬间超过USD 10,000，这是交易系统无法在价格跳变前物理阻止的市场机制。发生后系统禁止加仓、立即freeze并要求在正常交易时段处理减仓。
 
-共享Moomoo账户只能做逻辑隔离：系统能拒绝外部lot并检测手工改动，但无法阻止用户在Moomoo App中手工卖出策略股份。专用账户仍是优先方案，使用`MOOMOO_DEDICATED_ACCOUNT_CONFIRMED=true`。
+共享Moomoo账户采用逻辑子账本：Broker股份在账户层合并且可替代，系统只按已证明模块成交维护策略owned数量、成本和收益。系统无法阻止用户在Moomoo App中手工卖出；专用账户仍是风险更低的优先方案，使用`MOOMOO_DEDICATED_ACCOUNT_CONFIRMED=true`。
 
-若券商无法提供专用账户，只有在操作者明确接受剩余风险并从完整历史statement建立个人标的基线后，才可选择受限共享模式：
+若券商无法提供专用账户，操作者可明确接受剩余风险并选择受限共享模式：
 
 ```text
 MOOMOO_ACCOUNT_MODE=SHARED_RESTRICTED
 MOOMOO_SHARED_ACCOUNT_RISK_ACCEPTED=true
-MOOMOO_SHARED_ACCOUNT_BASELINE_CONFIRMED=true
 MOOMOO_DEDICATED_ACCOUNT_CONFIRMED=false
 ```
 
-显式模式、专用账户证据、共享风险接受和历史基线必须一致，否则配置为invalid。受限共享模式仍强制：
+显式模式、专用账户证据和共享风险接受必须一致，否则配置为invalid。受限共享模式采用可替代股份的逻辑子仓：
 
-- Broker已有外部持仓的代码禁止策略BUY；
+- Broker个人持仓作为透明背景，策略允许BUY同一代码；
 - SELL不超过本地可证明的系统持股减去系统挂单预留；
-- 无关外部持仓只读展示，不导入策略账本；
-- 任一系统持股代码的Broker数量与本地数量不一致即freeze；
+- 个人持仓、成本和收益不导入策略账本；
+- 共享模式要求Broker总数量始终不少于本地策略owned数量，低于时freeze；
 - 额外Broker现金不增加USD 10,000策略购买力；
 - 订单预览绑定账户隔离模式，模式变化后旧预览失效；
-- 页面始终显示“逻辑隔离，不是物理隔离”。
-- 任何系统持股代码的非模块订单/成交会写入持久manual-conflict锁，不能因90天活动窗口过去而自动解除；
-- 账户、模式、风险接受、交易开关、策略配置、denylist或manual-conflict变化都会增加持久control generation、freeze并删除旧同步证明。
+- 页面始终显示“逻辑隔离，不是物理隔离”；
+- 账户、模式、风险接受、交易开关或策略配置变化都会增加持久control generation、freeze并删除旧同步证明。
 
-该模式不能防止用户在Moomoo App中先于对账发生手工交易，只能在后续对账发现后冻结。生产启用必须另行完成RTH人工小额订单验收，不能仅凭设置环境变量直接开启自动交易。
+该模式不能指定券商税务lot，也不能防止用户在Moomoo App中手工卖出；只要Broker总股数仍覆盖策略owned数量，逻辑子仓继续有效。若总股数不足则在后续对账冻结。生产启用必须另行完成RTH人工小额订单验收，不能仅凭设置环境变量直接开启自动交易。
 
 ## Freeze状态机
 

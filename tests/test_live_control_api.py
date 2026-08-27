@@ -129,8 +129,7 @@ def test_unfreeze_allows_explicit_shared_risk_acceptance_after_fresh_sync(tmp_pa
     store = LiveStrategyStore(tmp_path / "strategy.db", tmp_path / "archives")
     settings = MoomooSettings(read_api_token="r", control_api_token="c",
                               account_mode="SHARED_RESTRICTED",
-                              shared_account_risk_accepted=True,
-                              shared_account_baseline_confirmed=True)
+                              shared_account_risk_accepted=True)
     client = MoomooClient(settings=settings, control_store=store)
     monkeypatch.setattr(live_api, "_client", client)
     monkeypatch.setattr(live_api, "unresolved_preview_count", lambda: 0)
