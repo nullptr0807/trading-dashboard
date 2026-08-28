@@ -33,6 +33,11 @@ def _rows(date, values):
             for factor, value in by_factor.items()]
 
 
+def _append_rows(db_path, rows):
+    with sqlite3.connect(db_path) as con:
+        con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", rows)
+
+
 def test_adapter_reproduces_percentile_rank_mean_and_is_deterministic(tmp_path):
     values = {
         "AAA": {"f1": 9.0, "f2": 1.0},
@@ -104,6 +109,104 @@ def test_adapter_fails_closed_on_future_or_stale_source_date(tmp_path, source_da
         load_b16_signal_batch(db, factors,
                               as_of=datetime(2026, 8, 27, tzinfo=timezone.utc),
                               max_age_days=4)
+
+
+@pytest.mark.parametrize(("as_of", "expected_source"), [
+    # UTC midnight is still the prior evening in New York.
+    (datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc), "2026-08-26"),
+    # Before and during the regular session, today's daily factors are not complete.
+    (datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc), "2026-08-26"),
+    (datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc), "2026-08-26"),
+    (datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc), "2026-08-27"),
+    # At the official close the session is complete.
+    (datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc), "2026-08-27"),
+    # Weekends and NYSE holidays retain the latest completed session.
+    (datetime(2026, 8, 29, 16, 0, tzinfo=timezone.utc), "2026-08-28"),
+    (datetime(2026, 9, 7, 16, 0, tzinfo=timezone.utc), "2026-09-04"),
+    # DST changes the UTC close from 21:00 to 20:00 without changing semantics.
+    (datetime(2026, 3, 9, 19, 59, tzinfo=timezone.utc), "2026-03-06"),
+    (datetime(2026, 3, 9, 20, 0, tzinfo=timezone.utc), "2026-03-09"),
+    # Black Friday's special close is 13:00 New York / 18:00 UTC.
+    (datetime(2026, 11, 27, 17, 59, tzinfo=timezone.utc), "2026-11-25"),
+    (datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc), "2026-11-27"),
+])
+def test_adapter_uses_only_latest_completed_nyse_session(tmp_path, as_of, expected_source):
+    values = {"OLD": {"f1": 1.0}, "NEW": {"f1": 2.0}}
+    dates = {
+        "2026-03-06", "2026-03-09", "2026-08-26", "2026-08-27", "2026-08-28",
+        "2026-09-04", "2026-09-08", "2026-11-25", "2026-11-27",
+    }
+    db, factors = _fixture(tmp_path, factors=("f1",))
+    for source_date in sorted(dates):
+        _append_rows(db, _rows(source_date, values))
+
+    batch = load_b16_signal_batch(db, factors, as_of=as_of, max_age_days=400)
+
+    assert batch.source_date == expected_source
+
+
+def test_historical_as_of_is_immutable_after_later_rows_are_written(tmp_path):
+    historical = {"HIST": {"f1": 2.0}, "OTHER": {"f1": 1.0}}
+    future = {"FUTURE": {"f1": 9.0}, "OTHER": {"f1": 0.0}}
+    db, factors = _fixture(
+        tmp_path, factors=("f1",), latest_rows=_rows("2026-08-26", historical),
+    )
+    as_of = datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc)
+    before = load_b16_signal_batch(db, factors, as_of=as_of)
+
+    _append_rows(db, _rows("2026-08-27", future))
+    _append_rows(db, _rows("2026-08-28", future))
+    after = load_b16_signal_batch(db, factors, as_of=as_of)
+
+    assert before == after
+    assert after.source_date == "2026-08-26"
+    assert after.buy_candidates == ("HIST",)
+
+
+def test_adapter_falls_back_to_older_data_within_age_limit_and_never_future(tmp_path):
+    values = {"AAA": {"f1": 1.0}, "BBB": {"f1": 2.0}}
+    db, factors = _fixture(
+        tmp_path, factors=("f1",),
+        prior_rows=_rows("2026-08-25", values),
+        latest_rows=_rows("2026-08-28", values),
+    )
+
+    batch = load_b16_signal_batch(
+        db, factors, as_of=datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc),
+        max_age_days=1,
+    )
+    assert batch.source_date == "2026-08-25"
+
+    with pytest.raises(SignalAdapterError, match="stale"):
+        load_b16_signal_batch(
+            db, factors, as_of=datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc),
+            max_age_days=0,
+        )
+
+
+def test_adapter_fails_closed_when_calendar_dependency_is_unavailable(tmp_path, monkeypatch):
+    values = {"AAA": {"f1": 1.0}, "BBB": {"f1": 2.0}}
+    db, factors = _fixture(
+        tmp_path, factors=("f1"), latest_rows=_rows("2026-08-26", values),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "exchange_calendars", None)
+
+    with pytest.raises(SignalAdapterError, match="NYSE calendar"):
+        load_b16_signal_batch(
+            db, factors, as_of=datetime(2026, 8, 27, tzinfo=timezone.utc),
+        )
+
+
+def test_adapter_rejects_non_session_source_rows(tmp_path):
+    values = {"AAA": {"f1": 1.0}, "BBB": {"f1": 2.0}}
+    db, factors = _fixture(
+        tmp_path, factors=("f1",), latest_rows=_rows("2026-09-07", values),
+    )
+
+    with pytest.raises(SignalAdapterError, match="not an NYSE session"):
+        load_b16_signal_batch(
+            db, factors, as_of=datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc),
+        )
 
 
 def test_production_prepared_b16_ranking_fixture_matches_legacy_generator():

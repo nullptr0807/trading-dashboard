@@ -50,6 +50,37 @@ def _as_utc(value: datetime | None) -> datetime:
     return result.astimezone(timezone.utc)
 
 
+def _latest_completed_nyse_session(now: datetime) -> tuple[Any, date]:
+    """Return the XNYS calendar and latest session whose official close passed."""
+    try:
+        import exchange_calendars as xcals
+        import pandas as pd
+
+        calendar = xcals.get_calendar("XNYS")
+        candidate = calendar.date_to_session(pd.Timestamp(now.date()), direction="previous")
+        while calendar.session_close(candidate).to_pydatetime() > now:
+            candidate = calendar.previous_session(candidate)
+        return calendar, candidate.date()
+    except Exception as exc:
+        # Daily live factors must never fall back to weekday/time arithmetic: that
+        # would silently mishandle holidays, DST and special closes.
+        raise SignalAdapterError("Unable to determine completed NYSE calendar session") from exc
+
+
+def _parse_session_date(value: str, calendar: Any, *, label: str) -> date:
+    try:
+        parsed = date.fromisoformat(value)
+        import pandas as pd
+
+        if not calendar.is_session(pd.Timestamp(parsed)):
+            raise SignalAdapterError(f"{label} B16 source date is not an NYSE session")
+        return parsed
+    except SignalAdapterError:
+        raise
+    except Exception as exc:
+        raise SignalAdapterError(f"Invalid {label.lower()} B16 source date") from exc
+
+
 def _active_factor_names(path: str | Path) -> tuple[str, ...]:
     try:
         document = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -102,9 +133,10 @@ def load_b16_signal_batch(
     minimum_latest_coverage: float = 0.90,
     sell_tail_size: int = 4,
 ) -> SignalBatch:
-    """Load and validate the latest complete gp_B16 cross-section.
+    """Load the latest valid gp_B16 cross-section completed by ``as_of``.
 
     The database is opened through SQLite's URI ``mode=ro`` and query-only mode.
+    The point-in-time cutoff is the most recent officially closed NYSE session.
     No paper account object, state, or QuantSystem import participates in ranking.
     """
     if strategy_id != "B16":
@@ -116,16 +148,31 @@ def load_b16_signal_batch(
 
     factor_names = _active_factor_names(factors_path)
     now = _as_utc(as_of)
+    calendar, cutoff_date = _latest_completed_nyse_session(now)
+    cutoff = cutoff_date.isoformat()
     placeholders = ",".join("?" for _ in factor_names)
     try:
         with _readonly_connection(db_path) as con:
             latest_row = con.execute(
-                "SELECT MAX(date) FROM factor_values WHERE factor_group=?",
-                (FACTOR_GROUP,),
+                "SELECT MAX(date) FROM factor_values WHERE factor_group=? AND date<=?",
+                (FACTOR_GROUP, cutoff),
             ).fetchone()
             source_date = str(latest_row[0]) if latest_row and latest_row[0] else ""
             if not source_date:
+                future_exists = con.execute(
+                    "SELECT EXISTS(SELECT 1 FROM factor_values "
+                    "WHERE factor_group=? AND date>?)",
+                    (FACTOR_GROUP, cutoff),
+                ).fetchone()[0]
+                if future_exists:
+                    raise SignalAdapterError("B16 source date is in the future")
                 raise SignalAdapterError("No gp_B16 factor values")
+            parsed_date = _parse_session_date(source_date, calendar, label="Selected")
+            age = (cutoff_date - parsed_date).days
+            if age < 0:
+                raise SignalAdapterError("B16 source date is in the future")
+            if age > max_age_days:
+                raise SignalAdapterError("B16 source date is stale")
             rows = con.execute(
                 "SELECT ticker,factor_name,value FROM factor_values "
                 "WHERE factor_group=? AND date=? ORDER BY ticker,factor_name",
@@ -137,6 +184,7 @@ def load_b16_signal_batch(
             ).fetchone()[0]
             previous_counts: list[int] = []
             if previous:
+                _parse_session_date(str(previous), calendar, label="Previous")
                 previous_counts = [int(row[0]) for row in con.execute(
                     f"SELECT COUNT(DISTINCT ticker) FROM factor_values "
                     f"WHERE factor_group=? AND date=? AND factor_name IN ({placeholders}) "
@@ -147,16 +195,6 @@ def load_b16_signal_batch(
         raise
     except (OSError, sqlite3.Error) as exc:
         raise SignalAdapterError("Unable to read B16 factor database") from exc
-
-    try:
-        parsed_date = date.fromisoformat(source_date)
-    except ValueError as exc:
-        raise SignalAdapterError("Invalid B16 source date") from exc
-    age = (now.date() - parsed_date).days
-    if age < 0:
-        raise SignalAdapterError("B16 source date is in the future")
-    if age > max_age_days:
-        raise SignalAdapterError("B16 source date is stale")
 
     observed_factors = {str(row["factor_name"]) for row in rows}
     if observed_factors != set(factor_names):
