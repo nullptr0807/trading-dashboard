@@ -16,6 +16,8 @@ import math
 import os
 import re
 import sqlite3
+import stat as stat_module
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,6 +32,8 @@ SCHEMA_VERSION = 3
 STORE_BUSY_TIMEOUT_SECONDS = 5
 ELIGIBILITY_MARGIN_SECONDS = 1
 ELIGIBILITY_DELAY_SECONDS = STORE_BUSY_TIMEOUT_SECONDS + ELIGIBILITY_MARGIN_SECONDS
+TRUSTED_UNIVERSE_SOURCES = frozenset({"configured_universe"})
+UNIVERSE_BASELINE_MAX_AGE = timedelta(days=7)
 DEFAULT_SOURCE_DB_PATH = Path("/home/gexin/quant-trading/data/trading.db")
 DEFAULT_FACTORS_PATH = Path("/home/gexin/quant-trading/factors/mined_alphas_per_account.json")
 DEFAULT_PUBLICATION_DB_PATH = (
@@ -212,6 +216,11 @@ def _resolved(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _store_path(path: str | Path) -> Path:
+    """Return an absolute store path without following its final symlink."""
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
 def require_canonical_paths(
     source_db_path: str | Path,
     factors_path: str | Path,
@@ -226,9 +235,12 @@ def require_canonical_paths(
 
 def _require_owned_mode(path: Path, *, directory: bool) -> None:
     try:
-        stat = path.stat()
+        stat = path.lstat()
     except OSError as exc:
         raise PublicationError("Unable to verify publication store permissions") from exc
+    expected_type = stat_module.S_ISDIR if directory else stat_module.S_ISREG
+    if not expected_type(stat.st_mode):
+        raise PublicationError("Publication store path type is unsafe")
     if stat.st_uid != os.getuid():
         raise PublicationError("Publication store owner does not match current uid")
     forbidden = 0o022 if directory else 0o077
@@ -237,40 +249,159 @@ def _require_owned_mode(path: Path, *, directory: bool) -> None:
 
 
 def validate_store_permissions(path: str | Path, *, store_may_be_missing: bool = False) -> None:
-    destination = _resolved(path)
+    destination = _store_path(path)
     if not destination.parent.exists():
         if store_may_be_missing:
             return
         raise PublicationError("publication store parent is missing")
     _require_owned_mode(destination.parent, directory=True)
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         _require_owned_mode(destination, directory=False)
     elif not store_may_be_missing:
         raise PublicationError("publication store is missing")
     lock_path = _lock_path(destination)
-    if lock_path.exists():
+    if lock_path.exists() or lock_path.is_symlink():
         _require_owned_mode(lock_path, directory=False)
 
 
 def _lock_path(path: str | Path) -> Path:
-    destination = _resolved(path)
+    destination = _store_path(path)
     return destination.with_name(destination.name + ".lock")
+
+
+def _ensure_private_store_parent(destination: Path) -> None:
+    """Create the store parent without traversing symlink path components."""
+    parent = destination.parent
+    current = Path(parent.anchor)
+    try:
+        for component in parent.parts[1:]:
+            current /= component
+            try:
+                item = current.lstat()
+            except FileNotFoundError:
+                try:
+                    current.mkdir(mode=0o700)
+                except FileExistsError:
+                    # A concurrent bootstrap won mkdir; validate what appeared.
+                    pass
+                item = current.lstat()
+            if not stat_module.S_ISDIR(item.st_mode):
+                raise PublicationError("Publication store parent path type is unsafe")
+    except PublicationError:
+        raise
+    except OSError as exc:
+        raise PublicationError("Unable to create private publication store parent") from exc
+    _require_owned_mode(parent, directory=True)
+
+
+def _require_descriptor_path(
+    path: Path, descriptor: int, *, label: str = "publication store lock"
+) -> None:
+    """Prove an opened descriptor still names the same regular file."""
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+    except OSError as exc:
+        raise PublicationError(f"Unable to verify {label}") from exc
+    if (not stat_module.S_ISREG(opened.st_mode)
+            or not stat_module.S_ISREG(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise PublicationError(f"{label.capitalize()} path was replaced")
+
+
+class _VerifiedStoreConnection(sqlite3.Connection):
+    """SQLite connection bound to the inode securely opened by this module."""
+
+    _store_path: Path
+    _store_identity: tuple[int, int]
+
+
+def _require_connection_path(con: sqlite3.Connection) -> None:
+    if not isinstance(con, _VerifiedStoreConnection):
+        raise PublicationError("Publication store connection is unverifiable")
+    try:
+        named = con._store_path.lstat()
+    except OSError as exc:
+        raise PublicationError("Unable to verify publication store database") from exc
+    if (not stat_module.S_ISREG(named.st_mode)
+            or (named.st_dev, named.st_ino) != con._store_identity):
+        raise PublicationError("Publication store database path was replaced")
+
+
+def _connect_open_store(
+    destination: Path, descriptor: int, *, readonly: bool
+) -> _VerifiedStoreConnection:
+    """Connect SQLite through a no-follow fd, then bind it to the named inode."""
+    _require_descriptor_path(destination, descriptor, label="publication store database")
+    mode = "ro" if readonly else "rw"
+    uri = Path(f"/proc/self/fd/{descriptor}").as_uri() + f"?mode={mode}"
+    try:
+        con = sqlite3.connect(
+            uri, uri=True, timeout=STORE_BUSY_TIMEOUT_SECONDS, isolation_level=None,
+            factory=_VerifiedStoreConnection,
+        )
+    except sqlite3.Error as exc:
+        raise PublicationError("Unable to safely open publication store") from exc
+    opened = os.fstat(descriptor)
+    con._store_path = destination
+    con._store_identity = (opened.st_dev, opened.st_ino)
+    try:
+        _require_descriptor_path(destination, descriptor, label="publication store database")
+        _require_connection_path(con)
+    except Exception:
+        con.close()
+        raise
+    return con
+
+
+def open_store_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open an existing store without following a replaced final symlink."""
+    destination = _store_path(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(destination, flags)
+    except OSError as exc:
+        raise PublicationError("Unable to safely open publication store") from exc
+    try:
+        return _connect_open_store(destination, descriptor, readonly=True)
+    finally:
+        os.close(descriptor)
+
+
+_process_lock_guard = threading.Lock()
+_process_locks: dict[str, Any] = {}
+
+
+def _process_lock(path: Path) -> Any:
+    with _process_lock_guard:
+        return _process_locks.setdefault(os.fspath(path), threading.Lock())
 
 
 @contextmanager
 def publication_lock(path: str | Path, *, exclusive: bool) -> Iterator[int]:
     """Serialize publishers and keep readers out until late commits are revoked."""
-    destination = _resolved(path)
+    destination = _store_path(path)
     lock_path = _lock_path(destination)
-    if not lock_path.parent.exists():
-        lock_path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
-    validate_store_permissions(destination, store_may_be_missing=True)
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    process_lock = _process_lock(lock_path)
     deadline = time.monotonic() + STORE_BUSY_TIMEOUT_SECONDS
+    if not process_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise PublicationError("Publication store lock busy timeout")
+    try:
+        _ensure_private_store_parent(destination)
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(lock_path, flags, 0o600)
+    except PublicationError:
+        process_lock.release()
+        raise
+    except OSError as exc:
+        process_lock.release()
+        raise PublicationError("Unable to safely open publication store lock") from exc
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     try:
         stat = os.fstat(descriptor)
-        if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        if (not stat_module.S_ISREG(stat.st_mode)
+                or stat.st_uid != os.getuid() or stat.st_mode & 0o077):
             raise PublicationError("Publication store lock owner or permissions are unsafe")
         while True:
             try:
@@ -280,12 +411,22 @@ def publication_lock(path: str | Path, *, exclusive: bool) -> Iterator[int]:
                 if time.monotonic() >= deadline:
                     raise PublicationError("Publication store lock busy timeout")
                 time.sleep(0.01)
+        # Store validation belongs after the lock: another first publisher may
+        # be creating it.  Existing permission drift still fails closed here.
+        _require_descriptor_path(lock_path, descriptor)
+        _require_owned_mode(destination.parent, directory=True)
+        if destination.exists() or destination.is_symlink():
+            _require_owned_mode(destination, directory=False)
         yield descriptor
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _require_descriptor_path(lock_path, descriptor)
         finally:
-            os.close(descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+                process_lock.release()
 
 
 def set_store_quarantine(descriptor: int, state: dict[str, Any] | None) -> None:
@@ -325,6 +466,8 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
         return
     con = initialize_store(path)
     try:
+        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_connection_path(con)
         validate_store_schema(con)
         con.execute("BEGIN IMMEDIATE")
         row = con.execute(
@@ -334,7 +477,11 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
         ).fetchone()
         if row is None:
             # BEGIN IMMEDIATE plus the process-wide exclusive lock proves absence.
+            _require_descriptor_path(_lock_path(path), descriptor)
+            _require_connection_path(con)
             con.commit()
+            _require_descriptor_path(_lock_path(path), descriptor)
+            _require_connection_path(con)
             set_store_quarantine(descriptor, None)
             return
         columns = [str(item[1]) for item in con.execute("PRAGMA table_info(signal_publications)")]
@@ -357,7 +504,11 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
                 "VALUES(?,?,?)",
                 (int(material["publication_id"]), timestamp_text(datetime.now(timezone.utc)), reason),
             )
+        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_connection_path(con)
         con.commit()
+        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_connection_path(con)
         set_store_quarantine(descriptor, None)
     except Exception:
         if con.in_transaction:
@@ -454,24 +605,40 @@ def _normalized_schema_sql(sql: str) -> str:
 
 
 def initialize_store(path: str | Path) -> sqlite3.Connection:
-    destination = _resolved(path)
-    parent_existed = destination.parent.exists()
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not parent_existed:
-        os.chmod(destination.parent, 0o700)
+    destination = _store_path(path)
+    _ensure_private_store_parent(destination)
     validate_store_permissions(destination, store_may_be_missing=True)
-    existed = destination.exists()
-    con = sqlite3.connect(destination, timeout=STORE_BUSY_TIMEOUT_SECONDS, isolation_level=None)
+    create_flags = (os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0))
     try:
-        if not existed:
-            os.chmod(destination, 0o600)
+        descriptor = os.open(destination, create_flags, 0o600)
+    except FileExistsError:
+        # Never repair an existing file: permission drift must fail closed.
+        _require_owned_mode(destination, directory=False)
+        open_flags = (os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                      | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor = os.open(destination, open_flags)
+        except OSError as exc:
+            raise PublicationError("Unable to safely open publication store") from exc
+    except OSError as exc:
+        raise PublicationError("Unable to safely create publication store") from exc
+    try:
+        con = _connect_open_store(destination, descriptor, readonly=False)
+    finally:
+        os.close(descriptor)
+    try:
         validate_store_permissions(destination)
+        _require_connection_path(con)
         version = int(con.execute("PRAGMA user_version").fetchone()[0])
         if version not in {0, SCHEMA_VERSION}:
             raise PublicationError(f"Unsupported publication schema version {version}")
         for sql in _SCHEMA_OBJECTS.values():
+            _require_connection_path(con)
             con.execute(_create_sql(sql))
+        _require_connection_path(con)
         con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        _require_connection_path(con)
         validate_store_schema(con)
         return con
     except Exception:
@@ -496,27 +663,47 @@ def validate_store_schema(con: sqlite3.Connection) -> None:
 
 
 def _universe_baseline(
-    con: sqlite3.Connection, source_date: str, current_symbols: set[str]
+    con: sqlite3.Connection, source_date: str, current_symbols: set[str], called_at: datetime
 ) -> CoverageBaseline | None:
     columns = {str(row[1]) for row in con.execute("PRAGMA table_info(universe_membership)")}
     required = {"market", "date", "ticker", "source", "universe_hash", "recorded_at"}
     if not required.issubset(columns):
         return None
     rows = con.execute(
-        "SELECT ticker,source,universe_hash FROM universe_membership "
+        "SELECT ticker,source,universe_hash,recorded_at FROM universe_membership "
         "WHERE market='US' AND date=? ORDER BY ticker", (source_date,),
     ).fetchall()
     if not rows:
         return None
     sources = {str(row[1]) for row in rows}
     hashes = {str(row[2]) for row in rows}
+    recorded_values = {str(row[3]) for row in rows}
     symbols = [str(row[0]).strip() for row in rows]
-    if len(sources) != 1 or len(hashes) != 1 or not all(symbols) or len(set(symbols)) != len(symbols):
+    if (len(sources) != 1 or len(hashes) != 1 or len(recorded_values) != 1
+            or not all(symbols) or len(set(symbols)) != len(symbols)):
         raise PublicationError("Exact universe coverage baseline is ambiguous")
+    source = next(iter(sources))
+    if source not in TRUSTED_UNIVERSE_SOURCES:
+        raise PublicationError("Exact universe coverage baseline source is untrusted")
+    expected_hash = hashlib.sha256("\n".join(sorted(symbols)).encode("utf-8")).hexdigest()
+    if next(iter(hashes)) != expected_hash:
+        raise PublicationError("Exact universe coverage baseline hash is invalid")
+    try:
+        recorded_at = datetime.fromisoformat(next(iter(recorded_values)).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PublicationError("Exact universe coverage baseline recorded_at is invalid") from exc
+    if recorded_at.tzinfo is None or recorded_at.utcoffset() != timedelta(0):
+        raise PublicationError("Exact universe coverage baseline recorded_at must be UTC")
+    recorded_at = recorded_at.astimezone(timezone.utc)
+    source_midnight = datetime.combine(date.fromisoformat(source_date), datetime.min.time(), timezone.utc)
+    if (recorded_at < source_midnight or recorded_at > called_at
+            or called_at - recorded_at > UNIVERSE_BASELINE_MAX_AGE):
+        raise PublicationError("Exact universe coverage baseline recorded_at violates PIT freshness")
     if not current_symbols.issubset(set(symbols)):
         raise PublicationError("B16 factor symbols are outside exact universe baseline")
     evidence = {"kind": "universe_membership", "date": source_date,
-                "source": next(iter(sources)), "universe_hash": next(iter(hashes)),
+                "source": source, "universe_hash": expected_hash,
+                "recorded_at": timestamp_text(recorded_at),
                 "symbols": symbols}
     return CoverageBaseline(
         "universe_membership", source_date, len(symbols), sha256_json(evidence), tuple(symbols)
@@ -557,6 +744,7 @@ def _snapshot_source(
     calendar: Any,
     cutoff_date: date,
     minimum_latest_coverage: float,
+    called_at: datetime,
 ) -> tuple[str, list[list[Any]], CoverageBaseline]:
     try:
         with readonly_connection(source_db_path) as con:
@@ -578,7 +766,7 @@ def _snapshot_source(
             normalized = [[str(row["ticker"]).strip(), str(row["factor_name"]), row["value"]]
                           for row in rows]
             _, matrix = ranking_from_values(normalized, factor_names)
-            baseline = _universe_baseline(con, source_date, set(matrix))
+            baseline = _universe_baseline(con, source_date, set(matrix), called_at)
             if baseline is None:
                 baseline = _prior_session_baseline(con, source_date, factor_names, calendar)
             if baseline is None:
@@ -639,7 +827,7 @@ def publish_b16_signal(
     calendar, cutoff_date = latest_completed_session(called_at)
     factors = active_factor_names(factors_path)
     source_date, values, baseline = _snapshot_source(
-        source_db_path, factors, calendar, cutoff_date, minimum_latest_coverage,
+        source_db_path, factors, calendar, cutoff_date, minimum_latest_coverage, called_at,
     )
     ranking, matrix = ranking_from_values(values, factors)
     factor_hash = sha256_json({"strategy_id": "B16", "factor_names": factors})
@@ -680,6 +868,8 @@ def publish_b16_signal(
             _recover_locked(publication_db_path, lock_descriptor)
         require_store_not_quarantined(lock_descriptor)
         con = initialize_store(publication_db_path)
+        _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+        _require_connection_path(con)
         quarantine_set = False
         commit_attempted = False
         try:
@@ -699,6 +889,8 @@ def publish_b16_signal(
                     baseline.size, True,
                 )
             append_started = utc_datetime(get_now(), label="clock")
+            if append_started < called_at:
+                raise PublicationError("Publication clock moved backwards before append")
             eligible = append_started + timedelta(seconds=ELIGIBILITY_DELAY_SECONDS)
             append_text = timestamp_text(append_started)
             eligible_text = timestamp_text(eligible)
@@ -752,10 +944,14 @@ def publish_b16_signal(
             if _test_crash_at == "after_insert":
                 raise _SimulatedPublicationCrash()
             commit_attempted = True
+            _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+            _require_connection_path(con)
             con.commit()
             if _test_crash_at == "after_commit":
                 raise _SimulatedPublicationCrash()
             committed_returned_at = utc_datetime(get_now(), label="clock")
+            if committed_returned_at < append_started:
+                raise PublicationError("Publication clock moved backwards after commit")
             if committed_returned_at >= eligible:
                 con.execute("BEGIN IMMEDIATE")
                 con.execute(
@@ -764,10 +960,16 @@ def publish_b16_signal(
                     (publication_id, timestamp_text(committed_returned_at),
                      "append commit did not complete before eligible_at"),
                 )
+                _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+                _require_connection_path(con)
                 con.commit()
+                _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+                _require_connection_path(con)
                 set_store_quarantine(lock_descriptor, None)
                 quarantine_set = False
                 raise PublicationError("Publication commit missed eligibility and was revoked")
+            _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+            _require_connection_path(con)
             set_store_quarantine(lock_descriptor, None)
             quarantine_set = False
             return PublicationResult(

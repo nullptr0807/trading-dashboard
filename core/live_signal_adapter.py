@@ -19,9 +19,11 @@ from core.live_signal_publication import (
     ELIGIBILITY_DELAY_SECONDS,
     FACTOR_GROUP,
     PublicationError,
+    _require_connection_path,
     active_factor_names,
     canonical_json,
     latest_completed_session,
+    open_store_readonly,
     parse_session,
     publication_lock,
     publication_record_material,
@@ -72,8 +74,7 @@ def _as_utc(value: datetime | None) -> datetime:
 def _publication_connection(path: str | Path) -> sqlite3.Connection:
     con: sqlite3.Connection | None = None
     try:
-        resolved = Path(path).expanduser().resolve(strict=True)
-        con = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+        con = open_store_readonly(path)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only=ON")
         validate_store_schema(con)
@@ -261,6 +262,7 @@ def load_b16_signal_batch(
                         "ORDER BY eligible_at DESC,publication_id DESC LIMIT 1",
                         (strategy_id, timestamp_text(now), cutoff_date.isoformat()),
                     ).fetchone()
+                    _require_connection_path(con)
                 except sqlite3.Error as exc:
                     raise SignalAdapterError("Unable to read B16 publication store") from exc
                 if row is None:

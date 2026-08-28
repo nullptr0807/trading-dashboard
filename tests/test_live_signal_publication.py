@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import core.live_signal_publication as publication_module
 from core.live_signal_adapter import SignalAdapterError, load_b16_signal_batch
 from core.live_signal_publication import (
     PublicationError,
     _SimulatedPublicationCrash,
+    publication_lock,
     publish_b16_signal,
     recover_publication_store,
 )
@@ -258,8 +263,11 @@ def test_exact_universe_baseline_rejects_partial_first_snapshot_and_large_rank_e
     )
     with sqlite3.connect(source) as con:
         con.execute("CREATE TABLE universe_membership(market TEXT,date TEXT,ticker TEXT,source TEXT,universe_hash TEXT,recorded_at TEXT,PRIMARY KEY(market,date,ticker))")
-        con.executemany("INSERT INTO universe_membership VALUES('US','2026-08-26',?,'configured_universe','h','2026-08-26T22:00:00+00:00')",
-                        [(f"S{i}",) for i in range(100)])
+        universe_hash = hashlib.sha256(
+            "\n".join(sorted(f"S{i}" for i in range(100))).encode()
+        ).hexdigest()
+        con.executemany("INSERT INTO universe_membership VALUES('US','2026-08-26',?,'configured_universe',?,'2026-08-26T22:00:00+00:00')",
+                        [(f"S{i}", universe_hash) for i in range(100)])
     with pytest.raises(PublicationError, match="partial"):
         _publish(source, factors, tmp_path / "pub.db", datetime(2026, 8, 27, tzinfo=timezone.utc))
 
@@ -504,3 +512,156 @@ def test_concurrent_new_version_keeps_monotonic_time_and_idempotency(tmp_path):
     with sqlite3.connect(store) as con:
         times = con.execute("SELECT append_started_at FROM signal_publications ORDER BY version").fetchall()
     assert times[0][0] < times[1][0]
+
+
+def test_first_publication_rejects_intra_invocation_clock_rollback(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    moments = iter([
+        datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 26, 23, 50, tzinfo=timezone.utc),
+    ])
+    with pytest.raises(PublicationError, match="backwards"):
+        publish_b16_signal(source, factors, store, clock=lambda: next(moments),
+                           publish=True, test_mode=True)
+    with pytest.raises(SignalAdapterError, match="eligible|publication"):
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+
+
+def test_post_commit_clock_rollback_quarantines_publication(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    moments = iter([
+        datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 27, 0, 59, tzinfo=timezone.utc),
+    ])
+    with pytest.raises(PublicationError, match="backwards"):
+        publish_b16_signal(source, factors, store, clock=lambda: next(moments),
+                           publish=True, test_mode=True)
+    with pytest.raises(SignalAdapterError, match="quarantine"):
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+
+
+@pytest.mark.parametrize(
+    "mutation", ["source", "hash", "future", "predate", "offset", "malformed", "mixed"],
+)
+def test_exact_universe_baseline_requires_trusted_pit_metadata(tmp_path, mutation):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(
+        tmp_path, factors=("f1",), rows=_rows("2026-08-26", values), add_prior=False,
+    )
+    symbols = sorted(values)
+    digest = hashlib.sha256("\n".join(symbols).encode()).hexdigest()
+    metadata = {
+        "source": "configured_universe",
+        "hash": digest,
+        "recorded": "2026-08-26T22:00:00+00:00",
+    }
+    if mutation == "source":
+        metadata["source"] = "ATTACKER_SOURCE"
+    elif mutation == "hash":
+        metadata["hash"] = "0" * 64
+    elif mutation == "future":
+        metadata["recorded"] = "2026-08-28T00:00:00+00:00"
+    elif mutation == "predate":
+        metadata["recorded"] = "2026-08-25T23:59:59+00:00"
+    elif mutation == "offset":
+        metadata["recorded"] = "2026-08-27T06:00:00+08:00"
+    elif mutation == "malformed":
+        metadata["recorded"] = "not-a-timestamp"
+    with sqlite3.connect(source) as con:
+        con.execute("CREATE TABLE universe_membership(market TEXT,date TEXT,ticker TEXT,source TEXT,universe_hash TEXT,recorded_at TEXT,PRIMARY KEY(market,date,ticker))")
+        rows = [
+            ("US", "2026-08-26", symbol, metadata["source"], metadata["hash"],
+             metadata["recorded"])
+            for symbol in symbols
+        ]
+        if mutation == "mixed":
+            rows[1] = (*rows[1][:-1], "2026-08-26T22:01:00+00:00")
+        con.executemany("INSERT INTO universe_membership VALUES(?,?,?,?,?,?)", rows)
+    with pytest.raises(PublicationError, match="universe coverage baseline"):
+        _publish(source, factors, tmp_path / "pub.db",
+                 datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+
+
+@pytest.mark.parametrize("target", ["db", "lock", "parent"])
+def test_publication_store_symlinks_fail_closed(tmp_path, target):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    store = private / "pub.db"
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    if target == "db":
+        store.symlink_to(victim)
+    elif target == "lock":
+        store.with_name(store.name + ".lock").symlink_to(victim)
+    else:
+        private.rmdir()
+        private.symlink_to(tmp_path)
+    with pytest.raises(PublicationError, match="unsafe|safely"):
+        _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+    assert victim.read_text() == "untouched"
+
+
+def test_replaced_lock_path_is_detected_without_split_brain(tmp_path):
+    store = tmp_path / "pub.db"
+    lock = store.with_name(store.name + ".lock")
+    entered_replacement = []
+    replacement_started = threading.Event()
+
+    def acquire_replacement():
+        replacement_started.set()
+        with publication_lock(store, exclusive=True):
+            entered_replacement.append(True)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = None
+        with pytest.raises(PublicationError, match="replaced"):
+            with publication_lock(store, exclusive=True):
+                lock.rename(lock.with_suffix(".old"))
+                lock.touch(mode=0o600)
+                future = pool.submit(acquire_replacement)
+                assert replacement_started.wait(timeout=1)
+                time.sleep(0.05)
+                assert not future.done()
+                assert not entered_replacement
+        assert future is not None
+        future.result(timeout=2)
+    assert entered_replacement == [True]
+
+
+def test_store_inode_replacement_during_sqlite_open_fails_closed(tmp_path, monkeypatch):
+    store = tmp_path / "pub.db"
+    displaced = tmp_path / "displaced.db"
+    real_connect = publication_module.sqlite3.connect
+
+    def replace_before_connect(*args, **kwargs):
+        if str(args[0]).startswith("file:///proc/self/fd/"):
+            store.rename(displaced)
+            store.touch(mode=0o600)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(publication_module.sqlite3, "connect", replace_before_connect)
+    with pytest.raises(PublicationError, match="database path was replaced"):
+        publication_module.initialize_store(store)
+
+
+def test_in_process_lock_wait_has_one_bounded_deadline(tmp_path, monkeypatch):
+    store = tmp_path / "pub.db"
+    monkeypatch.setattr(publication_module, "STORE_BUSY_TIMEOUT_SECONDS", 0.1)
+
+    def contend():
+        with pytest.raises(PublicationError, match="busy timeout"):
+            with publication_lock(store, exclusive=True):
+                pass
+
+    started = time.monotonic()
+    with publication_lock(store, exclusive=True):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(contend).result(timeout=1)
+    assert time.monotonic() - started < 1
