@@ -111,7 +111,54 @@ def test_strategy_execution_summary_and_fill_history(tmp_path):
     fills = s.fills()
     assert len(fills) == 2
     assert set(fills[0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
+    display = s.fill_display_history()
+    assert display[0]["effective_fee"] == pytest.approx(0.5)
+    assert display[0]["fee_finalized"] == 1
     assert all("fill_hash" not in row for row in fills)
+
+
+def test_symbol_performance_ranks_closed_and_open_positions_by_total_pnl(tmp_path):
+    s = store(tmp_path)
+    s.apply_fill("aaa-buy", "US.AAA", "BUY", 1, 10, 1.0)
+    s.apply_fill("aaa-sell", "US.AAA", "SELL", 1, 12, 0.5)
+    s.apply_fill("bbb-buy", "US.BBB", "BUY", 2, 10, 1.0)
+    s.mark_to_market({"US.BBB": 11})
+
+    # A cumulative order-fee account supersedes its fill fee; it must not be
+    # counted a second time in per-symbol performance.
+    order_hash = "b" * 64
+    with s.connect() as con:
+        con.execute(
+            "UPDATE applied_fills SET order_hash=? WHERE symbol='US.BBB'",
+            (order_hash,),
+        )
+        con.execute(
+            "INSERT INTO order_fee_accounts"
+            "(order_hash,symbol,side,cumulative_fee,finalized,revision,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (order_hash, "US.BBB", "BUY", 1.0, 1, 1, utcnow()),
+        )
+
+    rows = s.symbol_performance()
+    assert [row["symbol"] for row in rows] == ["US.BBB", "US.AAA"]
+
+    held, closed = rows
+    assert held["holding"] is True
+    assert held["quantity"] == 2
+    assert held["fees"] == pytest.approx(1.0)
+    assert held["unrealized_pnl"] == pytest.approx(1.0)
+    assert held["realized_pnl"] == pytest.approx(0.0)
+    assert held["total_pnl"] == pytest.approx(1.0)
+    assert held["return_pct"] == pytest.approx(100 / 21)
+
+    assert closed["holding"] is False
+    assert closed["quantity"] == 0
+    assert closed["unrealized_pnl"] == 0
+    assert closed["realized_pnl"] == pytest.approx(0.5)
+    assert closed["total_pnl"] == pytest.approx(0.5)
+    assert sum(row["total_pnl"] for row in rows) == pytest.approx(
+        s.snapshot().strategy_equity - INITIAL_CAPITAL
+    )
 
 
 def test_performance_summary_requires_enough_daily_sharpe_observations(tmp_path):

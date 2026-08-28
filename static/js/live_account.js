@@ -141,6 +141,13 @@ function laOwnedPositions(control) {
   return `<div class="la-table-wrap"><table class="la-table"><thead><tr><th>${laT('标的','Symbol')}</th><th>${laT('系统拥有数量','Owned qty')}</th><th>${laT('均价','Average cost')}</th><th>${laT('现价','Last')}</th><th>${laT('市值','Market value')}</th><th>${laT('已实现盈亏','Realized P&L')}</th></tr></thead><tbody>${items.map(p=>`<tr><td><b>${laEsc(p.symbol)}</b></td><td>${laNum(p,'quantity')}</td><td>${laMoney(p.average_cost)}</td><td>${laMoney(p.market_price)}</td><td>${laMoney(p.market_value)}</td><td class="${laClass(p.realized_pnl)}">${laMoney(p.realized_pnl)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
+function laSymbolPerformance(control) {
+  const items=control.symbol_performance||[];
+  if(!items.length)return `<div class="la-empty">${laT('尚无可汇总的策略交易','No strategy trades to summarize yet')}</div>`;
+  const total=items.reduce((sum,row)=>sum+laNum(row,'total_pnl'),0);
+  return `<div class="la-performance-summary"><span>${laT('按总收益从高到低','Ranked by total P&L')}</span><b class="${laClass(total)}">${laMoney(total)}</b><small>${laT('已实现 + 未实现，含全部交易费用','Realized + unrealized, including all trading fees')}</small></div><div class="la-table-wrap"><table class="la-table la-performance-table"><thead><tr><th>#</th><th>${laT('标的','Symbol')}</th><th>${laT('状态','Status')}</th><th>${laT('持有数量','Qty held')}</th><th>${laT('已实现收益','Realized')}</th><th>${laT('未实现收益','Unrealized')}</th><th>${laT('总收益','Total P&L')}</th><th>${laT('收益率','Return')}</th></tr></thead><tbody>${items.map((p,i)=>`<tr><td class="la-rank">${i+1}</td><td><b>${laEsc(p.symbol)}</b><small>${laT('累计费用','Fees')} ${laMoney(p.fees)}</small></td><td><span class="la-position-state ${p.holding?'held':'closed'}">${p.holding?laT('持有中','HELD'):laT('已平仓','CLOSED')}</span></td><td>${laNum(p,'quantity').toLocaleString()}</td><td class="${laClass(p.realized_pnl)}">${laMoney(p.realized_pnl)}</td><td class="${laClass(p.unrealized_pnl)}">${laMoney(p.unrealized_pnl)}</td><td class="la-total-pnl ${laClass(p.total_pnl)}">${laMoney(p.total_pnl)}</td><td class="${laClass(p.return_pct)}">${p.return_pct==null?'—':laPct(p.return_pct)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
 function laEvents(control) {
   const items=control.events||[];
   if(!items.length)return `<div class="la-empty">${laT('暂无事件','No events')}</div>`;
@@ -150,7 +157,7 @@ function laEvents(control) {
 function laStrategyFills(control) {
   const items=control.fills||[];
   if(!items.length)return `<div class="la-empty">${laT('尚无策略成交','No strategy fills yet')}</div>`;
-  return `<div class="la-table-wrap"><table class="la-table compact"><thead><tr><th>${laT('入账时间','Applied at')}</th><th>${laT('标的','Symbol')}</th><th>${laT('方向','Side')}</th><th>${laT('数量','Qty')}</th><th>${laT('成交价','Fill price')}</th><th>${laT('费用','Fee')}</th><th>${laT('成交金额','Notional')}</th></tr></thead><tbody>${items.map(x=>`<tr><td>${laEsc(laTime(x.applied_at))}</td><td><b>${laEsc(x.symbol||'')}</b></td><td>${laEsc(x.side||'')}</td><td>${laNum(x,'quantity').toLocaleString()}</td><td>${laMoney(x.price)}</td><td>${laMoney(x.fee)}</td><td>${laMoney(laNum(x,'quantity')*laNum(x,'price'))}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="la-table-wrap"><table class="la-table compact"><thead><tr><th>${laT('入账时间','Applied at')}</th><th>${laT('标的','Symbol')}</th><th>${laT('方向','Side')}</th><th>${laT('数量','Qty')}</th><th>${laT('成交价','Fill price')}</th><th>${laT('费用','Fee')}</th><th>${laT('成交金额','Notional')}</th></tr></thead><tbody>${items.map(x=>`<tr><td>${laEsc(laTime(x.applied_at))}</td><td><b>${laEsc(x.symbol||'')}</b></td><td>${laEsc(x.side||'')}</td><td>${laNum(x,'quantity').toLocaleString()}</td><td>${laMoney(x.price)}</td><td>${laMoney(x.effective_fee)}${Number(x.fee_finalized)===1?'':`<small>${laT('暂定','EST.')}</small>`}</td><td>${laMoney(laNum(x,'quantity')*laNum(x,'price'))}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 
@@ -178,6 +185,7 @@ async function renderLiveAccountPage(token) {
       ${st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：页面仅展示逻辑策略子仓。','RESTRICTED SHARED ACCOUNT: this page shows the logical strategy sub-position only.')}</b> ${laT('个人持仓不会进入页面；策略只记录并卖出自己经证明成交的数量。','Personal holdings never enter this page. The strategy records and sells only its proven quantity.')}</div>`:''}
       ${laControlPanel(control)}
       <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>
+      <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section>
       <section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section>
       <section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section>
       ${laSetup(st)}

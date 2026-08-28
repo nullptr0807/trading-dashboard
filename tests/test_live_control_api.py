@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
+import pytest
 
 import api.live_account as live_api
 from core.live_strategy_control import ControlRejected, LiveStrategyStore
@@ -56,7 +57,13 @@ def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):
     assert "last_price" not in body["market_status"]
     assert body["performance_summary"]["sharpe_ratio"] is None
     assert body["owned_positions"][0]["symbol"] == "US.DRAM"
-    assert set(body["fills"][0]) == {"symbol", "side", "quantity", "price", "fee", "applied_at"}
+    assert body["symbol_performance"][0]["symbol"] == "US.DRAM"
+    assert body["symbol_performance"][0]["holding"] is True
+    assert body["symbol_performance"][0]["total_pnl"] == pytest.approx(-0.99)
+    assert set(body["fills"][0]) == {
+        "symbol", "side", "quantity", "price", "fee", "effective_fee",
+        "fee_finalized", "applied_at",
+    }
     assert all(set(event) == {"ts", "event_type", "source", "severity", "message"}
                for event in body["events"])
     for forbidden in ("account", "account_id", "positions", "orders", "deals", "order_fees"):

@@ -786,6 +786,31 @@ class LiveStrategyStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def fill_display_history(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Return immutable fills plus a display-only reconciled fee allocation.
+
+        ``fee`` remains the deal-row value. ``effective_fee`` allocates an
+        order-level cumulative Broker fee across that order's fills by traded
+        notional. Accounting does not consume this presentation field.
+        """
+        safe_limit = max(1, min(int(limit), 1000))
+        with self.connect() as con:
+            rows = con.execute(
+                "WITH fee_view AS ("
+                " SELECT f.symbol,f.side,f.quantity,f.price,f.fee,f.applied_at,"
+                " f.order_hash,a.cumulative_fee,a.finalized,"
+                " SUM(f.quantity*f.price) OVER (PARTITION BY f.order_hash) AS order_notional"
+                " FROM applied_fills f LEFT JOIN order_fee_accounts a"
+                " ON a.order_hash=f.order_hash"
+                ") SELECT symbol,side,quantity,price,fee,"
+                " CASE WHEN cumulative_fee IS NOT NULL AND order_notional>0"
+                " THEN cumulative_fee*(quantity*price)/order_notional ELSE fee END AS effective_fee,"
+                " CASE WHEN cumulative_fee IS NOT NULL THEN finalized ELSE 1 END AS fee_finalized,"
+                " applied_at FROM fee_view ORDER BY applied_at DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def execution_summary(self) -> dict[str, Any]:
         with self.connect() as con:
             row = con.execute(
@@ -809,6 +834,122 @@ class LiveStrategyStore:
             "first_trade_at": row["first_trade_at"],
             "last_trade_at": row["last_trade_at"],
         }
+
+    def symbol_performance(self) -> list[dict[str, Any]]:
+        """Return all traded/current symbols ranked by net lifetime P&L.
+
+        Net P&L is reconstructed from immutable strategy fills, the latest
+        cumulative Broker fee account for each order, and current strategy-only
+        market value.  This keeps closed symbols visible and prevents delayed
+        fee updates from disappearing from per-symbol performance.
+        """
+        with self.connect() as con:
+            fills = con.execute(
+                "SELECT symbol,side,quantity,price,fee,order_hash,applied_at "
+                "FROM applied_fills ORDER BY applied_at,fill_hash"
+            ).fetchall()
+            positions = con.execute(
+                "SELECT symbol,quantity,average_cost,market_price,market_value,"
+                "realized_pnl,updated_at FROM owned_positions"
+            ).fetchall()
+            fee_accounts = con.execute(
+                "SELECT order_hash,symbol,side,cumulative_fee FROM order_fee_accounts"
+            ).fetchall()
+
+        rows: dict[str, dict[str, Any]] = {}
+
+        def item(symbol: Any) -> dict[str, Any]:
+            normalized = str(symbol or "").strip().upper()
+            if not normalized:
+                raise ControlRejected("Invalid symbol performance identity")
+            return rows.setdefault(normalized, {
+                "symbol": normalized,
+                "quantity": 0.0,
+                "average_cost": 0.0,
+                "market_price": 0.0,
+                "market_value": 0.0,
+                "buy_quantity": 0.0,
+                "sell_quantity": 0.0,
+                "buy_notional": 0.0,
+                "sell_notional": 0.0,
+                "fees": 0.0,
+                "buy_fees": 0.0,
+                "first_trade_at": None,
+                "last_trade_at": None,
+                "position_updated_at": None,
+            })
+
+        fee_order_hashes: set[str] = set()
+        for account in fee_accounts:
+            symbol = str(account["symbol"] or "").strip().upper()
+            side = str(account["side"] or "").strip().upper()
+            fee = _finite(account["cumulative_fee"], "cumulative_fee")
+            order_hash = str(account["order_hash"] or "").strip()
+            if not order_hash or side not in {"BUY", "SELL"} or fee < 0:
+                raise ControlRejected("Invalid order fee account")
+            target = item(symbol)
+            target["fees"] += fee
+            if side == "BUY":
+                target["buy_fees"] += fee
+            fee_order_hashes.add(order_hash)
+
+        for fill in fills:
+            target = item(fill["symbol"])
+            side = str(fill["side"] or "").strip().upper()
+            quantity = _finite(fill["quantity"], "quantity")
+            price = _finite(fill["price"], "price")
+            fee = _finite(fill["fee"], "fee")
+            if side not in {"BUY", "SELL"} or quantity <= 0 or price < 0 or fee < 0:
+                raise ControlRejected("Invalid historical fill economics")
+            notional = quantity * price
+            target[f"{side.lower()}_quantity"] += quantity
+            target[f"{side.lower()}_notional"] += notional
+            order_hash = str(fill["order_hash"] or "").strip()
+            if not order_hash or order_hash not in fee_order_hashes:
+                target["fees"] += fee
+                if side == "BUY":
+                    target["buy_fees"] += fee
+            applied_at = str(fill["applied_at"] or "") or None
+            if applied_at:
+                target["first_trade_at"] = target["first_trade_at"] or applied_at
+                target["last_trade_at"] = applied_at
+
+        for position in positions:
+            target = item(position["symbol"])
+            quantity = _finite(position["quantity"], "position_quantity")
+            average_cost = _finite(position["average_cost"], "average_cost")
+            market_price = _finite(position["market_price"], "market_price")
+            market_value = _finite(position["market_value"], "market_value")
+            if quantity < 0 or average_cost < 0 or market_price < 0 or market_value < 0:
+                raise ControlRejected("Invalid position performance economics")
+            target.update({
+                "quantity": quantity,
+                "average_cost": average_cost,
+                "market_price": market_price,
+                "market_value": market_value,
+                "position_updated_at": position["updated_at"],
+            })
+
+        result: list[dict[str, Any]] = []
+        for target in rows.values():
+            total_pnl = (target["sell_notional"] - target["buy_notional"]
+                         - target["fees"] + target["market_value"])
+            unrealized_pnl = (
+                target["market_value"] - target["quantity"] * target["average_cost"]
+                if target["quantity"] > 0 else 0.0
+            )
+            realized_pnl = total_pnl - unrealized_pnl
+            deployed = target["buy_notional"] + target["buy_fees"]
+            target.update({
+                "holding": target["quantity"] > 0,
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "total_pnl": total_pnl,
+                "return_pct": (total_pnl / deployed * 100.0) if deployed > 0 else None,
+            })
+            result.append(target)
+        result.sort(key=lambda row: (-float(row["total_pnl"]), str(row["symbol"])))
+        return result
 
     def performance_summary(self) -> dict[str, Any]:
         state = self.snapshot()
