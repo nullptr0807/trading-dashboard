@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -247,16 +249,43 @@ def test_distinct_deals_apply_once_regardless_of_callback_order(tmp_path):
     assert len(store.fills(limit=10)) == 2
 
 
-def test_negative_fee_is_rejected_without_ledger_mutation(tmp_path):
+@pytest.mark.parametrize("location,key", [
+    ("order_fees", "fee_amount"),
+    ("deals", "deal_fee"),
+    ("deals", "commission"),
+])
+def test_negative_fee_is_rejected_without_ledger_mutation(tmp_path, location, key):
     store = active_store(tmp_path)
     client = FakeClient()
     data = client.snapshot()
-    data["order_fees"] = [{"order_id": "module-order", "fee_amount": -99}]
+    data[location][0][key] = -99
     client.snapshot = lambda: data
     with pytest.raises(ControlRejected, match="negative"):
         reconcile(client, store, ownership_proof=lambda *_: True)
     assert store.owned_quantity("US.AAPL") == 0
     assert store.snapshot().allocated_cash == pytest.approx(10_000)
+
+
+@pytest.mark.parametrize("location,key", [
+    ("order_fees", "fee_amount"),
+    ("deals", "deal_fee"),
+    ("deals", "commission"),
+])
+@pytest.mark.parametrize("bad_fee", [float("nan"), float("inf"), "not-a-number"])
+def test_non_finite_or_invalid_fee_is_rejected_without_ledger_mutation(
+    tmp_path, location, key, bad_fee,
+):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data[location][0][key] = bad_fee
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid numeric"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+    assert store.execution_summary()["total_trades"] == 0
 
 
 def test_deal_symbol_must_match_authorized_order(tmp_path):
@@ -564,6 +593,82 @@ def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
+    state = store.snapshot()
+    assert state.lifecycle == "FROZEN"
+    assert state.freeze_reason == "reconciliation_snapshot_deal_conflict"
+    event = store.recent_events(1)[0]
+    assert event["event_type"] == "reconciliation_snapshot_deal_conflict"
+    assert event["details"] == {
+        "conflicting_fields": ["quantity"],
+        "symbol": "US.AAPL",
+    }
+    serialized = json.dumps(event, sort_keys=True)
+    for secret_name in ("order_id", "deal_id", "account_id", "module-order", "module-deal"):
+        assert secret_name not in serialized
+
+
+def test_snapshot_deal_conflict_keeps_write_lock_through_diagnostic_commit(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["deals"] = [data["deals"][0], dict(data["deals"][0], deal_qty=1)]
+    client.snapshot = lambda: data
+    original_event_tx = store._event_tx
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    observed = []
+    thread = None
+
+    def competing_writer():
+        writer_started.set()
+        with store.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            observed.append(con.execute(
+                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+            ).fetchone())
+        writer_finished.set()
+
+    def event_with_probe(con, event_type, *args, **kwargs):
+        nonlocal thread
+        if event_type == "reconciliation_snapshot_deal_conflict":
+            thread = threading.Thread(target=competing_writer)
+            thread.start()
+            assert writer_started.wait(1)
+            time.sleep(0.05)
+            assert not writer_finished.is_set()
+        return original_event_tx(con, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_event_tx", event_with_probe)
+    with pytest.raises(ControlRejected, match="conflicting duplicate"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert thread is not None
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert [tuple(row) for row in observed] == [
+        ("FROZEN", "reconciliation_snapshot_deal_conflict"),
+    ]
+
+
+def test_snapshot_deal_conflict_replaces_transient_freeze_and_clean_sync_cannot_recover(
+    tmp_path, monkeypatch,
+):
+    store = active_store(tmp_path)
+    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    client = FakeClient()
+    conflict = client.snapshot()
+    conflict["deals"] = [conflict["deals"][0], dict(conflict["deals"][0], deal_price=101)]
+    client.snapshot = lambda: conflict
+
+    with pytest.raises(ControlRejected, match="conflicting duplicate"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_deal_conflict"
+
+    monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
+    client.snapshot = FakeClient().snapshot
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+    assert result["auto_recovered"] is False
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_deal_conflict"
 
 
 @pytest.mark.parametrize("changed", [
@@ -616,7 +721,7 @@ def test_cross_sync_identical_deal_alias_replay_is_idempotent(tmp_path):
     assert store.owned_quantity("US.AAPL") == 2
 
 
-def test_cross_sync_fee_conflict_is_latched_without_rewriting_history(tmp_path):
+def test_cross_sync_cumulative_order_fee_change_is_audited_not_a_fill_conflict(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
     reconcile(client, store, ownership_proof=lambda *_: True)
@@ -625,6 +730,46 @@ def test_cross_sync_fee_conflict_is_latched_without_rewriting_history(tmp_path):
     replay["order_fees"][0]["fee_amount"] = 2.0
     client.snapshot = lambda: replay
 
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.fills(limit=10) == original_fills
+    assert store.snapshot().freeze_reason is None
+    assert store.execution_summary()["total_fees"] == pytest.approx(2.0)
+    assert store.recent_events(2)[0]["event_type"] == "account_sync"
+    assert any(
+        event["event_type"] == "order_fee_adjusted"
+        and event["details"]["delta"] == pytest.approx(1.0)
+        for event in store.recent_events(4)
+    )
+
+    correction = client.snapshot()
+    correction["order_fees"][0]["fee_amount"] = 1.5
+    client.snapshot = lambda: correction
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.5)
+    assert store.snapshot().allocated_cash == pytest.approx(9798.5)
+    assert store.snapshot().freeze_reason is None
+    assert any(
+        event["event_type"] == "order_fee_adjusted"
+        and event["details"]["delta"] == pytest.approx(-0.5)
+        for event in store.recent_events(4)
+    )
+
+
+def test_cross_sync_stable_deal_fee_conflict_is_latched(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    first = client.snapshot()
+    first["deals"][0]["deal_fee"] = 1.0
+    client.snapshot = lambda: first
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    original_fills = store.fills(limit=10)
+
+    replay = client.snapshot()
+    replay["deals"][0]["deal_fee"] = 2.0
+    replay["order_fees"][0]["fee_amount"] = 2.0
+    client.snapshot = lambda: replay
     with pytest.raises(ControlRejected, match="conflicting replay"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
@@ -676,6 +821,256 @@ def test_complete_partial_fill_is_applied_once_and_remains_global_blocker(tmp_pa
             symbol="US.MSFT", side="BUY", purpose="TARGET_BUY", target_qty=1,
             order_qty=1, limit_price=100,
         )
+
+
+def _cumulative_fee_snapshot(*, quantities, prices, cumulative_fee, status="FILLED_PART"):
+    client = FakeClient()
+    data = client.snapshot()
+    deals = []
+    for index, (quantity, price) in enumerate(zip(quantities, prices), start=1):
+        deals.append(dict(
+            data["deals"][0], deal_id=f"module-deal-{index}",
+            deal_qty=quantity, deal_price=price,
+        ))
+    dealt = sum(quantities)
+    data["orders"][0].update(order_status=status, qty=10, dealt_qty=dealt)
+    data["deals"] = deals
+    data["order_fees"] = [{"order_id": "module-order", "fee_amount": cumulative_fee}]
+    data["positions"] = [{"code": "US.AAPL", "qty": dealt}]
+    return data
+
+
+@pytest.mark.parametrize("final_fee", [1.2, 1.6, 0.8])
+def test_six_of_ten_partial_to_final_fee_correction_keeps_all_totals_consistent(
+    tmp_path, final_fee,
+):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    client.snapshot = lambda: _cumulative_fee_snapshot(
+        quantities=[6], prices=[100], cumulative_fee=1.2,
+    )
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    client.snapshot = lambda: _cumulative_fee_snapshot(
+        quantities=[6, 4], prices=[100, 101], cumulative_fee=final_fee,
+        status="FILLED_ALL",
+    )
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    state = store.snapshot()
+    assert state.allocated_cash == pytest.approx(8996.0 - final_fee)
+    assert state.strategy_equity == pytest.approx(9996.0 - final_fee)
+    assert state.realized_pnl == pytest.approx(-final_fee)
+    assert store.execution_summary()["total_fees"] == pytest.approx(final_fee)
+    assert [row["fee"] for row in store.fills(limit=10)] == [0.0, 0.0]
+    with store.connect() as con:
+        assert con.execute(
+            "SELECT cumulative_fee FROM order_fee_accounts"
+        ).fetchone()[0] == pytest.approx(final_fee)
+
+
+def test_legacy_applied_fill_migration_credits_historical_fee_once(tmp_path):
+    db_path = tmp_path / "strategy.db"
+    fill_hash = hashlib.sha256(b"module-deal").hexdigest()
+    with sqlite3.connect(db_path) as con:
+        con.execute("""CREATE TABLE applied_fills (
+            fill_hash TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+            quantity REAL NOT NULL CHECK(quantity>0),
+            price REAL NOT NULL CHECK(price>=0),
+            fee REAL NOT NULL CHECK(fee>=0),
+            applied_at TEXT NOT NULL
+        )""")
+        con.execute(
+            "INSERT INTO applied_fills VALUES(?,?,?,?,?,?,?)",
+            (fill_hash, "US.AAPL", "BUY", 2, 100, 1.0, "2026-01-01T00:00:00+00:00"),
+        )
+
+    store = LiveStrategyStore(db_path, tmp_path / "archives")
+    with store.connect() as con:
+        columns = {row[1]: row for row in con.execute("PRAGMA table_info(applied_fills)")}
+        assert columns["fee_is_stable"][4] == "0"
+        migrated = con.execute(
+            "SELECT fee_is_stable,order_hash FROM applied_fills WHERE fill_hash=?", (fill_hash,),
+        ).fetchone()
+        assert tuple(migrated) == (0, None)
+        con.execute("""INSERT INTO owned_positions
+            (symbol,quantity,average_cost,market_price,market_value,realized_pnl,updated_at)
+            VALUES('US.AAPL',2,100.5,100,200,0,'2026-01-01T00:00:00+00:00')""")
+        con.execute("""UPDATE strategy_state SET
+            lifecycle='ACTIVE',freeze_latched=0,freeze_reason=NULL,
+            allocated_cash=9799,owned_market_value=200,strategy_equity=9999,
+            unrealized_pnl=-1,last_sync_at='synced' WHERE id=1""")
+
+    reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
+    reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
+
+    state = store.snapshot()
+    assert state.allocated_cash == pytest.approx(9799)
+    assert state.strategy_equity == pytest.approx(9999)
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.0)
+    with store.connect() as con:
+        adjustments = con.execute(
+            "SELECT previous_total,new_total,fill_fee_credit,delta "
+            "FROM order_fee_adjustments ORDER BY id"
+        ).fetchall()
+        assert [tuple(row) for row in adjustments] == [(0.0, 1.0, 1.0, 0.0)]
+        assert con.execute("SELECT COUNT(*) FROM order_fee_accounts").fetchone()[0] == 1
+
+
+def test_cumulative_order_fee_partial_to_final_is_delta_accounted_idempotently(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+
+    partial = _cumulative_fee_snapshot(quantities=[4], prices=[100], cumulative_fee=1.0)
+    client.snapshot = lambda: partial
+    first = reconcile(client, store, ownership_proof=lambda *_: True)
+    assert first["applied_fills"] == 1
+    assert store.snapshot().allocated_cash == pytest.approx(9599.0)
+
+    additional = _cumulative_fee_snapshot(
+        quantities=[4, 3], prices=[100, 101], cumulative_fee=1.0,
+    )
+    client.snapshot = lambda: additional
+    second = reconcile(client, store, ownership_proof=lambda *_: True)
+    assert second["applied_fills"] == 1
+    assert store.snapshot().allocated_cash == pytest.approx(9296.0)
+
+    final = _cumulative_fee_snapshot(
+        quantities=[4, 3, 3], prices=[100, 101, 102], cumulative_fee=1.5,
+        status="FILLED_ALL",
+    )
+    client.snapshot = lambda: final
+    third = reconcile(client, store, ownership_proof=lambda *_: True)
+    duplicate = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert third["applied_fills"] == 1
+    assert duplicate["applied_fills"] == 0
+    assert store.snapshot().allocated_cash == pytest.approx(8989.5)
+    assert store.snapshot().strategy_equity == pytest.approx(9989.5)
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.5)
+    assert store.snapshot().realized_pnl == pytest.approx(-1.5)
+    store.mark_to_market({"US.AAPL": 100}, sync_complete=False)
+    assert store.snapshot().realized_pnl == pytest.approx(-1.5)
+    assert [row["fee"] for row in store.fills(limit=10)] == [0.0, 0.0, 0.0]
+    with store.connect() as con:
+        adjustments = con.execute(
+            "SELECT previous_total,new_total,delta FROM order_fee_adjustments ORDER BY id"
+        ).fetchall()
+        account = con.execute(
+            "SELECT cumulative_fee,finalized FROM order_fee_accounts"
+        ).fetchone()
+    assert [tuple(row) for row in adjustments] == [
+        (0.0, 1.0, 1.0),
+        (1.0, 1.5, 0.5),
+    ]
+    assert tuple(account) == (1.5, 1)
+    assert store.snapshot().lifecycle == "ACTIVE"
+
+
+def test_cumulative_fee_progress_survives_restart_without_double_charge(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    partial = _cumulative_fee_snapshot(quantities=[4], prices=[100], cumulative_fee=1.0)
+    client.snapshot = lambda: partial
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    restarted = LiveStrategyStore(store.path, tmp_path / "archives")
+    final = _cumulative_fee_snapshot(
+        quantities=[4, 6], prices=[100, 101], cumulative_fee=1.4,
+        status="FILLED_ALL",
+    )
+    client.snapshot = lambda: final
+    reconcile(client, restarted, ownership_proof=lambda *_: True)
+    reconcile(client, restarted, ownership_proof=lambda *_: True)
+
+    assert restarted.snapshot().allocated_cash == pytest.approx(8992.6)
+    assert restarted.execution_summary()["total_fees"] == pytest.approx(1.4)
+    assert restarted.snapshot().freeze_reason is None
+
+
+def test_fee_adjustment_and_new_fill_rollback_together_then_restart_replays_once(
+    tmp_path, monkeypatch,
+):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    partial = _cumulative_fee_snapshot(quantities=[4], prices=[100], cumulative_fee=1.0)
+    client.snapshot = lambda: partial
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    before_cash = store.snapshot().allocated_cash
+    original_event_tx = store._event_tx
+
+    def crash_during_adjustment(con, event_type, *args, **kwargs):
+        if event_type == "order_fee_adjusted":
+            raise RuntimeError("simulated crash before transaction commit")
+        return original_event_tx(con, event_type, *args, **kwargs)
+
+    final = _cumulative_fee_snapshot(
+        quantities=[4, 6], prices=[100, 101], cumulative_fee=1.4,
+        status="FILLED_ALL",
+    )
+    client.snapshot = lambda: final
+    monkeypatch.setattr(store, "_event_tx", crash_during_adjustment)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.owned_quantity("US.AAPL") == 4
+    assert store.snapshot().allocated_cash == before_cash
+    with store.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 1
+        assert con.execute("SELECT cumulative_fee FROM order_fee_accounts").fetchone()[0] == 1.0
+
+    restarted = LiveStrategyStore(store.path, tmp_path / "archives")
+    reconcile(client, restarted, ownership_proof=lambda *_: True)
+    reconcile(client, restarted, ownership_proof=lambda *_: True)
+    assert restarted.owned_quantity("US.AAPL") == 10
+    assert restarted.execution_summary()["total_fees"] == pytest.approx(1.4)
+
+
+def test_stable_per_deal_fee_is_immutable_and_order_total_only_books_difference(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    partial = _cumulative_fee_snapshot(quantities=[4], prices=[100], cumulative_fee=1.0)
+    partial["deals"][0]["deal_fee"] = 0.6
+    client.snapshot = lambda: partial
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    final = _cumulative_fee_snapshot(
+        quantities=[4, 6], prices=[100, 101], cumulative_fee=1.3,
+        status="FILLED_ALL",
+    )
+    final["deals"][0]["deal_fee"] = 0.6
+    final["deals"][1]["deal_fee"] = 0.7
+    client.snapshot = lambda: final
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert sorted(row["fee"] for row in store.fills(limit=10)) == [0.6, 0.7]
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.3)
+    assert store.snapshot().allocated_cash == pytest.approx(8992.7)
+    assert store.snapshot().freeze_reason is None
+
+
+def test_terminal_fill_without_any_fee_truth_is_rejected_but_partial_can_defer(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    partial = _cumulative_fee_snapshot(quantities=[4], prices=[100], cumulative_fee=0.0)
+    partial["order_fees"] = []
+    client.snapshot = lambda: partial
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+    assert result["applied_fills"] == 1
+    assert store.execution_summary()["total_fees"] == 0
+
+    final = _cumulative_fee_snapshot(
+        quantities=[4, 6], prices=[100, 101], cumulative_fee=0.0,
+        status="FILLED_ALL",
+    )
+    final["order_fees"] = []
+    client.snapshot = lambda: final
+    with pytest.raises(ControlRejected, match="fee record missing"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.owned_quantity("US.AAPL") == 4
 
 
 def test_broker_cannot_have_fewer_shares_than_strategy_ledger(tmp_path):

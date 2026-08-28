@@ -87,16 +87,30 @@ def number(row: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
+def fee_number(row: dict[str, Any], key: str, *, source: str) -> float:
+    """Parse an explicitly present fee field without coercing bad data to zero."""
+    try:
+        result = float(row[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ControlRejected(f"Moomoo {source} contains an invalid numeric value") from exc
+    if not math.isfinite(result):
+        raise ControlRejected(f"Moomoo {source} contains an invalid numeric value")
+    return result
+
+
 def fee_total(row: dict[str, Any]) -> float:
     for key in ("total_fee", "fee_amount", "total_fees"):
         if row.get(key) is not None:
-            value = number(row, key)
+            value = fee_number(row, key, source="fee record")
             if value < 0:
                 raise ControlRejected("Moomoo fee record contains a negative amount")
             return value
-    values = [number(row, key) for key in (
-        "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee"
-    )]
+    values = [
+        fee_number(row, key, source="fee record") if row.get(key) is not None else 0.0
+        for key in (
+            "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee"
+        )
+    ]
     if any(value < 0 for value in values):
         raise ControlRejected("Moomoo fee record contains a negative component")
     return sum(values)
@@ -120,14 +134,36 @@ def deal_number(deal: dict[str, Any], primary: str, alias: str) -> float:
     return values[0] if values else 0.0
 
 
-def normalized_deal_identity(deal: dict[str, Any]) -> tuple[str, str, str, float, float]:
-    """Canonical exact identity; no tolerance is allowed for fill economics."""
+def deal_fee(deal: dict[str, Any]) -> float | None:
+    """Return a Broker-provided per-deal fee, never an inferred allocation."""
+    for key in ("deal_fee", "fee_amount", "total_fee", "total_fees"):
+        if deal.get(key) is not None:
+            value = fee_number(deal, key, source="deal fee")
+            if value < 0:
+                raise ControlRejected("Moomoo deal fee contains a negative amount")
+            return value
+    component_keys = (
+        "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee",
+    )
+    if any(deal.get(key) is not None for key in component_keys):
+        values = [
+            fee_number(deal, key, source="deal fee") if deal.get(key) is not None else 0.0
+            for key in component_keys
+        ]
+        if any(value < 0 for value in values):
+            raise ControlRejected("Moomoo deal fee contains a negative component")
+        return sum(values)
+    return None
+
+
+def normalized_deal_identity(deal: dict[str, Any]) -> tuple[str, str, float, float, float | None]:
+    """Canonical economic identity; Broker references are deliberately excluded."""
     return (
-        str(deal.get("order_id") or ""),
         str(deal.get("code") or "").strip().upper(),
         str(deal.get("trd_side") or "").strip().upper(),
         deal_number(deal, "deal_qty", "qty"),
         deal_number(deal, "deal_price", "price"),
+        deal_fee(deal),
     )
 
 
@@ -179,8 +215,16 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             deal_ref = str(deal.get("deal_id") or "")
             if deal_ref and deal_ref in deals_by_reference:
                 previous = deals_by_reference[deal_ref]
-                if normalized_deal_identity(previous) != normalized_deal_identity(deal):
-                    raise ControlRejected("Moomoo returned a conflicting duplicate deal reference")
+                previous_identity = normalized_deal_identity(previous)
+                replay_identity = normalized_deal_identity(deal)
+                if previous_identity != replay_identity:
+                    field_names = ("symbol", "side", "quantity", "price", "fee")
+                    store.latch_snapshot_deal_conflict(
+                        str(deal.get("code") or previous.get("code") or ""),
+                        [name for name, old, new in zip(
+                            field_names, previous_identity, replay_identity,
+                        ) if old != new],
+                    )
                 continue
             if deal_ref:
                 deals_by_reference[deal_ref] = deal
@@ -202,7 +246,12 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             raise ControlRejected("Module order filled status leads complete fill details")
         if abs(dealt_qty - deal_qty_total) > 1e-9:
             raise ControlRejected("Module order dealt quantity differs from deal detail total")
-        if dealt_qty > 0 and order_id not in fee_by_order:
+        direct_deal_fees = [deal_fee(deal) for deal in deals_by_order.get(order_id, [])]
+        all_deal_fees_known = bool(direct_deal_fees) and all(
+            value is not None for value in direct_deal_fees
+        )
+        if (dealt_qty > 0 and order_id not in fee_by_order and not all_deal_fees_known
+                and order_status in TERMINAL):
             raise ControlRejected("Moomoo fee record missing for a module order")
 
     preview_finalizations = []
@@ -216,6 +265,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                     (preview_id, "failed" if failed else "accepted", None if failed else order_id)
                 )
     staged_fills = []
+    order_fee_observations = []
     for order_id, deals in deals_by_order.items():
         order = module_orders[order_id]
         deal_qty_total = sum(deal_number(d, "deal_qty", "qty") for d in deals)
@@ -227,10 +277,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             raise ControlRejected("Module order dealt quantity differs from deal detail total")
         if order_qty <= 0 or dealt_qty > order_qty + 1e-9:
             raise ControlRejected("Module order dealt quantity exceeds authorized order quantity")
-        total_qty = deal_qty_total
-        total_fee = fee_by_order.get(order_id)
-        if total_fee is None:
-            raise ControlRejected("Moomoo fee record missing for a module order")
+        direct_fees = [deal_fee(deal) for deal in deals]
         for deal in deals:
             deal_ref = deal.get("deal_id")
             qty = deal_number(deal, "deal_qty", "qty")
@@ -245,10 +292,23 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                 raise ControlRejected("Moomoo deal side differs from its authorized order")
             if not deal_ref or side not in {"BUY", "SELL"} or not symbol or qty <= 0 or price <= 0:
                 raise ControlRejected("Malformed module-tagged Moomoo deal")
-            allocated_fee = total_fee * qty / total_qty
+            stable_fee = deal_fee(deal)
             staged_fills.append({
                 "external_reference": str(deal_ref), "symbol": symbol,
-                "side": side, "quantity": qty, "price": price, "fee": allocated_fee,
+                "side": side, "quantity": qty, "price": price,
+                "fee": stable_fee if stable_fee is not None else 0.0,
+                "fee_is_stable": stable_fee is not None,
+                "external_order_reference": order_id,
+            })
+        if order_id in fee_by_order or all(value is not None for value in direct_fees):
+            cumulative_fee = (fee_by_order[order_id] if order_id in fee_by_order
+                              else sum(float(value) for value in direct_fees if value is not None))
+            order_fee_observations.append({
+                "external_order_reference": order_id,
+                "symbol": str(order.get("code") or "").strip().upper(),
+                "side": str(order.get("trd_side") or "").strip().upper(),
+                "cumulative_fee": cumulative_fee,
+                "finalized": str(order.get("order_status") or "").upper() in TERMINAL,
             })
     broker_positions = {str(row.get("code") or "").upper(): number(row, "qty")
                         for row in snapshot.get("positions", [])}
@@ -299,6 +359,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         allow_external_overlap=account_isolation_mode == "shared_restricted",
         account_isolation_mode=account_isolation_mode,
         quantity_observed_at=snapshot_observed_at,
+        order_fee_observations=order_fee_observations,
     )
     for preview_id, status, order_id in preview_finalizations:
         finalize_preview(preview_id, status, order_id)

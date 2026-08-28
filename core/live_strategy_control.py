@@ -198,7 +198,29 @@ class LiveStrategyStore:
                     quantity REAL NOT NULL CHECK(quantity>0),
                     price REAL NOT NULL CHECK(price>=0),
                     fee REAL NOT NULL CHECK(fee>=0),
-                    applied_at TEXT NOT NULL
+                    applied_at TEXT NOT NULL,
+                    fee_is_stable INTEGER NOT NULL DEFAULT 0 CHECK(fee_is_stable IN (0,1)),
+                    order_hash TEXT
+                );
+                CREATE TABLE IF NOT EXISTS order_fee_accounts (
+                    order_hash TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+                    cumulative_fee REAL NOT NULL CHECK(cumulative_fee>=0),
+                    finalized INTEGER NOT NULL CHECK(finalized IN (0,1)),
+                    revision INTEGER NOT NULL CHECK(revision>=0),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS order_fee_adjustments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    adjustment_hash TEXT NOT NULL UNIQUE,
+                    order_hash TEXT NOT NULL,
+                    previous_total REAL NOT NULL CHECK(previous_total>=0),
+                    new_total REAL NOT NULL CHECK(new_total>=0),
+                    fill_fee_credit REAL NOT NULL CHECK(fill_fee_credit>=0),
+                    delta REAL NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    FOREIGN KEY(order_hash) REFERENCES order_fee_accounts(order_hash)
                 );
                 CREATE TABLE IF NOT EXISTS external_symbol_denylist (
                     symbol TEXT PRIMARY KEY,
@@ -286,6 +308,11 @@ class LiveStrategyStore:
             proof_columns = {row[1] for row in con.execute("PRAGMA table_info(broker_sync_proof)")}
             if "control_generation" not in proof_columns:
                 con.execute("ALTER TABLE broker_sync_proof ADD COLUMN control_generation INTEGER NOT NULL DEFAULT 0")
+            fill_columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
+            if "fee_is_stable" not in fill_columns:
+                con.execute("ALTER TABLE applied_fills ADD COLUMN fee_is_stable INTEGER NOT NULL DEFAULT 0")
+            if "order_hash" not in fill_columns:
+                con.execute("ALTER TABLE applied_fills ADD COLUMN order_hash TEXT")
             exists = con.execute("SELECT 1 FROM strategy_state WHERE id=1").fetchone()
             if not exists:
                 now = utcnow()
@@ -345,6 +372,39 @@ class LiveStrategyStore:
                 ],
             },
         )
+
+    def latch_snapshot_deal_conflict(self, symbol: str, conflicting_fields: list[str]) -> None:
+        """Commit a non-recoverable, secret-free same-snapshot conflict latch."""
+        safe_symbol = str(symbol or "").strip().upper()
+        requested = set(conflicting_fields)
+        safe_fields = [
+            field for field in ("symbol", "side", "quantity", "price", "fee")
+            if field in requested
+        ]
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            now = utcnow()
+            current = con.execute(
+                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+            ).fetchone()
+            existing_reason = str(current["freeze_reason"] or "") if current else ""
+            preserve_existing = bool(
+                current and current["lifecycle"] == "FROZEN" and existing_reason
+                and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
+            )
+            reason = existing_reason if preserve_existing else "reconciliation_snapshot_deal_conflict"
+            con.execute(
+                "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                (reason, now, now),
+            )
+            self._event_tx(
+                con, "reconciliation_snapshot_deal_conflict", "moomoo_reconciler", "critical",
+                "Broker snapshot repeated a deal reference with conflicting economics",
+                {"symbol": safe_symbol, "conflicting_fields": safe_fields},
+            )
+            con.commit()
+        raise ControlRejected("Moomoo returned a conflicting duplicate deal reference")
 
     def _invalidate_runtime_tx(self, con: sqlite3.Connection, reason: str) -> int:
         row = con.execute("SELECT generation FROM control_runtime WHERE id=1").fetchone()
@@ -551,16 +611,19 @@ class LiveStrategyStore:
         with self.connect() as con:
             row = con.execute(
                 "SELECT COUNT(*) AS total_trades, "
-                "COALESCE(SUM(fee),0) AS total_fees, "
+                "COALESCE(SUM(fee),0) AS fill_fees, "
                 "COALESCE(SUM(quantity*price),0) AS total_notional, "
                 "COALESCE(SUM(CASE WHEN side='BUY' THEN 1 ELSE 0 END),0) AS buy_trades, "
                 "COALESCE(SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END),0) AS sell_trades, "
                 "MIN(applied_at) AS first_trade_at, MAX(applied_at) AS last_trade_at "
                 "FROM applied_fills"
             ).fetchone()
+            adjustment_row = con.execute(
+                "SELECT COALESCE(SUM(delta),0) AS adjustment_fees FROM order_fee_adjustments"
+            ).fetchone()
         return {
             "total_trades": int(row["total_trades"]),
-            "total_fees": float(row["total_fees"]),
+            "total_fees": float(row["fill_fees"]) + float(adjustment_row["adjustment_fees"]),
             "total_notional": float(row["total_notional"]),
             "buy_trades": int(row["buy_trades"]),
             "sell_trades": int(row["sell_trades"]),
@@ -1126,8 +1189,12 @@ class LiveStrategyStore:
                 market_price=excluded.market_price,market_value=excluded.market_value,
                 realized_pnl=excluded.realized_pnl,updated_at=excluded.updated_at""",
                 (symbol, new_qty, new_cost, market_price, market_value, realized, utcnow()))
-            con.execute("INSERT INTO applied_fills VALUES(?,?,?,?,?,?,?)",
-                        (reference_hash, symbol, side, quantity, price, fee, utcnow()))
+            con.execute(
+                "INSERT INTO applied_fills "
+                "(fill_hash,symbol,side,quantity,price,fee,applied_at,fee_is_stable,order_hash) "
+                "VALUES(?,?,?,?,?,?,?,1,NULL)",
+                (reference_hash, symbol, side, quantity, price, fee, utcnow()),
+            )
             con.execute("UPDATE strategy_state SET allocated_cash=?,updated_at=? WHERE id=1",
                         (cash, utcnow()))
             self._event_tx(con, "fill_applied", "moomoo_reconciler", "info",
@@ -1140,7 +1207,8 @@ class LiveStrategyStore:
                          reserved_buy_notional: float, sync_fingerprint: str,
                          allow_external_overlap: bool = False, *,
                          account_isolation_mode: str,
-                         quantity_observed_at: str) -> int:
+                         quantity_observed_at: str,
+                         order_fee_observations: list[dict[str, Any]] | None = None) -> int:
         """Atomically apply fills, marks, reservations, risk state, and sync proof."""
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -1153,6 +1221,8 @@ class LiveStrategyStore:
                 raise ControlRejected("Invalid reconciliation reservation or sync fingerprint")
             staged: list[dict[str, Any]] = []
             staged_by_hash: dict[str, tuple[str, str, float, float, float]] = {}
+            replayed_fees_by_order: dict[str, float] = {}
+            new_fees_by_order: dict[str, float] = {}
 
             for fill in fills:
                 reference_hash = hashlib.sha256(str(fill["external_reference"]).encode()).hexdigest()
@@ -1161,11 +1231,16 @@ class LiveStrategyStore:
                 quantity = _finite(fill["quantity"], "quantity")
                 price = _finite(fill["price"], "price")
                 fee = _finite(fill.get("fee", 0.0), "fee")
+                fee_is_stable = bool(fill.get("fee_is_stable", False))
+                external_order_reference = str(fill.get("external_order_reference") or "")
+                order_hash = (hashlib.sha256(external_order_reference.encode()).hexdigest()
+                              if external_order_reference else None)
                 if side not in {"BUY", "SELL"} or quantity <= 0 or price <= 0 or fee < 0:
                     raise ControlRejected("Invalid fill in reconciliation batch")
                 replay = (symbol, side, quantity, price, fee)
                 existing = con.execute(
-                    "SELECT symbol,side,quantity,price,fee FROM applied_fills WHERE fill_hash=?",
+                    "SELECT symbol,side,quantity,price,fee,fee_is_stable "
+                    "FROM applied_fills WHERE fill_hash=?",
                     (reference_hash,),
                 ).fetchone()
                 if existing:
@@ -1174,7 +1249,15 @@ class LiveStrategyStore:
                         str(existing["side"]).strip().upper(),
                         float(existing["quantity"]), float(existing["price"]), float(existing["fee"]),
                     )
-                    if replay == persisted:
+                    same_fill = replay[:4] == persisted[:4]
+                    stable_fee_conflict = bool(
+                        existing["fee_is_stable"] and fee_is_stable and fee != persisted[4]
+                    )
+                    if same_fill and not stable_fee_conflict:
+                        if order_hash:
+                            replayed_fees_by_order[order_hash] = (
+                                replayed_fees_by_order.get(order_hash, 0.0) + persisted[4]
+                            )
                         continue
                     self._latch_fill_conflict_tx(con, symbol, replay, persisted)
                     con.commit()
@@ -1217,7 +1300,10 @@ class LiveStrategyStore:
                 staged.append({
                     "fill_hash": reference_hash, "symbol": symbol, "side": side,
                     "quantity": quantity, "price": price, "fee": fee,
+                    "fee_is_stable": fee_is_stable, "order_hash": order_hash,
                 })
+                if order_hash:
+                    new_fees_by_order[order_hash] = new_fees_by_order.get(order_hash, 0.0) + fee
 
             for symbol, position in positions.items():
                 expected = float(position["quantity"])
@@ -1264,6 +1350,70 @@ class LiveStrategyStore:
                         "Broker quantity differs from staged strategy quantity; batch rolled back"
                     )
 
+            staged_fee_accounts: list[dict[str, Any]] = []
+            staged_fee_adjustments: list[dict[str, Any]] = []
+            observed_order_hashes: set[str] = set()
+            fee_cash_delta = 0.0
+            for observation in order_fee_observations or []:
+                external_order_reference = str(observation.get("external_order_reference") or "")
+                if not external_order_reference:
+                    raise ControlRejected("Order fee observation requires an external reference")
+                order_hash = hashlib.sha256(external_order_reference.encode()).hexdigest()
+                symbol = str(observation.get("symbol") or "").strip().upper()
+                side = str(observation.get("side") or "").strip().upper()
+                cumulative_fee = _finite(observation.get("cumulative_fee"), "cumulative_fee")
+                finalized = bool(observation.get("finalized", False))
+                if (order_hash in observed_order_hashes or not symbol
+                        or side not in {"BUY", "SELL"} or cumulative_fee < 0):
+                    raise ControlRejected("Invalid or duplicate order fee observation")
+                observed_order_hashes.add(order_hash)
+                existing_account = con.execute(
+                    "SELECT symbol,side,cumulative_fee,finalized,revision "
+                    "FROM order_fee_accounts WHERE order_hash=?", (order_hash,),
+                ).fetchone()
+                if existing_account and (
+                    str(existing_account["symbol"]) != symbol
+                    or str(existing_account["side"]) != side
+                ):
+                    replay = (symbol, side, 0.0, 0.0, cumulative_fee)
+                    persisted = (
+                        str(existing_account["symbol"]), str(existing_account["side"]),
+                        0.0, 0.0, float(existing_account["cumulative_fee"]),
+                    )
+                    self._latch_fill_conflict_tx(con, symbol, replay, persisted)
+                    con.commit()
+                    raise ControlRejected("Existing order fee reference has a conflicting replay")
+                previous_total = (
+                    float(existing_account["cumulative_fee"]) if existing_account else 0.0
+                )
+                fill_fee_credit = new_fees_by_order.get(order_hash, 0.0)
+                if not existing_account:
+                    fill_fee_credit += replayed_fees_by_order.get(order_hash, 0.0)
+                delta = cumulative_fee - previous_total - fill_fee_credit
+                revision = int(existing_account["revision"]) if existing_account else 0
+                should_audit = cumulative_fee != previous_total or fill_fee_credit != 0.0
+                if should_audit:
+                    revision += 1
+                    material = "|".join((
+                        order_hash, str(revision), format(previous_total, ".17g"),
+                        format(cumulative_fee, ".17g"), format(fill_fee_credit, ".17g"),
+                        format(delta, ".17g"),
+                    ))
+                    staged_fee_adjustments.append({
+                        "adjustment_hash": hashlib.sha256(material.encode()).hexdigest(),
+                        "order_hash": order_hash, "previous_total": previous_total,
+                        "new_total": cumulative_fee, "fill_fee_credit": fill_fee_credit,
+                        "delta": delta,
+                    })
+                fee_cash_delta += delta
+                staged_fee_accounts.append({
+                    "order_hash": order_hash, "symbol": symbol, "side": side,
+                    "cumulative_fee": cumulative_fee,
+                    "finalized": bool(finalized or (existing_account and existing_account["finalized"])),
+                    "revision": revision,
+                })
+            cash -= fee_cash_delta
+
             market_value = unrealized = realized_total = 0.0
             for symbol, position in positions.items():
                 quantity = float(position["quantity"])
@@ -1280,6 +1430,10 @@ class LiveStrategyStore:
                 else:
                     position["market_value"] = 0.0
                 realized_total += float(position["realized_pnl"])
+            prior_fee_adjustments = con.execute(
+                "SELECT COALESCE(SUM(delta),0) FROM order_fee_adjustments"
+            ).fetchone()[0]
+            realized_total -= float(prior_fee_adjustments) + fee_cash_delta
             equity = cash + market_value
             lifecycle, reason = state["lifecycle"], state["freeze_reason"]
             required_sync_after = state["required_sync_after"]
@@ -1303,12 +1457,48 @@ class LiveStrategyStore:
                              position["market_price"], position["market_value"],
                              position["realized_pnl"], now))
             for fill in staged:
-                con.execute("INSERT INTO applied_fills VALUES(?,?,?,?,?,?,?)",
-                            (fill["fill_hash"], fill["symbol"], fill["side"],
-                             fill["quantity"], fill["price"], fill["fee"], now))
+                con.execute(
+                    "INSERT INTO applied_fills "
+                    "(fill_hash,symbol,side,quantity,price,fee,applied_at,fee_is_stable,order_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (fill["fill_hash"], fill["symbol"], fill["side"], fill["quantity"],
+                     fill["price"], fill["fee"], now, int(fill["fee_is_stable"]),
+                     fill["order_hash"]),
+                )
                 self._event_tx(con, "fill_applied", "moomoo_reconciler", "info",
                                f"Strategy {fill['side'].lower()} fill reconciled",
                                {"symbol": fill["symbol"], "quantity": fill["quantity"]})
+            for account in staged_fee_accounts:
+                con.execute(
+                    """INSERT INTO order_fee_accounts
+                    (order_hash,symbol,side,cumulative_fee,finalized,revision,updated_at)
+                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(order_hash) DO UPDATE SET
+                    symbol=excluded.symbol,side=excluded.side,
+                    cumulative_fee=excluded.cumulative_fee,
+                    finalized=excluded.finalized,revision=excluded.revision,
+                    updated_at=excluded.updated_at""",
+                    (account["order_hash"], account["symbol"], account["side"],
+                     account["cumulative_fee"], int(account["finalized"]),
+                     account["revision"], now),
+                )
+            for adjustment in staged_fee_adjustments:
+                con.execute(
+                    """INSERT INTO order_fee_adjustments
+                    (adjustment_hash,order_hash,previous_total,new_total,fill_fee_credit,delta,applied_at)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (adjustment["adjustment_hash"], adjustment["order_hash"],
+                     adjustment["previous_total"], adjustment["new_total"],
+                     adjustment["fill_fee_credit"], adjustment["delta"], now),
+                )
+                self._event_tx(
+                    con, "order_fee_adjusted", "moomoo_reconciler", "info",
+                    "Cumulative Broker order fee was reconciled to the strategy ledger",
+                    {"symbol": next(
+                        account["symbol"] for account in staged_fee_accounts
+                        if account["order_hash"] == adjustment["order_hash"]
+                    ), "previous_total": adjustment["previous_total"],
+                     "new_total": adjustment["new_total"], "delta": adjustment["delta"]},
+                )
             if breach:
                 required_sync_after = now
                 self._event_tx(con, "risk_limit_breach", "risk_engine", "critical",
@@ -1369,6 +1559,9 @@ class LiveStrategyStore:
                 realized += float(row["realized_pnl"])
                 con.execute("UPDATE owned_positions SET market_price=?,market_value=?,updated_at=? WHERE symbol=?",
                             (price, value, utcnow(), row["symbol"]))
+            realized -= float(con.execute(
+                "SELECT COALESCE(SUM(delta),0) FROM order_fee_adjustments"
+            ).fetchone()[0])
             state = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
             equity = float(state["allocated_cash"]) + market_value
             lifecycle, reason = state["lifecycle"], state["freeze_reason"]
