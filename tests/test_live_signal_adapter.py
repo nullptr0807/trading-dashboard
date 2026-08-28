@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -32,6 +32,14 @@ def _fixture(tmp_path, *, factors=("f1", "f2"), source_date="2026-08-26", values
             [(ticker, source_date, factor, value, "gp_B16")
              for ticker, row in values.items() for factor, value in row.items()],
         )
+        prior = datetime.fromisoformat(source_date).date() - timedelta(days=1)
+        while prior.weekday() >= 5:
+            prior -= timedelta(days=1)
+        con.executemany(
+            "INSERT INTO factor_values VALUES(?,?,?,?,?)",
+            [(ticker, prior.isoformat(), factor, value, "gp_B16")
+             for ticker, row in values.items() for factor, value in row.items()],
+        )
     return source, factors_path
 
 
@@ -40,7 +48,7 @@ def _published(tmp_path, **kwargs):
     store = tmp_path / "publications.db"
     publish_b16_signal(
         source, factors, store,
-        published_at=datetime(2026, 8, 27, tzinfo=timezone.utc), publish=True,
+        clock=lambda: datetime(2026, 8, 27, tzinfo=timezone.utc), publish=True,
     )
     return source, factors, store
 
@@ -85,7 +93,7 @@ def test_adapter_rejects_stale_published_session(tmp_path):
     store = tmp_path / "publications.db"
     publish_b16_signal(
         source, factors, store,
-        published_at=datetime(2026, 8, 21, tzinfo=timezone.utc), publish=True,
+        clock=lambda: datetime(2026, 8, 21, tzinfo=timezone.utc), publish=True,
     )
     with pytest.raises(SignalAdapterError, match="stale"):
         load_b16_signal_batch(
@@ -122,7 +130,7 @@ def test_inactive_and_failure_marker_factors_are_excluded_at_publication(tmp_pat
     store = tmp_path / "publications.db"
     publish_b16_signal(
         source, factors, store,
-        published_at=datetime(2026, 8, 27, tzinfo=timezone.utc), publish=True,
+        clock=lambda: datetime(2026, 8, 27, tzinfo=timezone.utc), publish=True,
     )
     batch = load_b16_signal_batch(
         store, factors, as_of=datetime(2026, 8, 27, 1, tzinfo=timezone.utc),

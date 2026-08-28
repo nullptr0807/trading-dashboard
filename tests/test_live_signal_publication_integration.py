@@ -52,6 +52,7 @@ def _source(tmp_path):
             value REAL, factor_group TEXT NOT NULL,
             PRIMARY KEY(ticker,date,factor_name,factor_group))""")
         con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-26", "OLD"))
+        con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-25", "OLD"))
     return source, factors
 
 
@@ -69,7 +70,7 @@ def test_real_publication_loader_executor_planner_chain_is_pit_at_close(tmp_path
     publications = tmp_path / "publications.db"
     publish_b16_signal(
         source, factors, publications,
-        published_at=datetime(2026, 8, 26, 21, tzinfo=timezone.utc), publish=True,
+        clock=lambda: datetime(2026, 8, 26, 21, tzinfo=timezone.utc), publish=True,
     )
     with sqlite3.connect(source) as con:
         con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-27", "NEW"))
@@ -78,11 +79,11 @@ def test_real_publication_loader_executor_planner_chain_is_pit_at_close(tmp_path
     with pytest.raises(PublicationError, match="future|completed"):
         publish_b16_signal(
             source, factors, publications,
-            published_at=datetime(2026, 8, 27, 19, 59, tzinfo=timezone.utc), publish=True,
+            clock=lambda: datetime(2026, 8, 27, 19, 59, tzinfo=timezone.utc), publish=True,
         )
     publish_b16_signal(
         source, factors, publications,
-        published_at=datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc), publish=True,
+        clock=lambda: datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc), publish=True,
     )
 
     executor = LiveAutoExecutor(
@@ -90,7 +91,7 @@ def test_real_publication_loader_executor_planner_chain_is_pit_at_close(tmp_path
         signal_loader=partial(load_b16_signal_batch, publications, factors),
     )
     premarket = executor.shadow(now=datetime(2026, 8, 27, 12, tzinfo=timezone.utc))
-    exact_close = executor.shadow(now=datetime(2026, 8, 27, 20, tzinfo=timezone.utc))
+    exact_close = executor.shadow(now=datetime(2026, 8, 27, 20, 0, 6, tzinfo=timezone.utc))
 
     assert premarket["signal_source_date"] == "2026-08-26"
     assert exact_close["signal_source_date"] == "2026-08-27"

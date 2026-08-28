@@ -6,7 +6,7 @@ import json
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +15,16 @@ from core.live_signal_publication import (
     DEFAULT_FACTORS_PATH,
     DEFAULT_PUBLICATION_DB_PATH,
     EXPECTED_CALENDAR_VERSION,
+    ELIGIBILITY_DELAY_SECONDS,
     FACTOR_GROUP,
     PublicationError,
     active_factor_names,
     canonical_json,
     latest_completed_session,
     parse_session,
+    publication_lock,
+    publication_record_material,
+    require_store_not_quarantined,
     ranking_from_values,
     sha256_json,
     timestamp_text,
@@ -51,7 +55,7 @@ class SignalBatch:
     buy_candidates: tuple[str, ...]
     sell_tail: tuple[str, ...]
     publication_version: int = 0
-    published_at: str = ""
+    eligible_at: str = ""
     payload_sha256: str = ""
 
 
@@ -102,11 +106,15 @@ def _validate_publication(
         payload = json.loads(payload_text)
         if canonical_json(payload) != payload_text:
             raise _integrity_error()
-        published_at = datetime.fromisoformat(str(row["published_at"]))
-        if (published_at.tzinfo is None
-                or timestamp_text(published_at) != str(row["published_at"])
-                or published_at.astimezone(timezone.utc) > as_of):
-            raise _integrity_error("B16 publication timestamp is invalid")
+        eligible_at = datetime.fromisoformat(str(row["eligible_at"]))
+        append_started_at = datetime.fromisoformat(str(row["append_started_at"]))
+        if (eligible_at.tzinfo is None or append_started_at.tzinfo is None
+                or timestamp_text(eligible_at) != str(row["eligible_at"])
+                or timestamp_text(append_started_at) != str(row["append_started_at"])
+                or eligible_at - append_started_at
+                != timedelta(seconds=ELIGIBILITY_DELAY_SECONDS)
+                or eligible_at.astimezone(timezone.utc) > as_of):
+            raise _integrity_error("B16 publication eligibility is invalid")
         source_date = str(row["source_date"])
         parsed_date = parse_session(source_date, calendar, label="Published")
         if parsed_date > cutoff_date:
@@ -121,7 +129,7 @@ def _validate_publication(
             raise SignalAdapterError("B16 publication factor set does not match active factor set")
         if factor_hash != row["factor_set_sha256"]:
             raise _integrity_error()
-        if (payload.get("schema_version") != 1 or payload.get("strategy_id") != "B16"
+        if (payload.get("schema_version") != 2 or payload.get("strategy_id") != "B16"
                 or payload.get("source_date") != source_date
                 or tuple(payload.get("factor_names", ())) != factor_names
                 or payload.get("factor_set_sha256") != factor_hash):
@@ -147,15 +155,24 @@ def _validate_publication(
                 or payload.get("universe_size") != len(matrix)
                 or int(row["universe_size"]) != len(matrix)):
             raise _integrity_error()
-        prior = payload.get("prior_universe_size")
-        stored_prior = row["prior_universe_size"]
-        if prior != stored_prior:
+        coverage = payload.get("coverage")
+        if not isinstance(coverage, dict):
             raise _integrity_error()
-        if prior is not None:
-            if isinstance(prior, bool) or not isinstance(prior, int) or prior <= 0:
-                raise _integrity_error()
-            if len(matrix) / prior < minimum_latest_coverage:
+        baseline_size = row["baseline_size"]
+        expected_coverage = len(matrix) / int(baseline_size)
+        if (coverage.get("baseline_kind") != row["baseline_kind"]
+                or coverage.get("baseline_date") != row["baseline_date"]
+                or coverage.get("baseline_size") != baseline_size
+                or coverage.get("baseline_sha256") != row["baseline_sha256"]
+                or coverage.get("by_factor") != {
+                    factor: expected_coverage for factor in factor_names
+                }):
+            raise _integrity_error()
+        if any(float(value) < minimum_latest_coverage
+               for value in coverage["by_factor"].values()):
                 raise SignalAdapterError("B16 publication cross-section coverage is partial")
+        if sha256_json(publication_record_material(dict(row))) != row["record_sha256"]:
+            raise _integrity_error()
         return payload, ranking
     except SignalAdapterError:
         raise
@@ -193,23 +210,29 @@ def load_b16_signal_batch(
     except PublicationError as exc:
         raise SignalAdapterError(str(exc)) from exc
 
-    with _publication_connection(db_path) as con:
-        try:
-            row = con.execute(
-                "SELECT * FROM signal_publications WHERE strategy_id=? "
-                "AND published_at<=? AND source_date<=? "
-                "ORDER BY published_at DESC,publication_id DESC LIMIT 1",
-                (strategy_id, timestamp_text(now), cutoff_date.isoformat()),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            raise SignalAdapterError("Unable to read B16 publication store") from exc
-    if row is None:
-        raise SignalAdapterError("No eligible B16 publication exists for as_of")
-
-    _, ranking_payload = _validate_publication(
-        row, expected_factors, calendar, cutoff_date, now,
-        minimum_latest_coverage, max_age_days,
-    )
+    try:
+        with publication_lock(db_path, exclusive=False) as lock_descriptor:
+            require_store_not_quarantined(lock_descriptor)
+            with _publication_connection(db_path) as con:
+                try:
+                    row = con.execute(
+                        "SELECT p.* FROM signal_publications p WHERE strategy_id=? "
+                        "AND eligible_at<=? AND source_date<=? "
+                        "AND NOT EXISTS(SELECT 1 FROM signal_publication_revocations r "
+                        "WHERE r.publication_id=p.publication_id) "
+                        "ORDER BY eligible_at DESC,publication_id DESC LIMIT 1",
+                        (strategy_id, timestamp_text(now), cutoff_date.isoformat()),
+                    ).fetchone()
+                except sqlite3.Error as exc:
+                    raise SignalAdapterError("Unable to read B16 publication store") from exc
+                if row is None:
+                    raise SignalAdapterError("No eligible B16 publication exists for as_of")
+                _, ranking_payload = _validate_publication(
+                    row, expected_factors, calendar, cutoff_date, now,
+                    minimum_latest_coverage, max_age_days,
+                )
+    except PublicationError as exc:
+        raise SignalAdapterError(str(exc)) from exc
     ranking = tuple(RankedSignal(str(item[0]), float(item[1])) for item in ranking_payload)
     if not ranking or any(not item.symbol or not math.isfinite(item.score) for item in ranking):
         raise _integrity_error()
@@ -225,5 +248,5 @@ def load_b16_signal_batch(
     return SignalBatch(
         strategy_id, str(row["source_date"]), expected_factors,
         str(row["factor_set_sha256"]), batch_id, ranking, buy_candidates, sell_tail,
-        int(row["version"]), str(row["published_at"]), str(row["payload_sha256"]),
+        int(row["version"]), str(row["eligible_at"]), str(row["payload_sha256"]),
     )
