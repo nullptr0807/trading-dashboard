@@ -141,8 +141,13 @@ def _order_for_intent(snapshot: dict[str, Any], intent: dict[str, Any]) -> dict[
     return order
 
 
-def recover_auto_intents(store: LiveStrategyStore, snapshot: dict[str, Any]) -> dict[str, Any] | None:
-    """Reconcile intent lifecycle from proven Broker remarks; never redispatch unknowns."""
+def recover_auto_intents(
+    store: LiveStrategyStore,
+    snapshot: dict[str, Any],
+    *,
+    reconciliation_complete: bool = False,
+) -> dict[str, Any] | None:
+    """Recover proven intents; only a complete reconciliation may make them terminal."""
     blocker = None
     for intent in reversed(store.list_auto_order_intents(limit=1000)):
         status = str(intent["status"])
@@ -170,6 +175,9 @@ def recover_auto_intents(store: LiveStrategyStore, snapshot: dict[str, Any]) -> 
         order_status = str(order.get("order_status") or "").upper()
         dealt = _number(order, "dealt_qty")
         ordered = _number(order, "qty")
+        if order_status in TERMINAL_ORDERS and not reconciliation_complete:
+            blocker = intent
+            continue
         if order_status == "FILLED_ALL" or (ordered > 0 and dealt >= ordered - 1e-9):
             if status != "FILLED":
                 store.mark_auto_intent_filled(intent["intent_id"])
@@ -325,11 +333,6 @@ class LiveAutoExecutor:
             self.store.mark_auto_intent_acked(intent_row["intent_id"])
             self.reconcile_fn(self.client, self.store)
             order = result.get("order") or {}
-            returned_status = str(order.get("order_status") or "").upper()
-            if returned_status == "FILLED_ALL":
-                self.store.mark_auto_intent_filled(intent_row["intent_id"])
-            else:
-                recover_auto_intents(self.store, self.client.snapshot())
             final = self.store.get_auto_order_intent(intent_row["intent_id"])
             order_id = str(order.get("order_id") or "")
             return {

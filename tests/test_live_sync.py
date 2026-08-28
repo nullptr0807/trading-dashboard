@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -187,6 +188,62 @@ def test_shared_partial_buy_without_deal_detail_is_rejected(tmp_path):
         assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 0
 
 
+def test_filled_status_leading_fill_details_keeps_acked_intent_unresolved(tmp_path):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"][0].update(order_status="FILLED_ALL", dealt_qty=0)
+    data["deals"] = []
+    data["order_fees"] = []
+    data["positions"] = []
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="filled status leads complete fill details"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    current = store.get_auto_order_intent(intent["intent_id"])
+    assert current is not None and current["status"] == "ACKED"
+    assert store.positions() == []
+
+
+def test_delayed_order_visibility_keeps_acked_then_later_recovers(tmp_path):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    client = FakeClient()
+    lagging = client.snapshot()
+    lagging.update(orders=[], deals=[], order_fees=[], positions=[])
+    client.snapshot = lambda: lagging
+
+    first = reconcile(client, store, ownership_proof=lambda *_: True)
+    current = store.get_auto_order_intent(intent["intent_id"])
+    assert first["applied_fills"] == 0
+    assert current is not None and current["status"] == "ACKED"
+
+    complete = FakeClient().snapshot()
+    client.snapshot = lambda: complete
+    second = reconcile(client, store, ownership_proof=lambda *_: True)
+    current = store.get_auto_order_intent(intent["intent_id"])
+    assert second["applied_fills"] == 1
+    assert current is not None and current["status"] == "FILLED"
+
+
+def test_distinct_deals_apply_once_regardless_of_callback_order(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    first = dict(data["deals"][0], deal_id="deal-first", deal_qty=1, deal_price=99)
+    second = dict(data["deals"][0], deal_id="deal-second", deal_qty=1, deal_price=101)
+    data["deals"] = [second, first]
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 2
+    assert store.owned_quantity("US.AAPL") == 2
+    assert len(store.fills(limit=10)) == 2
+
+
 def test_negative_fee_is_rejected_without_ledger_mutation(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
@@ -329,8 +386,139 @@ def test_fill_batch_is_atomic_when_final_broker_quantity_mismatches(tmp_path):
 
     assert store.owned_quantity("US.AAPL") == 0
     assert store.snapshot().allocated_cash == pytest.approx(10_000)
+    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
     with store.connect() as con:
         assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 0
+        row = con.execute(
+            "SELECT event_type,details_json FROM strategy_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None and row[0] == "reconciliation_quantity_mismatch"
+    details = json.loads(row[1])
+    assert details == {
+        "account_isolation_mode": "dedicated",
+        "expected_quantity": 2.0,
+        "observed_quantity": 3.0,
+        "observation_stage": "broker_position_snapshot_after_deal_staging",
+        "observed_at": details["observed_at"],
+        "symbol": "US.AAPL",
+    }
+    assert "account_id" not in row[1]
+    assert "order_id" not in row[1]
+
+
+def test_quantity_mismatch_preserves_historical_fills_and_diagnostic(tmp_path):
+    store = active_store(tmp_path)
+    store.apply_fill("historical", "US.AAPL", "BUY", 1, 90)
+    client = FakeClient()
+    data = client.snapshot()
+    data["positions"][0]["qty"] = 4
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="differs from staged strategy quantity"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    fills = store.fills(limit=10)
+    assert [(row["symbol"], row["quantity"], row["price"]) for row in fills] == [
+        ("US.AAPL", 1.0, 90.0),
+    ]
+    assert store.recent_events(1)[0]["event_type"] == "reconciliation_quantity_mismatch"
+
+
+def test_real_mismatch_replaces_recoverable_freeze_and_cannot_auto_unfreeze(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    client = FakeClient()
+    mismatch = client.snapshot()
+    mismatch["positions"][0]["qty"] = 3
+    client.snapshot = lambda: mismatch
+
+    with pytest.raises(ControlRejected, match="differs from staged strategy quantity"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+
+    monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
+    complete = FakeClient().snapshot()
+    client.snapshot = lambda: complete
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["auto_recovered"] is False
+    current = store.get_auto_order_intent(intent["intent_id"])
+    assert current is not None and current["status"] == "FILLED"
+    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+
+
+def test_duplicate_identical_deals_are_idempotently_deduplicated(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["deals"] = [data["deals"][0], dict(data["deals"][0])]
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert store.owned_quantity("US.AAPL") == 2
+
+
+def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    conflict = dict(data["deals"][0], deal_qty=1)
+    data["deals"] = [data["deals"][0], conflict]
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="conflicting duplicate"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+
+
+def test_restarted_store_recovers_acked_only_after_complete_broker_snapshot(tmp_path):
+    store = active_store(tmp_path)
+    intent = _acked_intent_for_fake_order(store)
+    restarted = LiveStrategyStore(store.path, tmp_path / "archives")
+
+    result = reconcile(FakeClient(), restarted, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert restarted.get_auto_order_intent(intent["intent_id"])["status"] == "FILLED"
+    assert restarted.owned_quantity("US.AAPL") == 2
+
+
+def test_complete_partial_fill_is_applied_once_and_remains_global_blocker(tmp_path):
+    store = active_store(tmp_path)
+    intent = store.create_auto_order_intent(
+        strategy_id="B16", config_version=1, signal_batch_id="b" * 64,
+        signal_source_date="2026-08-26", factor_set_hash="f" * 64,
+        symbol="US.AAPL", side="BUY", purpose="TARGET_BUY", target_qty=10,
+        order_qty=10, limit_price=100,
+    )
+    store.mark_auto_intent_dispatching(intent["intent_id"], "preview")
+    store.mark_auto_intent_acked(intent["intent_id"])
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"][0].update(order_status="FILLED_PART", qty=10, dealt_qty=6)
+    data["deals"][0].update(deal_qty=6)
+    data["positions"][0]["qty"] = 6
+    client.snapshot = lambda: data
+
+    first = reconcile(client, store, ownership_proof=lambda *_: True)
+    second = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert first["applied_fills"] == 1
+    assert second["applied_fills"] == 0
+    assert store.owned_quantity("US.AAPL") == 6
+    assert store.get_auto_order_intent(intent["intent_id"])["status"] == "PARTIAL"
+    with pytest.raises(ControlRejected, match="unresolved"):
+        store.create_auto_order_intent(
+            strategy_id="B16", config_version=1, signal_batch_id="c" * 64,
+            signal_source_date="2026-08-26", factor_set_hash="f" * 64,
+            symbol="US.MSFT", side="BUY", purpose="TARGET_BUY", target_qty=1,
+            order_qty=1, limit_price=100,
+        )
 
 
 def test_broker_cannot_have_fewer_shares_than_strategy_ledger(tmp_path):

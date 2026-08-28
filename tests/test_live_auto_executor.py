@@ -93,7 +93,7 @@ def test_execute_outside_rth_creates_no_intent(tmp_path):
     assert store.list_auto_order_intents() == []
 
 
-def test_execute_dispatches_one_intent_and_marks_filled(tmp_path, monkeypatch):
+def test_dispatch_fill_response_stays_acked_until_reconciler_observes_fill(tmp_path, monkeypatch):
     ex, client, store = executor(tmp_path)
     calls = []
 
@@ -107,8 +107,17 @@ def test_execute_dispatches_one_intent_and_marks_filled(tmp_path, monkeypatch):
     assert result["side"] == "SELL"
     assert result["quantity"] == 1
     assert "raw-id" not in repr(result)
-    assert store.list_auto_order_intents()[0]["status"] == "FILLED"
+    # The placement response can lead order/deal/position visibility. It is not
+    # sufficient evidence to release the global unresolved-intent blocker.
+    assert store.list_auto_order_intents()[0]["status"] == "ACKED"
     assert client.previews[0]["auto_intent_id"]
+    with pytest.raises(ControlRejected, match="unresolved"):
+        store.create_auto_order_intent(
+            strategy_id="B16", config_version=1, signal_batch_id="c" * 64,
+            signal_source_date="2026-08-25", factor_set_hash="f" * 64,
+            symbol="US.MSFT", side="BUY", purpose="TARGET_BUY", target_qty=1,
+            order_qty=1, limit_price=100,
+        )
 
 
 def test_broker_unknown_freezes_and_never_makes_intent_retryable(tmp_path, monkeypatch):
@@ -212,7 +221,7 @@ def test_stale_reserved_config_is_cancelled_before_dispatch(tmp_path, monkeypatc
     intents = store.list_auto_order_intents()
     old_after = store.get_auto_order_intent(old["intent_id"])
     assert old_after is not None and old_after["status"] == "CANCELLED"
-    assert any(row["config_version"] == 2 and row["status"] == "FILLED" for row in intents)
+    assert any(row["config_version"] == 2 and row["status"] == "ACKED" for row in intents)
 
 
 def test_broker_visible_ack_handoffs_local_reservation(tmp_path):

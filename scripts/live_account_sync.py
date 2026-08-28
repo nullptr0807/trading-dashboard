@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.live_logging import get_live_logger, log_event
-from core.live_strategy_control import ControlRejected, LiveStrategyStore
+from core.live_strategy_control import ControlRejected, LiveStrategyStore, utcnow
 from core.moomoo_audit import (
     finalize_preview, is_module_order, is_module_preview, module_preview_record,
     unresolved_preview_count,
@@ -48,7 +48,7 @@ def _recover_intents_and_transient_freeze(
     """Recover proven intents; release only the narrow transient auto freeze."""
     from core.live_auto_executor import recover_auto_intents
 
-    blocker = recover_auto_intents(store, snapshot)
+    blocker = recover_auto_intents(store, snapshot, reconciliation_complete=True)
     state = store.snapshot()
     if state.lifecycle != "FROZEN":
         return False
@@ -104,6 +104,7 @@ def fee_total(row: dict[str, Any]) -> float:
 
 def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> dict[str, Any]:
     snapshot = client.snapshot()
+    snapshot_observed_at = utcnow()
     if snapshot.get("activity_warnings"):
         raise ControlRejected("Moomoo history or fee data is incomplete")
     account_id = snapshot.get("account_id")
@@ -142,9 +143,19 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     fee_by_order = {str(row.get("order_id")): fee_total(row)
                     for row in snapshot.get("order_fees", []) if row.get("order_id") is not None}
     deals_by_order: dict[str, list[dict[str, Any]]] = {}
+    deals_by_reference: dict[str, dict[str, Any]] = {}
     for deal in snapshot.get("deals", []):
         oid = str(deal.get("order_id") or "")
         if oid in module_orders:
+            deal_ref = str(deal.get("deal_id") or "")
+            if deal_ref and deal_ref in deals_by_reference:
+                previous = deals_by_reference[deal_ref]
+                identity = ("order_id", "code", "trd_side", "deal_qty", "qty", "deal_price", "price")
+                if any(str(previous.get(key)) != str(deal.get(key)) for key in identity):
+                    raise ControlRejected("Moomoo returned a conflicting duplicate deal reference")
+                continue
+            if deal_ref:
+                deals_by_reference[deal_ref] = deal
             deals_by_order.setdefault(oid, []).append(deal)
 
     # Broker order rows can lead deal-detail rows. Never publish a sync proof
@@ -158,6 +169,9 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         )
         if order_qty <= 0 or dealt_qty < 0 or dealt_qty > order_qty + 1e-9:
             raise ControlRejected("Module order has an invalid authorized or dealt quantity")
+        order_status = str(order.get("order_status") or "").upper()
+        if order_status == "FILLED_ALL" and abs(dealt_qty - order_qty) > 1e-9:
+            raise ControlRejected("Module order filled status leads complete fill details")
         if abs(dealt_qty - deal_qty_total) > 1e-9:
             raise ControlRejected("Module order dealt quantity differs from deal detail total")
         if dealt_qty > 0 and order_id not in fee_by_order:
@@ -255,6 +269,8 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     applied = store.apply_fill_batch(
         staged_fills, broker_positions, prices, pending_buy, fingerprint,
         allow_external_overlap=account_isolation_mode == "shared_restricted",
+        account_isolation_mode=account_isolation_mode,
+        quantity_observed_at=snapshot_observed_at,
     )
     for preview_id, status, order_id in preview_finalizations:
         finalize_preview(preview_id, status, order_id)

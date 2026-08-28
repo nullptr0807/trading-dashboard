@@ -1085,7 +1085,9 @@ class LiveStrategyStore:
     def apply_fill_batch(self, fills: list[dict[str, Any]],
                          broker_quantities: dict[str, float], prices: dict[str, float],
                          reserved_buy_notional: float, sync_fingerprint: str,
-                         allow_external_overlap: bool = False) -> int:
+                         allow_external_overlap: bool = False, *,
+                         account_isolation_mode: str,
+                         quantity_observed_at: str) -> int:
         """Atomically apply fills, marks, reservations, risk state, and sync proof."""
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -1148,6 +1150,43 @@ class LiveStrategyStore:
                 mismatch = (actual + 1e-9 < expected if allow_external_overlap
                             else abs(actual - expected) > 1e-9)
                 if mismatch:
+                    # Nothing has been written from the staged batch yet. End that
+                    # transaction, then atomically latch the freeze and durable,
+                    # secret-free diagnostic so rollback cannot erase the evidence.
+                    con.rollback()
+                    con.execute("BEGIN IMMEDIATE")
+                    now = utcnow()
+                    current = con.execute(
+                        "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+                    ).fetchone()
+                    existing_reason = str(current["freeze_reason"] or "") if current else ""
+                    recoverable_transient = existing_reason.endswith(
+                        "auto_post_broker_reconciliation_failed"
+                    )
+                    preserve_existing = bool(
+                        current and current["lifecycle"] == "FROZEN"
+                        and existing_reason and not recoverable_transient
+                    )
+                    reason = (existing_reason if preserve_existing
+                              else "reconciliation_quantity_mismatch")
+                    con.execute(
+                        "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                        "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                        (reason, now, now),
+                    )
+                    self._event_tx(
+                        con, "reconciliation_quantity_mismatch", "moomoo_reconciler", "critical",
+                        "Broker quantity differs from staged strategy quantity; batch rolled back",
+                        {
+                            "symbol": symbol,
+                            "expected_quantity": expected,
+                            "observed_quantity": actual,
+                            "observed_at": str(quantity_observed_at),
+                            "observation_stage": "broker_position_snapshot_after_deal_staging",
+                            "account_isolation_mode": str(account_isolation_mode),
+                        },
+                    )
+                    con.commit()
                     raise ControlRejected(
                         "Broker quantity differs from staged strategy quantity; batch rolled back"
                     )
