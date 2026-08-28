@@ -102,6 +102,35 @@ def fee_total(row: dict[str, Any]) -> float:
     return sum(values)
 
 
+def deal_number(deal: dict[str, Any], primary: str, alias: str) -> float:
+    """Read deal aliases exactly, rejecting disagreement or non-finite values."""
+    values = []
+    for key in (primary, alias):
+        if deal.get(key) is None:
+            continue
+        try:
+            value = float(deal[key])
+        except (TypeError, ValueError) as exc:
+            raise ControlRejected("Moomoo deal contains an invalid numeric value") from exc
+        if not math.isfinite(value):
+            raise ControlRejected("Moomoo deal contains an invalid numeric value")
+        values.append(value)
+    if len(values) == 2 and values[0] != values[1]:
+        raise ControlRejected("Moomoo deal contains conflicting numeric aliases")
+    return values[0] if values else 0.0
+
+
+def normalized_deal_identity(deal: dict[str, Any]) -> tuple[str, str, str, float, float]:
+    """Canonical exact identity; no tolerance is allowed for fill economics."""
+    return (
+        str(deal.get("order_id") or ""),
+        str(deal.get("code") or "").strip().upper(),
+        str(deal.get("trd_side") or "").strip().upper(),
+        deal_number(deal, "deal_qty", "qty"),
+        deal_number(deal, "deal_price", "price"),
+    )
+
+
 def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> dict[str, Any]:
     snapshot = client.snapshot()
     snapshot_observed_at = utcnow()
@@ -150,8 +179,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             deal_ref = str(deal.get("deal_id") or "")
             if deal_ref and deal_ref in deals_by_reference:
                 previous = deals_by_reference[deal_ref]
-                identity = ("order_id", "code", "trd_side", "deal_qty", "qty", "deal_price", "price")
-                if any(str(previous.get(key)) != str(deal.get(key)) for key in identity):
+                if normalized_deal_identity(previous) != normalized_deal_identity(deal):
                     raise ControlRejected("Moomoo returned a conflicting duplicate deal reference")
                 continue
             if deal_ref:
@@ -164,7 +192,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         order_qty = number(order, "qty")
         dealt_qty = number(order, "dealt_qty")
         deal_qty_total = sum(
-            number(deal, "deal_qty", "qty")
+            deal_number(deal, "deal_qty", "qty")
             for deal in deals_by_order.get(order_id, [])
         )
         if order_qty <= 0 or dealt_qty < 0 or dealt_qty > order_qty + 1e-9:
@@ -190,7 +218,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     staged_fills = []
     for order_id, deals in deals_by_order.items():
         order = module_orders[order_id]
-        deal_qty_total = sum(number(d, "deal_qty", "qty") for d in deals)
+        deal_qty_total = sum(deal_number(d, "deal_qty", "qty") for d in deals)
         dealt_qty = number(order, "dealt_qty")
         order_qty = number(order, "qty")
         if dealt_qty <= 0 or deal_qty_total <= 0:
@@ -205,15 +233,15 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             raise ControlRejected("Moomoo fee record missing for a module order")
         for deal in deals:
             deal_ref = deal.get("deal_id")
-            qty = number(deal, "deal_qty", "qty")
-            price = number(deal, "deal_price", "price")
-            side = str(deal.get("trd_side") or "").upper()
-            symbol = str(deal.get("code") or "").upper()
+            qty = deal_number(deal, "deal_qty", "qty")
+            price = deal_number(deal, "deal_price", "price")
+            side = str(deal.get("trd_side") or "").strip().upper()
+            symbol = str(deal.get("code") or "").strip().upper()
             if not symbol or side not in {"BUY", "SELL"}:
                 raise ControlRejected("Moomoo deal must explicitly provide symbol and side")
-            if symbol != str(order.get("code") or "").upper():
+            if symbol != str(order.get("code") or "").strip().upper():
                 raise ControlRejected("Moomoo deal symbol differs from its authorized order")
-            if side != str(order.get("trd_side") or "").upper():
+            if side != str(order.get("trd_side") or "").strip().upper():
                 raise ControlRejected("Moomoo deal side differs from its authorized order")
             if not deal_ref or side not in {"BUY", "SELL"} or not symbol or qty <= 0 or price <= 0:
                 raise ControlRejected("Malformed module-tagged Moomoo deal")
@@ -324,7 +352,9 @@ def main() -> int:
         return 0
     except Exception as exc:
         try:
-            state = store.freeze("five_minute_reconciliation_failed", "moomoo_sync")
+            state = store.freeze(
+                "five_minute_reconciliation_failed", "moomoo_sync", preserve_existing=True,
+            )
             store.event("sync_failed", "moomoo_sync", "critical",
                         "Moomoo five-minute reconciliation failed", {"error": str(exc)})
             lifecycle = state.lifecycle

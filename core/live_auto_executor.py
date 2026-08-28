@@ -368,7 +368,10 @@ class LiveAutoExecutor:
                     self.store.mark_auto_intent_unknown(
                         intent_row["intent_id"], "POST_BROKER_LOCAL_FAILURE",
                     )
-                self.store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+                self.store.freeze(
+                    "auto_post_broker_reconciliation_failed", "auto_executor",
+                    preserve_existing=True,
+                )
             elif current_intent and current_intent["status"] in {"RESERVED", "DISPATCHING"}:
                 self.store.mark_auto_intent_failed(intent_row["intent_id"], "PRE_BROKER_REJECTED")
             raise

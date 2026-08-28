@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -407,6 +410,62 @@ def test_fill_batch_is_atomic_when_final_broker_quantity_mismatches(tmp_path):
     assert "order_id" not in row[1]
 
 
+def test_quantity_mismatch_keeps_write_lock_until_freeze_and_diagnostic_commit(
+    tmp_path, monkeypatch,
+):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["positions"][0]["qty"] = 3
+    client.snapshot = lambda: data
+    original_event_tx = store._event_tx
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    observed_lifecycle = []
+    statements = []
+    thread = None
+    original_connect = store.connect
+
+    @contextmanager
+    def traced_connect():
+        with original_connect() as con:
+            con.set_trace_callback(statements.append)
+            yield con
+
+    monkeypatch.setattr(store, "connect", traced_connect)
+
+    def competing_writer():
+        writer_started.set()
+        with store.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            observed_lifecycle.append(con.execute(
+                "SELECT lifecycle FROM strategy_state WHERE id=1"
+            ).fetchone()[0])
+        writer_finished.set()
+
+    def event_with_concurrency_probe(con, event_type, *args, **kwargs):
+        nonlocal thread
+        if event_type == "reconciliation_quantity_mismatch":
+            thread = threading.Thread(target=competing_writer)
+            thread.start()
+            assert writer_started.wait(1)
+            time.sleep(0.05)
+            assert not writer_finished.is_set()
+        return original_event_tx(con, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_event_tx", event_with_concurrency_probe)
+    with pytest.raises(ControlRejected, match="differs from staged strategy quantity"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert thread is not None
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert observed_lifecycle == ["FROZEN"]
+    assert not any(statement.strip().upper() == "ROLLBACK" for statement in statements)
+    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+    assert store.recent_events(1)[0]["event_type"] == "reconciliation_quantity_mismatch"
+
+
 def test_quantity_mismatch_preserves_historical_fills_and_diagnostic(tmp_path):
     store = active_store(tmp_path)
     store.apply_fill("historical", "US.AAPL", "BUY", 1, 90)
@@ -462,6 +521,37 @@ def test_duplicate_identical_deals_are_idempotently_deduplicated(tmp_path):
     assert store.owned_quantity("US.AAPL") == 2
 
 
+def test_duplicate_deal_numeric_types_and_aliases_are_semantically_idempotent(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    original = data["deals"][0]
+    alias_replay = {
+        "deal_id": original["deal_id"], "order_id": original["order_id"],
+        "code": "us.aapl", "trd_side": "buy", "qty": 2.0, "price": 100.0,
+    }
+    data["deals"] = [original, alias_replay]
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert store.owned_quantity("US.AAPL") == 2
+
+
+def test_conflicting_numeric_aliases_are_rejected_without_mutation(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["deals"][0]["qty"] = 3
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="conflicting numeric aliases"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+
+
 def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
@@ -474,6 +564,73 @@ def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
+
+
+@pytest.mark.parametrize("changed", [
+    {"deal_price": 101},
+    {"deal_qty": 1},
+])
+def test_cross_sync_conflicting_deal_reference_freezes_without_rewriting_history(
+    tmp_path, changed,
+):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    original_fills = store.fills(limit=10)
+    replay = client.snapshot()
+    replay["deals"][0].update(changed)
+    replay["orders"][0]["dealt_qty"] = replay["deals"][0].get("deal_qty", 2)
+    replay["orders"][0]["qty"] = replay["orders"][0]["dealt_qty"]
+    replay["positions"][0]["qty"] = 2
+    client.snapshot = lambda: replay
+
+    with pytest.raises(ControlRejected, match="conflicting replay"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.fills(limit=10) == original_fills
+    assert store.owned_quantity("US.AAPL") == 2
+    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    event = store.recent_events(1)[0]
+    assert event["event_type"] == "reconciliation_fill_conflict"
+    serialized = json.dumps(event, sort_keys=True)
+    for secret_name in (
+        "order_id", "deal_id", "account_id", "credential", "module-order", "module-deal",
+    ):
+        assert secret_name not in serialized
+
+
+def test_cross_sync_identical_deal_alias_replay_is_idempotent(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    first = reconcile(client, store, ownership_proof=lambda *_: True)
+    replay = client.snapshot()
+    replay["deals"][0].pop("deal_qty")
+    replay["deals"][0].pop("deal_price")
+    replay["deals"][0].update(qty=2.0, price=100.0, code="us.aapl", trd_side="buy")
+    client.snapshot = lambda: replay
+
+    second = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert first["applied_fills"] == 1
+    assert second["applied_fills"] == 0
+    assert store.owned_quantity("US.AAPL") == 2
+
+
+def test_cross_sync_fee_conflict_is_latched_without_rewriting_history(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    original_fills = store.fills(limit=10)
+    replay = client.snapshot()
+    replay["order_fees"][0]["fee_amount"] = 2.0
+    client.snapshot = lambda: replay
+
+    with pytest.raises(ControlRejected, match="conflicting replay"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.fills(limit=10) == original_fills
+    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
 
 
 def test_restarted_store_recovers_acked_only_after_complete_broker_snapshot(tmp_path):

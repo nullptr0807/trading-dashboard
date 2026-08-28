@@ -313,6 +313,39 @@ class LiveStrategyStore:
              int(row[0]) if row else None))
         return int(cur.lastrowid or 0)
 
+    def _latch_fill_conflict_tx(
+        self, con: sqlite3.Connection, symbol: str,
+        replay: tuple[str, str, float, float, float],
+        persisted: tuple[str, str, float, float, float],
+    ) -> None:
+        """Latch an immutable-fill conflict without persisting Broker identifiers."""
+        now = utcnow()
+        current = con.execute(
+            "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+        ).fetchone()
+        existing_reason = str(current["freeze_reason"] or "") if current else ""
+        preserve_existing = bool(
+            current and current["lifecycle"] == "FROZEN" and existing_reason
+            and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
+        )
+        reason = existing_reason if preserve_existing else "reconciliation_fill_conflict"
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+            "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+            (reason, now, now),
+        )
+        field_names = ("symbol", "side", "quantity", "price", "fee")
+        self._event_tx(
+            con, "reconciliation_fill_conflict", "moomoo_reconciler", "critical",
+            "Immutable fill reference was replayed with conflicting economics",
+            {
+                "symbol": symbol,
+                "conflicting_fields": [
+                    name for name, old, new in zip(field_names, persisted, replay) if old != new
+                ],
+            },
+        )
+
     def _invalidate_runtime_tx(self, con: sqlite3.Connection, reason: str) -> int:
         row = con.execute("SELECT generation FROM control_runtime WHERE id=1").fetchone()
         generation = (int(row["generation"]) + 1) if row else 1
@@ -432,7 +465,8 @@ class LiveStrategyStore:
                            {"version": version, "changed_fields": sorted(patch), "reason": reason})
         return self.config()
 
-    def freeze(self, reason: str, source: str = "dashboard", severity: str = "critical") -> RiskSnapshot:
+    def freeze(self, reason: str, source: str = "dashboard", severity: str = "critical",
+               *, preserve_existing: bool = False) -> RiskSnapshot:
         reason = str(reason or "").strip() or "manual_freeze"
         now = utcnow()
         with self.connect() as con:
@@ -440,13 +474,18 @@ class LiveStrategyStore:
             current = con.execute(
                 "SELECT lifecycle,freeze_reason,required_sync_after FROM strategy_state WHERE id=1"
             ).fetchone()
-            required = (current["required_sync_after"] if current
-                        and current["lifecycle"] == "FROZEN"
-                        and current["freeze_reason"] == reason else now)
-            con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                        "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                        (reason, now, required))
-            self._event_tx(con, "system_frozen", source, severity, "Trading system frozen", {"reason": reason})
+            already_latched = bool(
+                preserve_existing and current and current["lifecycle"] == "FROZEN"
+                and current["freeze_reason"]
+            )
+            if not already_latched:
+                required = (current["required_sync_after"] if current
+                            and current["lifecycle"] == "FROZEN"
+                            and current["freeze_reason"] == reason else now)
+                con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                            "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                            (reason, now, required))
+                self._event_tx(con, "system_frozen", source, severity, "Trading system frozen", {"reason": reason})
         return self.snapshot()
 
     def unfreeze(self, reason: str, actor: str = "dashboard") -> RiskSnapshot:
@@ -1031,15 +1070,29 @@ class LiveStrategyStore:
                    quantity: float, price: float, fee: float = 0.0) -> bool:
         """Apply only a previously verified module-tagged Moomoo fill."""
         reference_hash = hashlib.sha256(str(external_reference).encode()).hexdigest()
-        symbol = str(symbol).upper()
-        side = str(side).upper()
+        symbol = str(symbol).strip().upper()
+        side = str(side).strip().upper()
         quantity, price, fee = (_finite(quantity, "quantity"), _finite(price, "price"), _finite(fee, "fee"))
         if side not in {"BUY", "SELL"} or quantity <= 0 or price < 0 or fee < 0:
             raise ControlRejected("Invalid fill")
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            if con.execute("SELECT 1 FROM applied_fills WHERE fill_hash=?", (reference_hash,)).fetchone():
-                return False
+            existing = con.execute(
+                "SELECT symbol,side,quantity,price,fee FROM applied_fills WHERE fill_hash=?",
+                (reference_hash,),
+            ).fetchone()
+            if existing:
+                replay = (symbol, side, quantity, price, fee)
+                persisted = (
+                    str(existing["symbol"]).strip().upper(),
+                    str(existing["side"]).strip().upper(),
+                    float(existing["quantity"]), float(existing["price"]), float(existing["fee"]),
+                )
+                if replay == persisted:
+                    return False
+                self._latch_fill_conflict_tx(con, symbol, replay, persisted)
+                con.commit()
+                raise ControlRejected("Existing deal reference has a conflicting replay")
             state = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
             position = con.execute("SELECT * FROM owned_positions WHERE symbol=?", (symbol,)).fetchone()
             old_qty = float(position["quantity"]) if position else 0.0
@@ -1099,19 +1152,41 @@ class LiveStrategyStore:
             if reserved_buy_notional < 0 or not sync_fingerprint:
                 raise ControlRejected("Invalid reconciliation reservation or sync fingerprint")
             staged: list[dict[str, Any]] = []
+            staged_by_hash: dict[str, tuple[str, str, float, float, float]] = {}
 
             for fill in fills:
                 reference_hash = hashlib.sha256(str(fill["external_reference"]).encode()).hexdigest()
-                if con.execute("SELECT 1 FROM applied_fills WHERE fill_hash=?",
-                               (reference_hash,)).fetchone():
-                    continue
-                symbol = str(fill["symbol"]).upper()
-                side = str(fill["side"]).upper()
+                symbol = str(fill["symbol"]).strip().upper()
+                side = str(fill["side"]).strip().upper()
                 quantity = _finite(fill["quantity"], "quantity")
                 price = _finite(fill["price"], "price")
                 fee = _finite(fill.get("fee", 0.0), "fee")
                 if side not in {"BUY", "SELL"} or quantity <= 0 or price <= 0 or fee < 0:
                     raise ControlRejected("Invalid fill in reconciliation batch")
+                replay = (symbol, side, quantity, price, fee)
+                existing = con.execute(
+                    "SELECT symbol,side,quantity,price,fee FROM applied_fills WHERE fill_hash=?",
+                    (reference_hash,),
+                ).fetchone()
+                if existing:
+                    persisted = (
+                        str(existing["symbol"]).strip().upper(),
+                        str(existing["side"]).strip().upper(),
+                        float(existing["quantity"]), float(existing["price"]), float(existing["fee"]),
+                    )
+                    if replay == persisted:
+                        continue
+                    self._latch_fill_conflict_tx(con, symbol, replay, persisted)
+                    con.commit()
+                    raise ControlRejected("Existing deal reference has a conflicting replay")
+                prior_staged = staged_by_hash.get(reference_hash)
+                if prior_staged is not None:
+                    if replay == prior_staged:
+                        continue
+                    self._latch_fill_conflict_tx(con, symbol, replay, prior_staged)
+                    con.commit()
+                    raise ControlRejected("Duplicate deal reference has a conflicting replay")
+                staged_by_hash[reference_hash] = replay
 
                 position = positions.get(symbol, {
                     "symbol": symbol, "quantity": 0.0, "average_cost": 0.0,
@@ -1150,11 +1225,9 @@ class LiveStrategyStore:
                 mismatch = (actual + 1e-9 < expected if allow_external_overlap
                             else abs(actual - expected) > 1e-9)
                 if mismatch:
-                    # Nothing has been written from the staged batch yet. End that
-                    # transaction, then atomically latch the freeze and durable,
-                    # secret-free diagnostic so rollback cannot erase the evidence.
-                    con.rollback()
-                    con.execute("BEGIN IMMEDIATE")
+                    # No staged ledger rows have been written. Keep the original
+                    # BEGIN IMMEDIATE lock while atomically latching both state and
+                    # the secret-free diagnostic; there is no ACTIVE writer window.
                     now = utcnow()
                     current = con.execute(
                         "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"

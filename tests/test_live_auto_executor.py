@@ -156,6 +156,31 @@ def test_post_broker_reconciliation_failure_freezes_without_failed_retry(tmp_pat
     assert store.snapshot().lifecycle == "FROZEN"
 
 
+def test_post_broker_quantity_mismatch_freeze_is_never_overwritten(tmp_path, monkeypatch):
+    count = 0
+
+    def reconcile(_client, reconcile_store):
+        nonlocal count
+        count += 1
+        if count == 2:
+            reconcile_store.freeze("reconciliation_quantity_mismatch", "moomoo_reconciler")
+            raise ControlRejected("Broker quantity differs from staged strategy quantity")
+        return {"ok": True}
+
+    ex, _, store = executor(tmp_path, reconcile)
+    monkeypatch.setattr(
+        module, "dispatch_signed_preview",
+        lambda *args, **kwargs: {"accepted": True, "order": {
+            "order_id": "raw", "order_status": "SUBMITTED",
+        }},
+    )
+
+    with pytest.raises(ControlRejected, match="quantity differs"):
+        ex.execute_one(now=NOW)
+
+    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+
+
 def test_transient_post_broker_api_failure_defers_without_global_freeze(tmp_path, monkeypatch):
     count = 0
 
