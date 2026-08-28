@@ -50,6 +50,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 EDITABLE_FIELDS = frozenset(DEFAULT_CONFIG) - {"strategy_id"}
 _INTENT_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_FREEZE_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,119}$")
+_WATCHDOG_FREEZE_REASON = re.compile(r"^health_watchdog:[A-Za-z0-9_:,]{1,143}$")
+_DASHBOARD_FREEZE_CODES = frozenset({
+    "manual_freeze", "operator_requested_freeze", "cleanup_requested",
+})
 AUTO_INTENT_STATUSES = frozenset({
     "PLANNED", "RESERVED", "DISPATCHING", "ACKED", "PARTIAL",
     "FILLED", "CANCELLED", "FAILED", "UNKNOWN",
@@ -74,6 +79,24 @@ def _finite(value: Any, name: str) -> float:
     if not math.isfinite(result):
         raise ControlRejected(f"Invalid {name}")
     return result
+
+
+def _safe_freeze_reason(reason: Any, source: str = "") -> tuple[str, bool]:
+    """Return a bounded state-machine code, never caller-controlled prose."""
+    raw = str(reason or "").strip()
+    if not raw:
+        raw = "manual_freeze"
+    valid = bool(_FREEZE_REASON_CODE.fullmatch(raw) or _WATCHDOG_FREEZE_REASON.fullmatch(raw))
+    if str(source) == "dashboard" and raw not in _DASHBOARD_FREEZE_CODES:
+        return "operator_requested_freeze", raw != "operator_requested_freeze"
+    if valid:
+        return raw, False
+    return "sanitized_freeze_reason", True
+
+
+def freeze_reason_code(reason: Any, source: str = "") -> str:
+    """Public read-boundary helper for safe freeze-state serialization."""
+    return _safe_freeze_reason(reason, source)[0]
 
 
 @dataclass(frozen=True)
@@ -352,6 +375,16 @@ class LiveStrategyStore:
                             (json.dumps(DEFAULT_CONFIG, sort_keys=True), now, "bootstrap", "safe default"))
                 self._event_tx(con, "system_initialized", "system", "warning",
                                "Live strategy initialized frozen", {})
+            persisted = con.execute(
+                "SELECT freeze_reason FROM strategy_state WHERE id=1"
+            ).fetchone()
+            if persisted and persisted["freeze_reason"]:
+                safe_reason, changed = _safe_freeze_reason(persisted["freeze_reason"])
+                if changed:
+                    con.execute(
+                        "UPDATE strategy_state SET freeze_reason=?,updated_at=? WHERE id=1",
+                        (safe_reason, utcnow()),
+                    )
 
     def _event_tx(self, con: sqlite3.Connection, event_type: str, source: str,
                   severity: str, message: str, details: dict[str, Any]) -> int:
@@ -513,9 +546,12 @@ class LiveStrategyStore:
             row = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
         if not row:
             raise ControlRejected("Strategy control state is missing")
+        safe_freeze_reason = (
+            _safe_freeze_reason(row["freeze_reason"])[0] if row["freeze_reason"] else None
+        )
         return RiskSnapshot(
             lifecycle=row["lifecycle"], frozen=row["lifecycle"] != "ACTIVE",
-            freeze_reason=row["freeze_reason"], initial_capital=row["initial_capital"],
+            freeze_reason=safe_freeze_reason, initial_capital=row["initial_capital"],
             exposure_cap=row["exposure_cap"], loss_floor=row["loss_floor"],
             allocated_cash=row["allocated_cash"], owned_market_value=row["owned_market_value"],
             strategy_equity=row["strategy_equity"], realized_pnl=row["realized_pnl"],
@@ -603,7 +639,8 @@ class LiveStrategyStore:
 
     def freeze(self, reason: str, source: str = "dashboard", severity: str = "critical",
                *, preserve_existing: bool = False) -> RiskSnapshot:
-        reason = str(reason or "").strip() or "manual_freeze"
+        raw_reason = str(reason or "").strip() or "manual_freeze"
+        reason, reason_was_sanitized = _safe_freeze_reason(raw_reason, source)
         now = utcnow()
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -614,6 +651,12 @@ class LiveStrategyStore:
                 preserve_existing and current and current["lifecycle"] == "FROZEN"
                 and current["freeze_reason"]
             )
+            if reason_was_sanitized:
+                self._event_tx(
+                    con, "freeze_reason_sanitized", source, "warning",
+                    "Freeze request detail was sanitized to a bounded reason code",
+                    {"reason_code": reason, "operator_detail": raw_reason},
+                )
             if not already_latched:
                 required = (current["required_sync_after"] if current
                             and current["lifecycle"] == "FROZEN"

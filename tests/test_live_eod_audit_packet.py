@@ -87,3 +87,18 @@ def test_eod_application_log_sanitization_cannot_reemit_generic_failure_secrets(
         "BRK=NATURAL-2", "D.NATURAL-3", "ACCT.NATURAL-4",
     ):
         assert secret not in serialized
+
+
+def test_eod_sanitize_redacts_plain_labels_authorization_and_unsafe_freeze_reason():
+    malicious = (
+        "order ORD12 deal DEAL34 broker BRK56 account ACCT78; "
+        "Authorization: Basic NATURALSECRETONLYLETTERS"
+    )
+
+    serialized = json.dumps(eod.sanitize({"freeze_reason": malicious, "message": malicious}))
+
+    for secret in (
+        "ORD12", "DEAL34", "BRK56", "ACCT78", "NATURALSECRETONLYLETTERS",
+    ):
+        assert secret not in serialized
+    assert eod.sanitize("private operator note", "freeze_reason") == "sanitized_freeze_reason"

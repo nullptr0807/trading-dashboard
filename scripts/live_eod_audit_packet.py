@@ -16,6 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from core.live_logging import redact
+from core.live_strategy_control import freeze_reason_code
 
 ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_DB = ROOT / "data" / "live_strategy.db"
@@ -39,6 +40,8 @@ def ref(value: Any) -> str | None:
 def sanitize(value: Any, key: str = "") -> Any:
     if SENSITIVE_KEY.search(key):
         return "[REDACTED]"
+    if key == "freeze_reason" and value is not None:
+        return freeze_reason_code(value)
     if REFERENCE_KEY.match(key):
         return ref(value)
     if isinstance(value, dict):

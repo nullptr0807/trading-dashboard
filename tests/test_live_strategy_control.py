@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import core.live_strategy_control as live_control
+from core.live_logging import JsonFormatter, redact
 from core.live_strategy_control import (
     ControlRejected, EXPOSURE_CAP, INITIAL_CAPITAL, LOSS_FLOOR, LiveStrategyStore, utcnow,
 )
@@ -244,6 +247,75 @@ def test_events_redact_natural_language_broker_references_and_long_identifiers(t
 
     serialized = json.dumps(s.recent_events(1), sort_keys=True)
     assert all(secret not in serialized for secret in secrets)
+
+
+def test_redaction_covers_plain_identifier_labels_and_complete_authorization_values():
+    malicious = (
+        "order ORD12 deal DEAL34 broker BRK56 account ACCT78; "
+        "Authorization: Basic NATURALSECRETONLYLETTERS; "
+        "authorization=Digest digest-user-secret, "
+        "AUTHORIZATION CustomScheme dotted.secret-value\nnext line"
+    )
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    logger = logging.Logger("redaction-regression")
+    logger.addHandler(handler)
+    logger.info(malicious, extra={"structured": {"error": malicious}})
+
+    outputs = [str(redact(malicious)), stream.getvalue()]
+    for output in outputs:
+        for secret in (
+            "ORD12", "DEAL34", "BRK56", "ACCT78",
+            "NATURALSECRETONLYLETTERS", "digest-user-secret", "dotted.secret-value",
+        ):
+            assert secret not in output
+        assert "next line" in output
+    assert redact(redact(malicious)) == redact(malicious)
+    ordinary = "error code RECONCILIATION_INTERNAL_ERROR order failed account unavailable deal rejected broker offline"
+    assert redact(ordinary) == ordinary
+
+
+def test_redaction_bounds_and_escapes_untrusted_multiline_text():
+    result = str(redact("first\r\nAuthorization Bearer secret\n" + "x" * 20_000))
+    assert "\n" not in result and "\r" not in result
+    assert "secret" not in result
+    assert len(result) <= 4_200
+
+
+def test_freeze_never_persists_caller_controlled_reason_text(tmp_path):
+    s = store(tmp_path)
+    malicious = "operator order ORD12 Authorization: Basic NATURALSECRETONLYLETTERS"
+
+    state = s.freeze(malicious, "dashboard")
+
+    assert state.freeze_reason == "operator_requested_freeze"
+    with s.connect() as con:
+        persisted = con.execute("SELECT freeze_reason FROM strategy_state WHERE id=1").fetchone()[0]
+        rows = con.execute("SELECT message,details_json FROM strategy_events").fetchall()
+    assert persisted == "operator_requested_freeze"
+    serialized = json.dumps([tuple(row) for row in rows])
+    assert "ORD12" not in serialized
+    assert "NATURALSECRETONLYLETTERS" not in serialized
+    assert any(event["event_type"] == "freeze_reason_sanitized" for event in s.recent_events(10))
+
+
+def test_existing_unsafe_freeze_reason_is_sanitized_when_store_reopens(tmp_path):
+    db = tmp_path / "legacy.db"
+    s = LiveStrategyStore(db, tmp_path / "archives")
+    with s.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET freeze_reason=? WHERE id=1",
+            ("order ORD12 Authorization Bearer NATURALSECRET",),
+        )
+
+    reopened = LiveStrategyStore(db, tmp_path / "archives")
+
+    assert reopened.snapshot().freeze_reason == "sanitized_freeze_reason"
+    with reopened.connect() as con:
+        assert con.execute("SELECT freeze_reason FROM strategy_state WHERE id=1").fetchone()[0] == (
+            "sanitized_freeze_reason"
+        )
 
 
 def test_concurrent_first_open_serializes_schema_migration(tmp_path):

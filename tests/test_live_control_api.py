@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
@@ -132,6 +133,28 @@ def test_one_click_freeze_and_guarded_unfreeze(tmp_path, monkeypatch):
                              "reason": "operator review complete"})
     assert active.status_code == 200
     assert store.snapshot().lifecycle == "ACTIVE"
+
+
+def test_freeze_api_and_public_strategy_never_return_operator_reason_text(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(live_api.get_client(), "quote", lambda _code: {})
+    malicious = "order ORD12 Authorization: Basic NATURALSECRETONLYLETTERS"
+
+    frozen = http.post(
+        "/api/live-account/control/freeze",
+        headers={"X-Moomoo-Control-Token": "c"},
+        json={"confirmation": "FREEZE LIVE TRADING", "reason": malicious},
+    )
+    public = http.get("/api/live-account/strategy")
+
+    assert frozen.status_code == 200
+    assert public.status_code == 200
+    serialized = json.dumps({"freeze": frozen.json(), "public": public.json()})
+    assert "ORD12" not in serialized
+    assert "NATURALSECRETONLYLETTERS" not in serialized
+    assert frozen.json()["state"]["freeze_reason"] == "operator_requested_freeze"
+    assert public.json()["state"]["freeze_reason"] == "operator_requested_freeze"
+    assert store.snapshot().freeze_reason == "operator_requested_freeze"
 
 
 def test_unfreeze_rejects_unknown_broker_outcome(tmp_path, monkeypatch):
