@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 from dataclasses import asdict
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.moomoo_audit import (
@@ -124,6 +126,16 @@ async def live_status(x_moomoo_read_token: str = Header(default="")):
             "data_source": "Moomoo OpenD only", "paper_ledger_used": False}
 
 
+async def _public_status_payload() -> dict[str, Any]:
+    """Public status only; account identity is never included in the stream."""
+    client = get_client()
+    status = await asyncio.to_thread(client.status)
+    status["account_id"] = None
+    status["read_access_granted"] = False
+    return {"status": status, "policy": client.public_policy(),
+            "data_source": "Moomoo OpenD only", "paper_ledger_used": False}
+
+
 @router.get("/control")
 async def live_control(x_moomoo_read_token: str = Header(default=""),
                        event_limit: int = Query(200, ge=1, le=1000)):
@@ -144,44 +156,84 @@ async def live_control(x_moomoo_read_token: str = Header(default=""),
         _raise_public_error(503, "CONTROL_STATE_UNAVAILABLE")
 
 
+async def _live_strategy_payload(event_limit: int = 100,
+                                 fill_limit: int = 200,
+                                 *, include_history: bool = True) -> dict[str, Any]:
+    """Build the public strategy sub-ledger; never returns broker account data."""
+    store = get_client().control
+    events = await asyncio.to_thread(store.recent_events, event_limit)
+    try:
+        market_quote = await asyncio.to_thread(get_client().quote, "US.SPY")
+        market_status = {
+            "state": str(market_quote.get("market_state") or "UNKNOWN").upper(),
+            "security_status": str(market_quote.get("sec_status") or "UNKNOWN").upper(),
+            "updated_at": market_quote.get("update_time"),
+        }
+    except MoomooUnavailable:
+        market_status = {"state": "UNKNOWN", "security_status": "UNKNOWN", "updated_at": None}
+    public_events = [
+        {key: row.get(key) for key in ("ts", "event_type", "source", "severity", "message")}
+        for row in events
+    ]
+    payload = {
+        "state": asdict(await asyncio.to_thread(store.snapshot)),
+        "config": await asyncio.to_thread(store.config),
+        "owned_positions": await asyncio.to_thread(store.positions),
+        "symbol_performance": await asyncio.to_thread(store.symbol_performance),
+        "execution_summary": await asyncio.to_thread(store.execution_summary),
+        "performance_summary": await asyncio.to_thread(store.performance_summary),
+        "market_status": market_status,
+        "fills": await asyncio.to_thread(store.fill_display_history, fill_limit),
+        "events": public_events,
+        "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
+                        "loss_floor": 7_500, "regular_hours_only": True},
+        "data_scope": "strategy_subledger_only",
+    }
+    if include_history:
+        payload["equity"] = await asyncio.to_thread(store.equity_history)
+        payload["paper_series"] = await asyncio.to_thread(store.paper_series)
+    return payload
+
+
 @router.get("/strategy")
 async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
                         fill_limit: int = Query(200, ge=1, le=1000)):
     """Public strategy sub-ledger only; never returns broker account data."""
-    store = get_client().control
     try:
-        events = await asyncio.to_thread(store.recent_events, event_limit)
-        try:
-            market_quote = await asyncio.to_thread(get_client().quote, "US.SPY")
-            market_status = {
-                "state": str(market_quote.get("market_state") or "UNKNOWN").upper(),
-                "security_status": str(market_quote.get("sec_status") or "UNKNOWN").upper(),
-                "updated_at": market_quote.get("update_time"),
-            }
-        except MoomooUnavailable:
-            market_status = {"state": "UNKNOWN", "security_status": "UNKNOWN", "updated_at": None}
-        public_events = [
-            {key: row.get(key) for key in ("ts", "event_type", "source", "severity", "message")}
-            for row in events
-        ]
-        return {
-            "state": asdict(await asyncio.to_thread(store.snapshot)),
-            "config": await asyncio.to_thread(store.config),
-            "owned_positions": await asyncio.to_thread(store.positions),
-            "symbol_performance": await asyncio.to_thread(store.symbol_performance),
-            "execution_summary": await asyncio.to_thread(store.execution_summary),
-            "performance_summary": await asyncio.to_thread(store.performance_summary),
-            "market_status": market_status,
-            "fills": await asyncio.to_thread(store.fill_display_history, fill_limit),
-            "equity": await asyncio.to_thread(store.equity_history),
-            "paper_series": await asyncio.to_thread(store.paper_series),
-            "events": public_events,
-            "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
-                            "loss_floor": 7_500, "regular_hours_only": True},
-            "data_scope": "strategy_subledger_only",
-        }
+        return await _live_strategy_payload(event_limit, fill_limit)
     except ControlRejected:
         _raise_public_error(503, "CONTROL_STATE_UNAVAILABLE")
+
+
+def _sse_snapshot(payload: dict[str, Any]) -> str:
+    return "event: snapshot\ndata: " + json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ) + "\n\n"
+
+
+@router.get("/strategy/stream")
+async def live_strategy_stream(request: Request):
+    """Long-lived public SSE stream of sanitized strategy-only snapshots."""
+    async def events():
+        yield "retry: 3000\n\n"
+        while not await request.is_disconnected():
+            try:
+                payload = {
+                    "root": await _public_status_payload(),
+                    "control": await _live_strategy_payload(
+                        event_limit=50, fill_limit=100, include_history=False,
+                    ),
+                }
+                yield _sse_snapshot(payload)
+            except (ControlRejected, MoomooUnavailable):
+                yield "event: unavailable\ndata: {}\n\n"
+            await asyncio.sleep(10)
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @router.put("/control/config")

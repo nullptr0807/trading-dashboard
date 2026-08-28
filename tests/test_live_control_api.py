@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
@@ -68,6 +69,27 @@ def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):
                for event in body["events"])
     for forbidden in ("account", "account_id", "positions", "orders", "deals", "order_fees"):
         assert forbidden not in body
+
+    streamed = asyncio.run(live_api._live_strategy_payload(include_history=False))
+    assert "equity" not in streamed
+    assert "paper_series" not in streamed
+    assert streamed["data_scope"] == "strategy_subledger_only"
+
+
+def test_strategy_sse_response_is_unbuffered_and_snapshot_is_single_line():
+    class Disconnected:
+        async def is_disconnected(self):
+            return True
+
+    response = asyncio.run(live_api.live_strategy_stream(Disconnected()))  # type: ignore[arg-type]
+    assert response.media_type == "text/event-stream"
+    assert response.headers["cache-control"] == "no-cache, no-transform"
+    assert response.headers["x-accel-buffering"] == "no"
+    event = live_api._sse_snapshot({"value": "line one\nline two"})
+    assert event.startswith("event: snapshot\ndata: ")
+    assert event.endswith("\n\n")
+    assert event.count("\ndata: ") == 1
+    assert "line one\\nline two" in event
 
 
 def test_public_strategy_defense_in_depth_sanitizes_legacy_event_rows(tmp_path, monkeypatch):

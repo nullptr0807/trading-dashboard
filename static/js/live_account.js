@@ -5,7 +5,11 @@ let _laChart = null;
 let _laChartResizeObserver = null;
 let _laRefreshTimer = null;
 let _laRequestInFlight = false;
-const LA_REFRESH_MS = 10000;
+let _laEventSource = null;
+let _laChartSignature = '';
+const LA_RECONNECT_MS = 3000;
+const LA_API_BASE = window.location.pathname.startsWith('/trading-dashboard/')
+  ? '/trading-dashboard/api/live-account' : '/api/live-account';
 
 function laLang() { return (typeof getLang === 'function' && getLang() === 'zh') ? 'zh' : 'en'; }
 function laT(zh, en) { return laLang() === 'zh' ? zh : en; }
@@ -55,14 +59,14 @@ function laScheduleRefresh() {
   _laRefreshTimer = setTimeout(() => {
     _laRefreshTimer = null;
     if (!document.hidden && isRouteCurrent(window.__activeRouteToken, '/live-account')) {
-      renderLiveAccountPage(window.__activeRouteToken, {background:true});
+      laStartStream();
     }
-  }, LA_REFRESH_MS);
+  }, LA_RECONNECT_MS);
 }
 async function laFetch(path, options) {
   options = options ? {...options} : {};
   options.headers = {...(options.headers || {})};
-  const res = await fetch('/api/live-account' + path, options);
+  const res = await fetch(LA_API_BASE + path, options);
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.detail || `API ${res.status}`);
   return body;
@@ -217,6 +221,65 @@ function laRenderChart(control) {
   _laChart.timeScale().fitContent();_laChartResizeObserver=new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}});_laChartResizeObserver.observe(el);
 }
 
+function laChartDataSignature(control){
+  const live=control.equity||[],paper=control.paper_series||[];
+  const a=live[live.length-1]||{},b=paper[paper.length-1]||{};
+  return `${live.length}:${a.ts||''}:${a.equity||''}|${paper.length}:${b.ts||''}:${b.equity||''}`;
+}
+
+function laLiveBar(st){
+  return `<div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)} · ${laT('实时长连接','Live stream')}</span><button class="la-link" id="la-refresh">${laT('立即更新','Update now')}</button></div>`;
+}
+
+function laSharedWarning(st){
+  return st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：页面仅展示逻辑策略子仓。','RESTRICTED SHARED ACCOUNT: this page shows the logical strategy sub-position only.')}</b> ${laT('个人持仓不会进入页面；策略只记录并卖出自己经证明成交的数量。','Personal holdings never enter this page. The strategy records and sells only its proven quantity.')}</div>`:'';
+}
+
+function laBindRefresh(){
+  const refresh=document.getElementById('la-refresh');
+  if(refresh)refresh.addEventListener('click',()=>renderLiveAccountPage(window.__activeRouteToken,{background:true}));
+}
+
+function laApplySnapshot(root,control){
+  if(!isRouteCurrent(window.__activeRouteToken,'/live-account'))return;
+  const app=document.getElementById('app'),st=root.status,p=root.policy,view=laCaptureView(app);
+  const set=(id,html)=>{const el=document.getElementById(id);if(el)el.innerHTML=html;};
+  set('la-live-hero',laHero(control,st));
+  set('la-livebar-wrap',laLiveBar(st));
+  set('la-shared-warning',laSharedWarning(st));
+  set('la-control-wrap',laControlPanel(control));
+  set('la-performance-wrap',`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section>`);
+  set('la-positions-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section>`);
+  set('la-fills-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section>`);
+  set('la-setup-wrap',laSetup(st));
+  set('la-policy-wrap',laPolicyCard(p,control));
+  set('la-events-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section>`);
+  set('la-raw-wrap',`<section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section>`);
+  if(Object.prototype.hasOwnProperty.call(control,'equity')||Object.prototype.hasOwnProperty.call(control,'paper_series')){
+    const signature=laChartDataSignature(control);
+    if(signature!==_laChartSignature){_laChartSignature=signature;laRenderChart(control);}
+  }
+  laBindControls(control);laBindRefresh();laRestoreView(app,view);
+}
+
+function laStopStream(){
+  if(_laEventSource){_laEventSource.close();_laEventSource=null;}
+  if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
+}
+
+function laStartStream(){
+  if(document.hidden||!isRouteCurrent(window.__activeRouteToken,'/live-account'))return;
+  if(_laEventSource)_laEventSource.close();
+  const stream=new EventSource(`${LA_API_BASE}/strategy/stream`);
+  _laEventSource=stream;
+  stream.addEventListener('snapshot',(event)=>{
+    try{const payload=JSON.parse(event.data);laApplySnapshot(payload.root,payload.control);}catch{}
+  });
+  stream.onerror=()=>{
+    if(_laEventSource===stream){stream.close();_laEventSource=null;laScheduleRefresh();}
+  };
+}
+
 async function renderLiveAccountPage(token, options={}) {
   if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
   if(_laRequestInFlight)return;
@@ -227,27 +290,24 @@ async function renderLiveAccountPage(token, options={}) {
     const [root,control]=await Promise.all([laFetch('/status'),laFetch('/strategy')]);
     if(token && !isRouteCurrent(token,'/live-account'))return;
     const st=root.status,p=root.policy;
-    const view=options.background?laCaptureView(app):null;
-    app.innerHTML=`<div class="la-shell">${laHero(control,st)}
-      <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)} · ${laT('每10秒自动更新','Auto-updates every 10s')}</span><button class="la-link" id="la-refresh">${laT('立即更新','Update now')}</button></div>
-      ${st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：页面仅展示逻辑策略子仓。','RESTRICTED SHARED ACCOUNT: this page shows the logical strategy sub-position only.')}</b> ${laT('个人持仓不会进入页面；策略只记录并卖出自己经证明成交的数量。','Personal holdings never enter this page. The strategy records and sells only its proven quantity.')}</div>`:''}
-      ${laControlPanel(control)}
+    if(options.background&&document.getElementById('la-live-hero')){laApplySnapshot(root,control);return;}
+    app.innerHTML=`<div class="la-shell"><div id="la-live-hero">${laHero(control,st)}</div>
+      <div id="la-livebar-wrap">${laLiveBar(st)}</div>
+      <div id="la-shared-warning">${laSharedWarning(st)}</div>
+      <div id="la-control-wrap">${laControlPanel(control)}</div>
       <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>
-      <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section>
-      <section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section>
-      <section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section>
-      ${laSetup(st)}
-      ${laPolicyCard(p,control)}
-      <section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section>
-      <section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section>
+      <div id="la-performance-wrap"><section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section></div>
+      <div id="la-positions-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section></div>
+      <div id="la-fills-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section></div>
+      <div id="la-setup-wrap">${laSetup(st)}</div>
+      <div id="la-policy-wrap">${laPolicyCard(p,control)}</div>
+      <div id="la-events-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section></div>
+      <div id="la-raw-wrap"><section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section></div>
     </div>`;
-    laRenderChart(control);laBindControls(control);
-    laRestoreView(app,view);
-    const refresh=document.getElementById('la-refresh');if(refresh)refresh.addEventListener('click',()=>renderLiveAccountPage(window.__activeRouteToken,{background:true}));
+    _laChartSignature=laChartDataSignature(control);laRenderChart(control);laBindControls(control);laBindRefresh();laStartStream();
   } catch(e){if(!options.background)app.innerHTML=`<div class="la-shell"><div class="la-fatal"><h2>${laT('策略账户模块不可用','Strategy account module unavailable')}</h2><p>${laEsc(e.message)}</p></div></div>`;}
   finally {
     _laRequestInFlight=false;
-    if(isRouteCurrent(window.__activeRouteToken,'/live-account'))laScheduleRefresh();
   }
 }
 
@@ -262,8 +322,8 @@ function laBindControls(control){
 
 window.renderLiveAccountPage=renderLiveAccountPage;
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden&&isRouteCurrent(window.__activeRouteToken,'/live-account')){
-    renderLiveAccountPage(window.__activeRouteToken,{background:true});
-  }
+  if(document.hidden)laStopStream();
+  else if(isRouteCurrent(window.__activeRouteToken,'/live-account'))laStartStream();
 });
+window.addEventListener('hashchange',()=>{if(!isRouteCurrent(window.__activeRouteToken,'/live-account'))laStopStream();});
 })();

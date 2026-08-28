@@ -202,16 +202,20 @@ def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     assert 'style.css?v=50' in html
 
 
-def test_live_account_auto_refresh_is_fast_safe_and_cache_busted():
+def test_live_account_uses_sse_incremental_updates_and_cache_bust():
     js = (ROOT / 'static/js/live_account.js').read_text()
     html = (ROOT / 'static/index.html').read_text()
-    assert 'const LA_REFRESH_MS = 10000' in js
-    assert "if (!document.hidden && isRouteCurrent" in js
-    assert "document.addEventListener('visibilitychange'" in js
-    assert 'if(_laRequestInFlight)return' in js
+    assert 'const LA_API_BASE' in js
+    assert "startsWith('/trading-dashboard/')" in js
+    assert 'new EventSource(`${LA_API_BASE}/strategy/stream`)' in js
+    assert "stream.addEventListener('snapshot'" in js
+    assert 'function laApplySnapshot(root,control)' in js
+    assert "set('la-control-wrap',laControlPanel(control))" in js
+    assert "if(signature!==_laChartSignature)" in js
+    assert "if(document.hidden)laStopStream()" in js
+    assert "window.addEventListener('hashchange'" in js
     assert 'laCaptureView(app)' in js and 'laRestoreView(app,view)' in js
-    assert 'if(!options.background)app.innerHTML' in js
-    assert 'live_account.js?v=14' in html
+    assert 'live_account.js?v=15' in html
 
 
 def test_strategy_text_is_html_escaped_in_card(tmp_path):
