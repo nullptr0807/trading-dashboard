@@ -202,6 +202,18 @@ def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     assert 'style.css?v=50' in html
 
 
+def test_live_account_auto_refresh_is_fast_safe_and_cache_busted():
+    js = (ROOT / 'static/js/live_account.js').read_text()
+    html = (ROOT / 'static/index.html').read_text()
+    assert 'const LA_REFRESH_MS = 10000' in js
+    assert "if (!document.hidden && isRouteCurrent" in js
+    assert "document.addEventListener('visibilitychange'" in js
+    assert 'if(_laRequestInFlight)return' in js
+    assert 'laCaptureView(app)' in js and 'laRestoreView(app,view)' in js
+    assert 'if(!options.background)app.innerHTML' in js
+    assert 'live_account.js?v=14' in html
+
+
 def test_strategy_text_is_html_escaped_in_card(tmp_path):
     script = tmp_path / 'check.js'
     script.write_text(

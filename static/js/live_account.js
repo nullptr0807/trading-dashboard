@@ -2,7 +2,10 @@
 (()=>{
 let _laControlToken = '';
 let _laChart = null;
+let _laChartResizeObserver = null;
 let _laRefreshTimer = null;
+let _laRequestInFlight = false;
+const LA_REFRESH_MS = 10000;
 
 function laLang() { return (typeof getLang === 'function' && getLang() === 'zh') ? 'zh' : 'en'; }
 function laT(zh, en) { return laLang() === 'zh' ? zh : en; }
@@ -15,6 +18,47 @@ function laMoney(v) { return '$' + Number(v || 0).toLocaleString('en-US', {minim
 function laTime(v) { if(!v)return '—'; const d=new Date(v); return Number.isNaN(d.getTime())?String(v):d.toLocaleString(); }
 function laPct(v) { const n = Number(v || 0); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`; }
 function laClass(v) { return Number(v) > 0 ? 'la-positive' : Number(v) < 0 ? 'la-negative' : '' ; }
+
+function laCaptureView(app) {
+  const fields = {};
+  app.querySelectorAll('input[id], input[data-la-param]').forEach((el) => {
+    const key = el.id || `param:${el.dataset.laParam}`;
+    fields[key] = el.value;
+  });
+  return {
+    fields,
+    activeId: document.activeElement && document.activeElement.id,
+    scrollX: window.scrollX,
+    scrollY: window.scrollY,
+    openDetails: [...app.querySelectorAll('details')].map((el) => el.open),
+  };
+}
+
+function laRestoreView(app, view) {
+  if (!view) return;
+  app.querySelectorAll('input[id], input[data-la-param]').forEach((el) => {
+    const key = el.id || `param:${el.dataset.laParam}`;
+    if (Object.prototype.hasOwnProperty.call(view.fields, key)) el.value = view.fields[key];
+  });
+  [...app.querySelectorAll('details')].forEach((el, i) => { el.open = Boolean(view.openDetails[i]); });
+  requestAnimationFrame(() => {
+    window.scrollTo(view.scrollX, view.scrollY);
+    if (view.activeId) {
+      const active = document.getElementById(view.activeId);
+      if (active) active.focus({preventScroll:true});
+    }
+  });
+}
+
+function laScheduleRefresh() {
+  if (_laRefreshTimer) clearTimeout(_laRefreshTimer);
+  _laRefreshTimer = setTimeout(() => {
+    _laRefreshTimer = null;
+    if (!document.hidden && isRouteCurrent(window.__activeRouteToken, '/live-account')) {
+      renderLiveAccountPage(window.__activeRouteToken, {background:true});
+    }
+  }, LA_REFRESH_MS);
+}
 async function laFetch(path, options) {
   options = options ? {...options} : {};
   options.headers = {...(options.headers || {})};
@@ -163,25 +207,29 @@ function laStrategyFills(control) {
 
 function laRenderChart(control) {
   const el=document.getElementById('la-nav-chart'), history=control&&control.equity||[]; if(!el || !window.LightweightCharts) return;
+  if(_laChartResizeObserver){_laChartResizeObserver.disconnect();_laChartResizeObserver=null;}
   if(_laChart){try{_laChart.remove();}catch{} _laChart=null;}
   el.textContent='';
   _laChart=LightweightCharts.createChart(el,{width:el.clientWidth,height:260,layout:{background:{color:'#111827'},textColor:'#9fb0c7'},grid:{vertLines:{color:'#223049'},horzLines:{color:'#223049'}},rightPriceScale:{borderColor:'#34445e'},timeScale:{borderColor:'#34445e',timeVisible:true}});
   if(history.length){const series=_laChart.addAreaSeries({lineColor:'#33e3a2',topColor:'rgba(51,227,162,.35)',bottomColor:'rgba(51,227,162,.02)',lineWidth:2,title:laT('实盘$10k子账本','Live $10k sub-ledger')});const byDay={};history.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});series.setData(Object.entries(byDay).map(([time,value])=>({time,value})));}
   const grouped={};(control.paper_series||[]).forEach(x=>(grouped[x.series_id]??=[]).push(x));
   const colors=['#6aa9ff','#f4b860','#c792ea','#ff6b8a'];Object.entries(grouped).forEach(([id,rows],i)=>{const line=_laChart.addLineSeries({color:colors[i%colors.length],lineWidth:2,lineStyle:2,title:`PAPER · ${rows[0].label}`});const byDay={};rows.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});line.setData(Object.entries(byDay).map(([time,value])=>({time,value})));});
-  _laChart.timeScale().fitContent();new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}}).observe(el);
+  _laChart.timeScale().fitContent();_laChartResizeObserver=new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}});_laChartResizeObserver.observe(el);
 }
 
-async function renderLiveAccountPage(token) {
+async function renderLiveAccountPage(token, options={}) {
   if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
+  if(_laRequestInFlight)return;
+  _laRequestInFlight=true;
   const app=document.getElementById('app');
-  app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · STRATEGY SUB-LEDGER</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><p>${laT('仅展示独立$10,000策略子账本；个人账户资金、持仓和交易不会发送到此页面。','Only the independent $10,000 strategy sub-ledger is shown. Personal account cash, holdings and activity are never sent to this page.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section><div class="la-loading">${laT('正在加载策略子账本…','Loading strategy sub-ledger…')}</div></div>`;
+  if(!options.background)app.innerHTML=`<div class="la-shell"><section class="la-hero"><div><span class="la-kicker">MOOMOO OPENAPI · STRATEGY SUB-LEDGER</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><p>${laT('仅展示独立$10,000策略子账本；个人账户资金、持仓和交易不会发送到此页面。','Only the independent $10,000 strategy sub-ledger is shown. Personal account cash, holdings and activity are never sent to this page.')}</p></div><div class="la-hero-mark">$10K<span>${laT('不可变策略本金','IMMUTABLE CAPITAL')}</span></div></section><div class="la-loading">${laT('正在加载策略子账本…','Loading strategy sub-ledger…')}</div></div>`;
   try {
     const [root,control]=await Promise.all([laFetch('/status'),laFetch('/strategy')]);
     if(token && !isRouteCurrent(token,'/live-account'))return;
     const st=root.status,p=root.policy;
+    const view=options.background?laCaptureView(app):null;
     app.innerHTML=`<div class="la-shell">${laHero(control,st)}
-      <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)}</span><button class="la-link" id="la-refresh">${laT('刷新','Refresh')}</button></div>
+      <div class="la-livebar ${st.place_order_ready?'armed':'safe'}"><b>${st.place_order_ready?laT('真实下单已解锁','REAL ORDERS ARMED'):laT('只读/冻结安全模式','READ-ONLY / FROZEN SAFE MODE')}</b><span>${laEsc(st.message||`${st.security_firm} · ${st.market}`)} · ${laT('每10秒自动更新','Auto-updates every 10s')}</span><button class="la-link" id="la-refresh">${laT('立即更新','Update now')}</button></div>
       ${st.account_isolation_mode==='shared_restricted'?`<div class="la-error"><b>${laT('受限共享账户：页面仅展示逻辑策略子仓。','RESTRICTED SHARED ACCOUNT: this page shows the logical strategy sub-position only.')}</b> ${laT('个人持仓不会进入页面；策略只记录并卖出自己经证明成交的数量。','Personal holdings never enter this page. The strategy records and sells only its proven quantity.')}</div>`:''}
       ${laControlPanel(control)}
       <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>
@@ -194,9 +242,13 @@ async function renderLiveAccountPage(token) {
       <section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section>
     </div>`;
     laRenderChart(control);laBindControls(control);
-    const refresh=document.getElementById('la-refresh');if(refresh)refresh.addEventListener('click',()=>renderLiveAccountPage(window.__activeRouteToken));
-    _laRefreshTimer=setTimeout(()=>{if(isRouteCurrent(window.__activeRouteToken,'/live-account'))renderLiveAccountPage(window.__activeRouteToken);},300000);
-  } catch(e){app.innerHTML=`<div class="la-shell"><div class="la-fatal"><h2>${laT('策略账户模块不可用','Strategy account module unavailable')}</h2><p>${laEsc(e.message)}</p></div></div>`;}
+    laRestoreView(app,view);
+    const refresh=document.getElementById('la-refresh');if(refresh)refresh.addEventListener('click',()=>renderLiveAccountPage(window.__activeRouteToken,{background:true}));
+  } catch(e){if(!options.background)app.innerHTML=`<div class="la-shell"><div class="la-fatal"><h2>${laT('策略账户模块不可用','Strategy account module unavailable')}</h2><p>${laEsc(e.message)}</p></div></div>`;}
+  finally {
+    _laRequestInFlight=false;
+    if(isRouteCurrent(window.__activeRouteToken,'/live-account'))laScheduleRefresh();
+  }
 }
 
 function laControlAuth(){const input=document.getElementById('la-control-token');if(input&&input.value)_laControlToken=input.value;return _laControlToken;}
@@ -209,4 +261,9 @@ function laBindControls(control){
 }
 
 window.renderLiveAccountPage=renderLiveAccountPage;
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&isRouteCurrent(window.__activeRouteToken,'/live-account')){
+    renderLiveAccountPage(window.__activeRouteToken,{background:true});
+  }
+});
 })();
