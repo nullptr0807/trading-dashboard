@@ -310,8 +310,11 @@ async def get_factor_ai(account_id: str, payload: dict, lang: str = Query('zh'))
         # Shield the generation task from client disconnects / browser aborts.
         # A later retry can await the same task or hit the freshly populated cache.
         entry = await asyncio.shield(task)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f'AI generation failed: {e}')
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "AI_GENERATION_FAILED", "message": "AI generation failed."},
+        )
     return {
         'markdown': entry['markdown'],
         'cached': False,

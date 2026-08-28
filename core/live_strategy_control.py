@@ -50,10 +50,50 @@ DEFAULT_CONFIG: dict[str, Any] = {
 EDITABLE_FIELDS = frozenset(DEFAULT_CONFIG) - {"strategy_id"}
 _INTENT_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_FREEZE_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,119}$")
-_WATCHDOG_FREEZE_REASON = re.compile(r"^health_watchdog:[A-Za-z0-9_:,]{1,143}$")
 _DASHBOARD_FREEZE_CODES = frozenset({
     "manual_freeze", "operator_requested_freeze", "cleanup_requested",
+})
+_INTERNAL_FREEZE_CODES = frozenset({
+    "auto_broker_outcome_unknown",
+    "auto_intent_broker_outcome_unknown",
+    "auto_intent_broker_proof_mismatch",
+    "auto_intent_payload_conflict",
+    "auto_post_broker_reconciliation_failed",
+    "auto_unclassified_dispatch_failure",
+    "cleaned_no_valid_strategy",
+    "cleanup_requested",
+    "config_changed_requires_review",
+    "control_generation_changed_requires_sync",
+    "five_minute_reconciliation_failed",
+    "manual_freeze",
+    "not_provisioned",
+    "operator_requested_freeze",
+    "owned_price_missing",
+    "reconciliation_fill_conflict",
+    "reconciliation_quantity_mismatch",
+    "reconciliation_snapshot_deal_conflict",
+    "reconciliation_snapshot_numeric_conflict",
+    "reconciliation_snapshot_order_conflict",
+    "reconciliation_snapshot_position_conflict",
+    "runtime_identity_changed_requires_sync",
+    "sanitized_freeze_reason",
+    "strategy_equity_at_or_below_7500",
+    "strategy_exposure_above_10000",
+})
+_WATCHDOG_PROBLEM_CODES = frozenset({
+    "ACCOUNT_ISOLATION_SYNC_PROOF_MISMATCH",
+    "AUTO_INTENT_DISPATCH_STALE",
+    "AUTO_INTENT_OUTCOME_UNKNOWN",
+    "BROKER_OUTCOME_REQUIRES_RECONCILIATION",
+    "EXPOSURE_CAP_BREACH",
+    "FIVE_MINUTE_SYNC_STALE",
+    "LOSS_FLOOR_BREACH",
+    "MODULE_ORDER_STUCK_OVER_15_MIN",
+    "MOOMOO_HISTORY_INCOMPLETE",
+    "MOOMOO_UNAVAILABLE_WHILE_ACTIVE",
+})
+_WATCHDOG_STALE_CODES = frozenset({
+    "AUTO_INTENT_STALE:ACKED", "AUTO_INTENT_STALE:PARTIAL", "AUTO_INTENT_STALE:RESERVED",
 })
 AUTO_INTENT_STATUSES = frozenset({
     "PLANNED", "RESERVED", "DISPATCHING", "ACKED", "PARTIAL",
@@ -81,15 +121,35 @@ def _finite(value: Any, name: str) -> float:
     return result
 
 
+def _valid_watchdog_reason(raw: str) -> bool:
+    if not raw.startswith("health_watchdog:"):
+        return False
+    problems = raw.removeprefix("health_watchdog:").split(",")
+    if not problems or any(not problem for problem in problems):
+        return False
+    for problem in problems:
+        if problem in _WATCHDOG_PROBLEM_CODES or problem in _WATCHDOG_STALE_CODES:
+            continue
+        if problem.startswith("SYSTEM_FROZEN:"):
+            frozen_code = problem.removeprefix("SYSTEM_FROZEN:")
+            if frozen_code in _INTERNAL_FREEZE_CODES:
+                continue
+        return False
+    return True
+
+
 def _safe_freeze_reason(reason: Any, source: str = "") -> tuple[str, bool]:
     """Return a bounded state-machine code, never caller-controlled prose."""
     raw = str(reason or "").strip()
     if not raw:
         raw = "manual_freeze"
-    valid = bool(_FREEZE_REASON_CODE.fullmatch(raw) or _WATCHDOG_FREEZE_REASON.fullmatch(raw))
     if str(source) == "dashboard" and raw not in _DASHBOARD_FREEZE_CODES:
         return "operator_requested_freeze", raw != "operator_requested_freeze"
-    if valid:
+    if raw.startswith("health_watchdog:"):
+        if str(source) in {"", "health_watchdog"} and _valid_watchdog_reason(raw):
+            return raw, False
+        return "sanitized_freeze_reason", True
+    if raw in _INTERNAL_FREEZE_CODES:
         return raw, False
     return "sanitized_freeze_reason", True
 
@@ -655,7 +715,7 @@ class LiveStrategyStore:
                 self._event_tx(
                     con, "freeze_reason_sanitized", source, "warning",
                     "Freeze request detail was sanitized to a bounded reason code",
-                    {"reason_code": reason, "operator_detail": raw_reason},
+                    {"reason_code": reason},
                 )
             if not already_latched:
                 required = (current["required_sync_after"] if current
@@ -1815,7 +1875,16 @@ class LiveStrategyStore:
         limit = max(1, min(int(limit), 1000))
         with self.connect() as con:
             rows = con.execute("SELECT * FROM strategy_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(row) | {"details": json.loads(row["details_json"])} for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            raw_details = item.pop("details_json", "{}")
+            try:
+                details = json.loads(raw_details)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {"unparsed": str(raw_details)}
+            result.append(_redact(item | {"details": details}))
+        return result
 
     def equity_history(self, limit: int = 5000) -> list[dict[str, Any]]:
         with self.connect() as con:

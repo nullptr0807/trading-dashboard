@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 import api.live_account as live_api
-from core.live_strategy_control import LiveStrategyStore
-from core.moomoo_client import MoomooClient, MoomooSettings
+from core.live_strategy_control import ControlRejected, LiveStrategyStore
+from core.moomoo_client import MoomooClient, MoomooSettings, MoomooUnavailable
 from server import app
 
 
@@ -61,6 +61,42 @@ def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):
                for event in body["events"])
     for forbidden in ("account", "account_id", "positions", "orders", "deals", "order_fees"):
         assert forbidden not in body
+
+
+def test_public_strategy_defense_in_depth_sanitizes_legacy_event_rows(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(live_api.get_client(), "quote", lambda _code: {})
+    with store.connect() as con:
+        con.execute(
+            "INSERT INTO strategy_events(ts,event_type,source,severity,message,details_json,config_version) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("2026-08-28T00:00:00+00:00", "legacy", "test", "critical",
+             "order alphaidentifier Authorization: Bearer LegacyBearer",
+             json.dumps({"Authorization": "Digest nonce=LegacyNonce", "deal": "DealToken"}), 1),
+        )
+    body = http.get("/api/live-account/strategy").json()
+    serialized = json.dumps(body, sort_keys=True)
+    assert all(marker not in serialized for marker in (
+        "alphaidentifier", "LegacyBearer", "LegacyNonce", "DealToken",
+    ))
+
+
+def test_live_api_exceptions_return_only_enumerated_public_errors(tmp_path, monkeypatch):
+    http, store = setup_client(tmp_path, monkeypatch)
+    marker = "Authorization: Bearer APISecret order alphaidentifier"
+    monkeypatch.setattr(live_api.get_client(), "quote", lambda _code: (_ for _ in ()).throw(
+        MoomooUnavailable(marker)
+    ))
+    quote = http.get("/api/live-account/quote/US.SPY", headers={"X-Moomoo-Read-Token": "r"})
+    assert quote.status_code == 503
+    assert quote.json()["detail"]["code"] == "MOOMOO_UNAVAILABLE"
+    assert marker not in json.dumps(quote.json())
+
+    monkeypatch.setattr(store, "config", lambda: (_ for _ in ()).throw(ControlRejected(marker)))
+    control = http.get("/api/live-account/control", headers={"X-Moomoo-Read-Token": "r"})
+    assert control.status_code == 503
+    assert control.json()["detail"]["code"] == "CONTROL_STATE_UNAVAILABLE"
+    assert marker not in json.dumps(control.json())
 
 
 def test_preview_api_forwards_explicit_overnight_session(tmp_path, monkeypatch):
@@ -188,7 +224,7 @@ def test_unfreeze_rejects_shared_account_even_after_fresh_read_only_sync(tmp_pat
     )
 
     assert result.status_code == 409
-    assert "accepted Moomoo account isolation mode" in result.json()["detail"]
+    assert result.json()["detail"]["code"] == "UNFREEZE_REJECTED"
     assert store.snapshot().lifecycle == "FROZEN"
 
 
@@ -266,5 +302,5 @@ def test_cleanup_rejects_when_broker_account_is_not_configured(tmp_path, monkeyp
               "reason": "candidate failed"},
     )
     assert result.status_code == 409
-    assert "configured Moomoo account" in result.json()["detail"]
+    assert result.json()["detail"]["code"] == "CLEANUP_REJECTED"
     assert store.snapshot().strategy_id == "B16"

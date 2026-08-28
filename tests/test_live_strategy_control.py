@@ -276,6 +276,39 @@ def test_redaction_covers_plain_identifier_labels_and_complete_authorization_val
     assert redact(ordinary) == ordinary
 
 
+def test_redaction_closes_authorization_json_key_and_plain_word_bypasses(tmp_path):
+    payload = {
+        "Authorization": "Digest realm=\"private\", nonce=\"NonceSecret\", uri=\"/private\"",
+        "order alphaidentifier": "key-secret",
+        "nested": [
+            {"deal": "DealToken", "safe": "order failed"},
+            {"account": "AccountToken", "broker": "BrokerToken"},
+        ],
+    }
+    quoted = (
+        '{"Authorization":"AWS4-HMAC-SHA256 Credential=AccessSecret/region, '
+        'SignedHeaders=host;x-private, Signature=SignatureSecret","safe":"visible"}'
+    )
+    cleaned = redact(payload)
+    serialized = json.dumps(cleaned, sort_keys=True)
+    quoted_cleaned = str(redact(quoted))
+    for marker in (
+        "private", "NonceSecret", "/private", "alphaidentifier", "key-secret",
+        "DealToken", "AccountToken", "BrokerToken", "AccessSecret", "x-private",
+        "SignatureSecret",
+    ):
+        assert marker not in serialized + quoted_cleaned
+    assert cleaned["nested"][0]["safe"] == "order failed"
+    assert '"safe":"visible"' in quoted_cleaned
+
+    s = store(tmp_path)
+    s.event("api", "test", "critical", quoted, payload)
+    persisted = json.dumps(s.recent_events(1), sort_keys=True)
+    assert all(marker not in persisted for marker in (
+        "NonceSecret", "alphaidentifier", "DealToken", "AccessSecret", "SignatureSecret",
+    ))
+
+
 def test_redaction_bounds_and_escapes_untrusted_multiline_text():
     result = str(redact("first\r\nAuthorization Bearer secret\n" + "x" * 20_000))
     assert "\n" not in result and "\r" not in result
@@ -316,6 +349,28 @@ def test_existing_unsafe_freeze_reason_is_sanitized_when_store_reopens(tmp_path)
         assert con.execute("SELECT freeze_reason FROM strategy_state WHERE id=1").fetchone()[0] == (
             "sanitized_freeze_reason"
         )
+
+
+def test_freeze_reason_is_semantic_allowlist_and_watchdog_namespace_is_owned(tmp_path):
+    s = store(tmp_path)
+    assert s.freeze("private_operator_note", "internal").freeze_reason == "sanitized_freeze_reason"
+    assert s.freeze("secrettokenvalue", "internal").freeze_reason == "sanitized_freeze_reason"
+    assert s.freeze("health_watchdog:NATURALSECRET", "auto_executor").freeze_reason == (
+        "sanitized_freeze_reason"
+    )
+    assert s.freeze("health_watchdog:AUTO_INTENT_STALE:ACKED", "health_watchdog").freeze_reason == (
+        "health_watchdog:AUTO_INTENT_STALE:ACKED"
+    )
+    assert s.freeze("health_watchdog:AUTO_INTENT_STALE:NATURALSECRET", "health_watchdog").freeze_reason == (
+        "sanitized_freeze_reason"
+    )
+    assert s.freeze("arbitrary_snake_case_secret", "internal").freeze_reason == (
+        "sanitized_freeze_reason"
+    )
+    serialized = json.dumps(s.recent_events(50), sort_keys=True)
+    assert "private_operator_note" not in serialized
+    assert "secrettokenvalue" not in serialized
+    assert "NATURALSECRET" not in serialized
 
 
 def test_concurrent_first_open_serializes_schema_migration(tmp_path):

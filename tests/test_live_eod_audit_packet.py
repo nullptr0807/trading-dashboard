@@ -102,3 +102,17 @@ def test_eod_sanitize_redacts_plain_labels_authorization_and_unsafe_freeze_reaso
     ):
         assert secret not in serialized
     assert eod.sanitize("private operator note", "freeze_reason") == "sanitized_freeze_reason"
+
+
+def test_eod_recursively_sanitizes_keys_structured_values_and_authorization_fields():
+    payload = {
+        "Authorization": "Digest realm=PrivateRealm, nonce=NonceSecret, uri=/secret",
+        "order alphaidentifier": "KeySecret",
+        "nested": [{"deal": "DealToken", "ref": "ReferenceToken"}],
+    }
+    serialized = json.dumps(eod.sanitize(payload), sort_keys=True)
+    for marker in (
+        "PrivateRealm", "NonceSecret", "/secret", "alphaidentifier", "KeySecret",
+        "DealToken", "ReferenceToken",
+    ):
+        assert marker not in serialized

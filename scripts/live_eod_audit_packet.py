@@ -30,6 +30,12 @@ REFERENCE_KEY = re.compile(r"^(?:order_id|preview_id|account_ref|process_id|pid)
 TOKEN_TEXT = re.compile(r"(?i)(?:gh[opusr]_[A-Za-z0-9]{12,}|sk-[A-Za-z0-9_-]{12,}|bearer\s+\S+)")
 LONG_NUMBER = re.compile(r"(?<![\d.])\d{7,}(?![\d.])")
 TERMINAL_INTENTS = {"FILLED", "CANCELLED", "FAILED"}
+SENSITIVE_STRUCTURED_KEYS = {
+    "authorization", "account", "account_id", "account_ref", "account_reference",
+    "broker", "broker_id", "broker_ref", "broker_reference", "credential", "credentials",
+    "deal", "deal_id", "deal_ref", "deal_reference", "order", "order_id", "order_ref",
+    "order_reference", "password", "ref", "reference", "secret", "token",
+}
 
 
 def ref(value: Any) -> str | None:
@@ -38,14 +44,16 @@ def ref(value: Any) -> str | None:
 
 
 def sanitize(value: Any, key: str = "") -> Any:
-    if SENSITIVE_KEY.search(key):
-        return "[REDACTED]"
     if key == "freeze_reason" and value is not None:
         return freeze_reason_code(value)
+    normalized_key = re.sub(r"[\s-]+", "_", key.strip().casefold())
+    if (normalized_key in SENSITIVE_STRUCTURED_KEYS or SENSITIVE_KEY.search(key)
+            or str(redact(key)) != key):
+        return "[REDACTED]"
     if REFERENCE_KEY.match(key):
         return ref(value)
     if isinstance(value, dict):
-        return {str(k): sanitize(v, str(k)) for k, v in value.items()}
+        return {str(redact(str(k))): sanitize(v, str(k)) for k, v in value.items()}
     if isinstance(value, list):
         return [sanitize(v) for v in value]
     if isinstance(value, tuple):

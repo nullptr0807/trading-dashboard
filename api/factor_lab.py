@@ -362,7 +362,13 @@ async def factor_lab_run(req: FactorLabRunRequest):
         return await asyncio.to_thread(run_factor_lab, payload)
     except HTTPException:
         raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_FACTOR_LAB_REQUEST", "message": "Factor lab request is invalid."},
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "FACTOR_LAB_RUN_FAILED", "message": "Factor lab run failed."},
+        )

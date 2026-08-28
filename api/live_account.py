@@ -78,10 +78,37 @@ class EventRequest(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
-def _error(exc: Exception):
+_PUBLIC_ERROR_MESSAGES = {
+    "BROKER_OUTCOME_UNKNOWN": "Broker outcome is unknown; reconciliation is required.",
+    "CLEANUP_REJECTED": "Live strategy cleanup was rejected.",
+    "CONFIG_UPDATE_REJECTED": "Live strategy configuration update was rejected.",
+    "CONTROL_STATE_UNAVAILABLE": "Live strategy control state is unavailable.",
+    "LIVE_TRADE_REJECTED": "Live trade request was rejected.",
+    "MOOMOO_UNAVAILABLE": "Moomoo service is unavailable.",
+    "UNFREEZE_REJECTED": "Live strategy unfreeze was rejected.",
+}
+
+
+def _raise_public_error(status_code: int, code: str) -> None:
+    if code not in _PUBLIC_ERROR_MESSAGES:
+        code = "MOOMOO_UNAVAILABLE"
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": _PUBLIC_ERROR_MESSAGES[code]},
+    )
+
+
+def _exception_code(exc: Exception) -> str:
+    if isinstance(exc, BrokerOutcomeUnknown):
+        return "BROKER_OUTCOME_UNKNOWN"
     if isinstance(exc, LiveTradeRejected):
-        raise HTTPException(status_code=400, detail=str(exc))
-    raise HTTPException(status_code=503, detail=str(exc))
+        return "LIVE_TRADE_REJECTED"
+    return "MOOMOO_UNAVAILABLE"
+
+
+def _error(exc: Exception) -> None:
+    code = _exception_code(exc)
+    _raise_public_error(400 if code == "LIVE_TRADE_REJECTED" else 503, code)
 
 
 @router.get("/status")
@@ -113,8 +140,8 @@ async def live_control(x_moomoo_read_token: str = Header(default=""),
             "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
                             "loss_floor": 7_500, "regular_hours_only": True},
         }
-    except ControlRejected as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except ControlRejected:
+        _raise_public_error(503, "CONTROL_STATE_UNAVAILABLE")
 
 
 @router.get("/strategy")
@@ -152,8 +179,8 @@ async def live_strategy(event_limit: int = Query(100, ge=1, le=200),
                             "loss_floor": 7_500, "regular_hours_only": True},
             "data_scope": "strategy_subledger_only",
         }
-    except ControlRejected as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    except ControlRejected:
+        _raise_public_error(503, "CONTROL_STATE_UNAVAILABLE")
 
 
 @router.put("/control/config")
@@ -165,8 +192,8 @@ async def update_live_config(req: ConfigUpdateRequest,
             get_client().control.update_config, req.patch, req.expected_version,
             "dashboard", req.reason,
         )
-    except ControlRejected as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except ControlRejected:
+        _raise_public_error(409, "CONFIG_UPDATE_REJECTED")
 
 
 @router.post("/control/freeze")
@@ -206,8 +233,8 @@ async def unfreeze_live_system(req: ControlActionRequest,
         await asyncio.to_thread(client.current_sync_fingerprint)
         state = await asyncio.to_thread(client.control.unfreeze, req.reason, "dashboard")
         return {"state": asdict(state)}
-    except ControlRejected as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except ControlRejected:
+        _raise_public_error(409, "UNFREEZE_REJECTED")
 
 
 @router.post("/control/events")
@@ -248,8 +275,8 @@ async def cleanup_live_strategy(req: ControlActionRequest,
         )
         return {"cleaned": True, "archive_name": archive.name,
                 "state": asdict(get_client().control.snapshot())}
-    except (ControlRejected, MoomooUnavailable) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except (ControlRejected, MoomooUnavailable):
+        _raise_public_error(409, "CLEANUP_REJECTED")
 
 
 @router.get("/snapshot")
@@ -293,7 +320,7 @@ async def preview_order(req: OrderPreviewRequest, x_moomoo_read_token: str = Hea
         append_audit("preview", True, {**payload, "account_id": result.get("account_id")})
         return result
     except (MoomooUnavailable, LiveTradeRejected) as exc:
-        append_audit("preview", False, {**payload, "error": str(exc)})
+        append_audit("preview", False, {**payload, "error_code": _exception_code(exc)})
         _error(exc)
 
 
@@ -327,10 +354,12 @@ async def cancel_order(order_id: str, req: CancelOrderRequest,
         return result
     except BrokerOutcomeUnknown as exc:
         try:
-            append_audit("cancel_unknown", False, {"order_id": order_id, "error": str(exc)})
+            append_audit("cancel_unknown", False, {"order_id": order_id,
+                                                    "error_code": _exception_code(exc)})
         except Exception:
             pass
         _error(exc)
     except (MoomooUnavailable, LiveTradeRejected) as exc:
-        append_audit("cancel", False, {"order_id": order_id, "error": str(exc)})
+        append_audit("cancel", False, {"order_id": order_id,
+                                       "error_code": _exception_code(exc)})
         _error(exc)

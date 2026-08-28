@@ -30,8 +30,12 @@ async def list_posts():
         return JSONResponse({'posts': []})
     try:
         posts = json.loads(_INDEX.read_text(encoding='utf-8'))
-    except Exception as e:
-        return JSONResponse({'posts': [], 'error': str(e)}, status_code=500)
+    except Exception:
+        return JSONResponse({
+            'posts': [],
+            'error': {'code': 'EXPLORE_INDEX_UNAVAILABLE',
+                      'message': 'Explore index is unavailable.'},
+        }, status_code=500)
     posts = sorted(posts, key=lambda p: p.get('date', ''), reverse=True)
     return JSONResponse({'posts': posts})
 

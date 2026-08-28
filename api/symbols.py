@@ -132,8 +132,11 @@ def _yf_profile(ticker: str) -> dict:
         if out['industry']:
             out['industry_zh'] = _translate_zh(out['industry'])
         out['source'] = 'yfinance'
-    except Exception as e:
-        out['error'] = str(e)
+    except Exception:
+        out['error'] = {
+            'code': 'SYMBOL_PROFILE_UNAVAILABLE',
+            'message': 'Symbol profile is unavailable.',
+        }
     _PROFILE_CACHE[ticker] = (time.time(), out)
     return out
 

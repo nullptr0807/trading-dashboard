@@ -118,8 +118,12 @@ async def backtest_qlib_status(market: str = Query('US')):
     try:
         from factors.qlib_checkpoint import coverage_summary
         cov = coverage_summary(market)
-    except Exception as e:
-        cov = {"error": str(e), "market": market, "models": {}, "total_bytes": 0}
+    except Exception:
+        cov = {
+            "error": {"code": "CHECKPOINT_COVERAGE_UNAVAILABLE",
+                      "message": "Checkpoint coverage is unavailable."},
+            "market": market, "models": {}, "total_bytes": 0,
+        }
 
     earliest_full = None
     if cov.get("models"):
