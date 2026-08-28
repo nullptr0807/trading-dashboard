@@ -263,6 +263,7 @@ def load_b16_signal_batch(
                         (strategy_id, timestamp_text(now), cutoff_date.isoformat()),
                     ).fetchone()
                     _require_connection_path(con)
+                    require_store_not_quarantined(lock_descriptor)
                 except sqlite3.Error as exc:
                     raise SignalAdapterError("Unable to read B16 publication store") from exc
                 if row is None:

@@ -250,6 +250,10 @@ def _require_owned_mode(path: Path, *, directory: bool) -> None:
 
 def validate_store_permissions(path: str | Path, *, store_may_be_missing: bool = False) -> None:
     destination = _store_path(path)
+    guard_directory = destination.parent.parent
+    if not guard_directory.exists():
+        raise PublicationError("publication guard directory is missing")
+    _require_owned_mode(guard_directory, directory=True)
     if not destination.parent.exists():
         if store_may_be_missing:
             return
@@ -404,7 +408,36 @@ def _require_directory_descriptor_path(
             or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
         raise PublicationError(f"{label.capitalize()} path was replaced")
     if private and (opened.st_uid != os.getuid() or opened.st_mode & 0o022):
-        raise PublicationError("Publication store directory owner or permissions are unsafe")
+        raise PublicationError(f"{label.capitalize()} owner or permissions are unsafe")
+
+
+@dataclass(frozen=True)
+class _PublicationLockScope:
+    destination: Path
+    guard_descriptor: int
+    directory_descriptor: int
+
+
+_lock_scopes_guard = threading.Lock()
+_lock_scopes: dict[int, _PublicationLockScope] = {}
+
+
+def _require_lock_scope(path: str | Path, lock_descriptor: int) -> None:
+    """Revalidate every inode and permission boundary held by a publication lock."""
+    destination = _store_path(path)
+    with _lock_scopes_guard:
+        scope = _lock_scopes.get(lock_descriptor)
+    if scope is None or scope.destination != destination:
+        raise PublicationError("Publication store lock scope is unverifiable")
+    _require_directory_descriptor_path(
+        destination.parent.parent, scope.guard_descriptor,
+        label="publication guard directory", private=True,
+    )
+    _require_directory_descriptor_path(
+        destination.parent, scope.directory_descriptor,
+        label="publication store directory", private=True,
+    )
+    _require_descriptor_path(_lock_path(destination), lock_descriptor)
 
 
 def _flock_until(descriptor: int, operation: int, deadline: float) -> None:
@@ -495,8 +528,13 @@ def _clear_path_quarantine(destination: Path) -> None:
     try:
         _require_directory_descriptor_path(
             guard_directory, guard_descriptor, label="publication guard directory",
+            private=True,
         )
         os.unlink(_path_quarantine_name(destination), dir_fd=guard_descriptor)
+        _require_directory_descriptor_path(
+            guard_directory, guard_descriptor, label="publication guard directory",
+            private=True,
+        )
         os.fsync(guard_descriptor)
     except FileNotFoundError:
         return
@@ -534,15 +572,24 @@ def publication_lock(
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     replacement_error: PublicationError | None = None
     try:
-        _ensure_private_store_parent(destination)
         guard_descriptor = _open_directory(guard_directory, label="publication guard directory")
+        _require_directory_descriptor_path(
+            guard_directory, guard_descriptor, label="publication guard directory",
+            private=True,
+        )
         _flock_until(guard_descriptor, operation, deadline)
+        _require_directory_descriptor_path(
+            guard_directory, guard_descriptor, label="publication guard directory",
+            private=True,
+        )
+        _ensure_private_store_parent(destination)
         directory_descriptor = _open_directory(
             publication_directory, label="publication store directory",
         )
         _flock_until(directory_descriptor, operation, deadline)
         _require_directory_descriptor_path(
             guard_directory, guard_descriptor, label="publication guard directory",
+            private=True,
         )
         _require_directory_descriptor_path(
             publication_directory, directory_descriptor, label="publication store directory",
@@ -576,10 +623,19 @@ def publication_lock(
         _require_descriptor_path(lock_path, lock_descriptor)
         if destination.exists() or destination.is_symlink():
             _require_owned_mode(destination, directory=False)
+        with _lock_scopes_guard:
+            _lock_scopes[lock_descriptor] = _PublicationLockScope(
+                destination, guard_descriptor, directory_descriptor,
+            )
+        _require_lock_scope(destination, lock_descriptor)
         yield lock_descriptor
     finally:
         if guard_descriptor is not None and directory_descriptor is not None:
             try:
+                _require_directory_descriptor_path(
+                    guard_directory, guard_descriptor,
+                    label="publication guard directory", private=True,
+                )
                 _require_directory_descriptor_path(
                     publication_directory, directory_descriptor,
                     label="publication store directory", private=True,
@@ -589,17 +645,16 @@ def publication_lock(
             except PublicationError as exc:
                 replacement_error = exc
                 try:
-                    _require_directory_descriptor_path(
-                        guard_directory, guard_descriptor,
-                        label="publication guard directory",
-                    )
                     _set_path_quarantine(
                         guard_descriptor, quarantine_name, directory_descriptor, str(exc),
                     )
                 except PublicationError:
-                    # Preserve the original replacement finding.  A missing or
-                    # unsafe guard path independently makes future opens fail.
+                    # Preserve the original drift finding. An unsafe or missing
+                    # guard path independently makes future opens fail closed.
                     pass
+        if lock_descriptor is not None:
+            with _lock_scopes_guard:
+                _lock_scopes.pop(lock_descriptor, None)
         for descriptor in (lock_descriptor, directory_descriptor, guard_descriptor):
             if descriptor is not None:
                 try:
@@ -613,23 +668,41 @@ def publication_lock(
 
 def set_store_quarantine(descriptor: int, state: dict[str, Any] | None) -> None:
     """Durably mark an append as unresolved, or clear it after commit proof."""
+    with _lock_scopes_guard:
+        scope = _lock_scopes.get(descriptor)
+    if scope is None:
+        raise PublicationError("Publication store lock scope is unverifiable")
+    _require_lock_scope(scope.destination, descriptor)
     content = b"" if state is None else canonical_json(state).encode("utf-8")
     os.lseek(descriptor, 0, os.SEEK_SET)
     os.ftruncate(descriptor, 0)
     if content:
         os.write(descriptor, content)
     os.fsync(descriptor)
+    _require_lock_scope(scope.destination, descriptor)
 
 
 def require_store_not_quarantined(descriptor: int) -> None:
+    with _lock_scopes_guard:
+        scope = _lock_scopes.get(descriptor)
+    if scope is None:
+        raise PublicationError("Publication store lock scope is unverifiable")
+    _require_lock_scope(scope.destination, descriptor)
     os.lseek(descriptor, 0, os.SEEK_SET)
     if os.read(descriptor, 65536).strip():
         raise PublicationError("Publication store has an unresolved append quarantine")
+    _require_lock_scope(scope.destination, descriptor)
 
 
 def _quarantine_state(descriptor: int) -> dict[str, Any] | None:
+    with _lock_scopes_guard:
+        scope = _lock_scopes.get(descriptor)
+    if scope is None:
+        raise PublicationError("Publication store lock scope is unverifiable")
+    _require_lock_scope(scope.destination, descriptor)
     os.lseek(descriptor, 0, os.SEEK_SET)
     raw = os.read(descriptor, 65536).strip()
+    _require_lock_scope(scope.destination, descriptor)
     if not raw:
         return None
     try:
@@ -648,7 +721,7 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
         return
     con = initialize_store(path)
     try:
-        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_lock_scope(path, descriptor)
         _require_connection_path(con)
         validate_store_schema(con)
         con.execute("BEGIN IMMEDIATE")
@@ -659,10 +732,10 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
         ).fetchone()
         if row is None:
             # BEGIN IMMEDIATE plus the process-wide exclusive lock proves absence.
-            _require_descriptor_path(_lock_path(path), descriptor)
+            _require_lock_scope(path, descriptor)
             _require_connection_path(con)
             con.commit()
-            _require_descriptor_path(_lock_path(path), descriptor)
+            _require_lock_scope(path, descriptor)
             _require_connection_path(con)
             set_store_quarantine(descriptor, None)
             return
@@ -686,10 +759,10 @@ def _recover_locked(path: str | Path, descriptor: int) -> None:
                 "VALUES(?,?,?)",
                 (int(material["publication_id"]), timestamp_text(datetime.now(timezone.utc)), reason),
             )
-        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_lock_scope(path, descriptor)
         _require_connection_path(con)
         con.commit()
-        _require_descriptor_path(_lock_path(path), descriptor)
+        _require_lock_scope(path, descriptor)
         _require_connection_path(con)
         set_store_quarantine(descriptor, None)
     except Exception:
@@ -716,7 +789,7 @@ def recover_publication_store(
             validate_store_schema(con)
         finally:
             con.close()
-        _require_descriptor_path(_lock_path(publication_db_path), descriptor)
+        _require_lock_scope(publication_db_path, descriptor)
         _clear_path_quarantine(_store_path(publication_db_path))
 
 
@@ -1014,6 +1087,10 @@ def publish_b16_signal(
         raise PublicationError("Crash injection is test-only")
     if publish and not test_mode:
         require_canonical_paths(source_db_path, factors_path, publication_db_path)
+    if not test_mode:
+        # Dry-runs must fail closed on the same publication trust boundary as
+        # writes; do not postpone permission-drift discovery until deployment.
+        validate_store_permissions(publication_db_path, store_may_be_missing=True)
     get_now = clock or (lambda: datetime.now(timezone.utc))
     called_at = utc_datetime(get_now(), label="clock")
     calendar, cutoff_date = latest_completed_session(called_at)
@@ -1060,7 +1137,7 @@ def publish_b16_signal(
             _recover_locked(publication_db_path, lock_descriptor)
         require_store_not_quarantined(lock_descriptor)
         con = initialize_store(publication_db_path)
-        _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+        _require_lock_scope(publication_db_path, lock_descriptor)
         _require_connection_path(con)
         quarantine_set = False
         commit_attempted = False
@@ -1136,7 +1213,7 @@ def publish_b16_signal(
             if _test_crash_at == "after_insert":
                 raise _SimulatedPublicationCrash()
             commit_attempted = True
-            _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+            _require_lock_scope(publication_db_path, lock_descriptor)
             _require_connection_path(con)
             con.commit()
             if _test_crash_at == "after_commit":
@@ -1152,15 +1229,15 @@ def publish_b16_signal(
                     (publication_id, timestamp_text(committed_returned_at),
                      "append commit did not complete before eligible_at"),
                 )
-                _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+                _require_lock_scope(publication_db_path, lock_descriptor)
                 _require_connection_path(con)
                 con.commit()
-                _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+                _require_lock_scope(publication_db_path, lock_descriptor)
                 _require_connection_path(con)
                 set_store_quarantine(lock_descriptor, None)
                 quarantine_set = False
                 raise PublicationError("Publication commit missed eligibility and was revoked")
-            _require_descriptor_path(_lock_path(publication_db_path), lock_descriptor)
+            _require_lock_scope(publication_db_path, lock_descriptor)
             _require_connection_path(con)
             set_store_quarantine(lock_descriptor, None)
             quarantine_set = False

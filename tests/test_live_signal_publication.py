@@ -524,6 +524,95 @@ def test_permission_drift_fails_closed_immediately(tmp_path, target, mode):
         _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
+@pytest.mark.parametrize("mode", [0o777, 0o775])
+def test_guard_directory_writable_modes_fail_closed(tmp_path, mode):
+    guard = tmp_path / f"guard-{mode:o}"
+    guard.mkdir(mode=mode)
+    os.chmod(guard, mode)
+    store = guard / "private" / "pub.db"
+
+    with pytest.raises(PublicationError, match="guard directory.*permissions|permissions.*guard"):
+        with publication_lock(store, exclusive=True):
+            pass
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o700])
+def test_guard_directory_nonwritable_modes_are_accepted(tmp_path, mode):
+    guard = tmp_path / f"guard-{mode:o}"
+    guard.mkdir(mode=mode)
+    os.chmod(guard, mode)
+    store = guard / "private" / "pub.db"
+
+    with publication_lock(store, exclusive=True):
+        pass
+
+
+def test_guard_directory_symlink_fails_closed(tmp_path):
+    actual_guard = tmp_path / "actual-guard"
+    actual_guard.mkdir(mode=0o755)
+    guard = tmp_path / "guard"
+    guard.symlink_to(actual_guard, target_is_directory=True)
+
+    with pytest.raises(PublicationError, match="safely open.*guard|path type is unsafe"):
+        with publication_lock(guard / "private" / "pub.db", exclusive=True):
+            pass
+
+
+def test_guard_directory_owner_must_match_current_uid(tmp_path, monkeypatch):
+    guard = tmp_path / "guard"
+    guard.mkdir(mode=0o755)
+    monkeypatch.setattr(os, "getuid", lambda: guard.stat().st_uid + 1)
+
+    with pytest.raises(PublicationError, match="guard directory.*owner|owner.*guard"):
+        with publication_lock(guard / "private" / "pub.db", exclusive=True):
+            pass
+
+
+def test_guard_permission_drift_while_locked_is_detected_and_quarantined(tmp_path):
+    guard = tmp_path / "guard"
+    guard.mkdir(mode=0o755)
+    store = guard / "private" / "pub.db"
+
+    with pytest.raises(PublicationError, match="guard directory.*permissions|permissions.*guard"):
+        with publication_lock(store, exclusive=True):
+            os.chmod(guard, 0o775)
+
+    os.chmod(guard, 0o755)
+    with pytest.raises(PublicationError, match="quarantine"):
+        with publication_lock(store, exclusive=False):
+            pass
+
+
+def test_guard_replacement_while_locked_is_detected_and_quarantined(tmp_path):
+    guard = tmp_path / "guard"
+    guard.mkdir(mode=0o755)
+    displaced = tmp_path / "guard.displaced"
+    store = guard / "private" / "pub.db"
+
+    with pytest.raises(PublicationError, match="guard directory.*replaced|replaced.*guard"):
+        with publication_lock(store, exclusive=True):
+            guard.rename(displaced)
+            guard.mkdir(mode=0o755)
+
+    guard.rmdir()
+    displaced.rename(guard)
+    with pytest.raises(PublicationError, match="quarantine"):
+        with publication_lock(store, exclusive=False):
+            pass
+
+
+def test_production_dry_run_rejects_untrusted_guard_before_source_reads(tmp_path):
+    guard = tmp_path / "guard"
+    guard.mkdir(mode=0o775)
+    os.chmod(guard, 0o775)
+
+    with pytest.raises(PublicationError, match="permissions"):
+        publish_b16_signal(
+            tmp_path / "missing-source.db", tmp_path / "missing-factors.json",
+            guard / "private" / "pub.db",
+        )
+
+
 def test_owner_drift_fails_closed(tmp_path, monkeypatch):
     values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
     source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
