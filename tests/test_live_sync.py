@@ -1414,3 +1414,213 @@ def test_net_zero_manual_activity_is_allowed_when_broker_still_covers_owned_qty(
     assert result["ok"] is True
     assert store.owned_quantity("US.AAPL") == 2
     assert store.manual_conflict_symbols() == set()
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda data: data["orders"][0].update(qty=float("nan")),
+    lambda data: data["orders"][0].update(qty=-1),
+    lambda data: data["orders"][0].update(dealt_qty=-1),
+    lambda data: data["orders"][0].update(dealt_qty=float("nan")),
+    lambda data: data["orders"][0].update(qty=1, dealt_qty=2),
+    lambda data: data["orders"][0].update(price=float("inf")),
+    lambda data: data["deals"][0].update(deal_qty=-1),
+    lambda data: data["deals"][0].update(deal_price=float("nan")),
+    lambda data: data["deals"][0].update(deal_fee=float("inf")),
+    lambda data: data["deals"][0].update(deal_fee=-1),
+    lambda data: data["order_fees"][0].update(fee_amount=float("nan")),
+    lambda data: data["order_fees"][0].update(fee_amount=-1),
+])
+def test_module_owned_invalid_economics_latch_permanent_freeze(tmp_path, mutation):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    mutation(data)
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid|negative|contradictory"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    state = store.snapshot()
+    assert state.lifecycle == "FROZEN"
+    assert state.freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    event = store.recent_events(1)[0]
+    assert event["event_type"] == "reconciliation_snapshot_numeric_conflict"
+    assert set(event["details"]) == {"symbol", "conflicting_fields"}
+    assert store.positions() == []
+
+
+def test_invalid_economics_replaces_only_recoverable_auto_freeze(tmp_path):
+    store = active_store(tmp_path)
+    with store.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+            "freeze_reason='auto_post_broker_reconciliation_failed' WHERE id=1"
+        )
+    client = FakeClient()
+    data = client.snapshot()
+    data["order_fees"][0]["fee_amount"] = float("nan")
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+
+
+@pytest.mark.parametrize("target,aliases", [
+    ("order_fees", {"fee_amount": 1, "total_fee": 2.0}),
+    ("order_fees", {"fee_amount": 1, "commission": 2.0}),
+    ("deals", {"deal_fee": 1, "fee_amount": 2.0}),
+    ("deals", {"deal_fee": 1, "commission": 2.0}),
+])
+def test_module_fee_alias_conflict_latches_permanent_freeze(tmp_path, target, aliases):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data[target][0].update(aliases)
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="conflicting"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
+
+
+def test_equal_module_fee_aliases_are_canonicalized(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["order_fees"][0].update(total_fee=1, fee_amount=1.0, commission=1.0)
+    data["deals"][0].update(deal_fee=1, fee_amount=1.0, commission=1.0)
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.0)
+
+
+def test_shared_restricted_ignores_invalid_fee_on_unrelated_manual_order(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode="SHARED_RESTRICTED",
+        dedicated_account_confirmed=False,
+        shared_account_risk_accepted=True,
+        trading_enabled=True,
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["order_fees"].append({"order_id": "manual-order", "fee_amount": float("nan")})
+    data["positions"].append({"code": "US.MSFT", "qty": 50})
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert store.snapshot().lifecycle == "ACTIVE"
+
+
+def _buy_then_partial_sell_snapshot(*, buy_fee_known: bool, sell_fee_known: bool = True) -> dict:
+    data = FakeClient().snapshot()
+    buy = data["orders"][0]
+    buy_deal = data["deals"][0]
+    if buy_fee_known:
+        buy_deal["deal_fee"] = 0.6
+    sell = {
+        "order_id": "module-sell", "code": "US.AAPL", "trd_side": "SELL",
+        "order_status": "FILLED_ALL", "qty": 1, "dealt_qty": 1, "price": 110,
+        "remark": "dashboard:B16:sell-preview",
+    }
+    sell_deal = {
+        "deal_id": "module-sell-deal", "order_id": "module-sell", "code": "US.AAPL",
+        "trd_side": "SELL", "deal_qty": 1, "deal_price": 110,
+    }
+    if sell_fee_known:
+        sell_deal["deal_fee"] = 0.2
+    data.update(
+        orders=[buy, sell],
+        deals=[buy_deal, sell_deal],
+        order_fees=[
+            {"order_id": "module-order", "fee_amount": 1.0},
+            {"order_id": "module-sell", "fee_amount": 0.5},
+        ],
+        positions=[{"code": "US.AAPL", "qty": 1}],
+    )
+    return data
+
+
+def _run_buy_fee_path(tmp_path, *, delayed: bool):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    first = client.snapshot()
+    if not delayed:
+        first["deals"][0]["deal_fee"] = 0.6
+    client.snapshot = lambda: first
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    sold = _buy_then_partial_sell_snapshot(buy_fee_known=not delayed)
+    client.snapshot = lambda: sold
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    if delayed:
+        final = _buy_then_partial_sell_snapshot(buy_fee_known=True)
+        client.snapshot = lambda: final
+        reconcile(client, store, ownership_proof=lambda *_: True)
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    position = store.positions()[0]
+    state = store.snapshot()
+    return position, state, store.execution_summary()
+
+
+def test_delayed_stable_buy_fee_matches_immediate_path_after_partial_sell(tmp_path):
+    immediate = _run_buy_fee_path(tmp_path / "immediate", delayed=False)
+    delayed = _run_buy_fee_path(tmp_path / "delayed", delayed=True)
+
+    immediate_position, immediate_state, immediate_execution = immediate
+    delayed_position, delayed_state, delayed_execution = delayed
+    for field in ("quantity", "average_cost", "realized_pnl", "market_value"):
+        assert delayed_position[field] == pytest.approx(immediate_position[field])
+    for field in (
+        "allocated_cash", "strategy_equity", "realized_pnl", "unrealized_pnl",
+    ):
+        assert getattr(delayed_state, field) == pytest.approx(getattr(immediate_state, field))
+    assert delayed_execution["total_fees"] == pytest.approx(immediate_execution["total_fees"])
+
+
+def _run_sell_fee_path(tmp_path, *, delayed: bool):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    first = client.snapshot()
+    first["deals"][0]["deal_fee"] = 0.6
+    client.snapshot = lambda: first
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    sold = _buy_then_partial_sell_snapshot(
+        buy_fee_known=True, sell_fee_known=not delayed,
+    )
+    client.snapshot = lambda: sold
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    if delayed:
+        final = _buy_then_partial_sell_snapshot(
+            buy_fee_known=True, sell_fee_known=True,
+        )
+        client.snapshot = lambda: final
+        reconcile(client, store, ownership_proof=lambda *_: True)
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    return store.positions()[0], store.snapshot(), store.execution_summary()
+
+
+def test_delayed_stable_sell_fee_matches_immediate_path(tmp_path):
+    immediate = _run_sell_fee_path(tmp_path / "immediate", delayed=False)
+    delayed = _run_sell_fee_path(tmp_path / "delayed", delayed=True)
+
+    for field in ("quantity", "average_cost", "realized_pnl", "market_value"):
+        assert delayed[0][field] == pytest.approx(immediate[0][field])
+    for field in (
+        "allocated_cash", "strategy_equity", "realized_pnl", "unrealized_pnl",
+    ):
+        assert getattr(delayed[1], field) == pytest.approx(getattr(immediate[1], field))
+    assert delayed[2]["total_fees"] == pytest.approx(immediate[2]["total_fees"])

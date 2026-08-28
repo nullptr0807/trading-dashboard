@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import core.live_strategy_control as live_control
 from core.live_strategy_control import (
     ControlRejected, EXPOSURE_CAP, INITIAL_CAPITAL, LOSS_FLOOR, LiveStrategyStore, utcnow,
 )
@@ -248,13 +249,38 @@ def test_concurrent_first_open_serializes_schema_migration(tmp_path):
     assert failures == []
     with sqlite3.connect(path) as con:
         assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 1
         columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
         assert {"fee_is_stable", "order_hash"} <= columns
+        state_columns = {row[1] for row in con.execute("PRAGMA table_info(strategy_state)")}
+        assert "required_sync_after" in state_columns
+        proof_columns = {row[1] for row in con.execute("PRAGMA table_info(broker_sync_proof)")}
+        assert "control_generation" in proof_columns
+        indexes = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+        assert {"one_active_config", "auto_order_intents_status"} <= indexes
         assert con.execute("SELECT COUNT(*) FROM strategy_state").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM strategy_config WHERE active=1").fetchone()[0] == 1
+
+    # Reopening an already migrated database is idempotent.
+    LiveStrategyStore(path, tmp_path / "archives").snapshot()
+    with sqlite3.connect(path) as con:
+        assert con.execute("SELECT COUNT(*) FROM strategy_state").fetchone()[0] == 1
+        assert con.execute("SELECT COUNT(*) FROM strategy_config WHERE active=1").fetchone()[0] == 1
 
 
-def test_concurrent_process_first_open_is_retry_safe(tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_concurrent_process_first_open_is_retry_safe(tmp_path, legacy):
     path = tmp_path / "processes.db"
+    if legacy:
+        with sqlite3.connect(path) as con:
+            con.execute("""CREATE TABLE applied_fills (
+                fill_hash TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                quantity REAL NOT NULL, price REAL NOT NULL, fee REAL NOT NULL,
+                applied_at TEXT NOT NULL
+            )""")
     code = (
         "from core.live_strategy_control import LiveStrategyStore;"
         f"LiveStrategyStore({str(path)!r}, {str(tmp_path / 'archives')!r}).snapshot()"
@@ -269,3 +295,24 @@ def test_concurrent_process_first_open_is_retry_safe(tmp_path):
     with sqlite3.connect(path) as con:
         assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
+        assert {"fee_is_stable", "order_hash"} <= columns
+        assert con.execute("SELECT COUNT(*) FROM strategy_state").fetchone()[0] == 1
+
+
+def test_wal_initialization_fails_closed_after_bounded_lock_timeout(tmp_path, monkeypatch):
+    class LockedConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(live_control, "SQLITE_BUSY_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(live_control.sqlite3, "connect", lambda *_args, **_kwargs: LockedConnection())
+
+    with pytest.raises(sqlite3.OperationalError, match="Timed out enabling WAL journal mode"):
+        LiveStrategyStore(tmp_path / "locked.db", tmp_path / "archives")

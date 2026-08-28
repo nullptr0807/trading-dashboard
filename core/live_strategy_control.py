@@ -15,6 +15,7 @@ import re
 import sqlite3
 import tarfile
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "data" / "live_strategy_arch
 INITIAL_CAPITAL = 10_000.0
 EXPOSURE_CAP = 10_000.0
 LOSS_FLOOR = 7_500.0
+SQLITE_BUSY_TIMEOUT_SECONDS = 20.0
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_id": "B16",
@@ -125,7 +127,10 @@ class LiveStrategyStore:
     def connect(self):
         if self.read_only:
             resolved = self.path.expanduser().resolve(strict=True)
-            con = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True, timeout=20)
+            con = sqlite3.connect(
+                f"{resolved.as_uri()}?mode=ro", uri=True,
+                timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+            )
             con.row_factory = sqlite3.Row
             con.execute("PRAGMA query_only=ON")
             try:
@@ -134,13 +139,13 @@ class LiveStrategyStore:
                 con.close()
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(str(self.path), timeout=20)
+        con = sqlite3.connect(str(self.path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         con.row_factory = sqlite3.Row
         try:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
-        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
         con.execute("PRAGMA foreign_keys=ON")
         try:
             yield con
@@ -148,7 +153,40 @@ class LiveStrategyStore:
         finally:
             con.close()
 
+    def _enable_wal_mode(self) -> None:
+        """Enable WAL outside migration transactions, retrying SQLite's immediate BUSY."""
+        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_SECONDS
+        delay = 0.001
+        while True:
+            try:
+                with sqlite3.connect(
+                    str(self.path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+                ) as con:
+                    con.execute(
+                        f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
+                    )
+                    if str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                        return
+                    mode = str(con.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+                    if mode != "wal":
+                        raise sqlite3.OperationalError(
+                            f"SQLite refused WAL journal mode (reported {mode!r})"
+                        )
+                    return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise sqlite3.OperationalError(
+                        "Timed out enabling WAL journal mode before schema initialization"
+                    ) from exc
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 0.05)
+
     def _initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._enable_wal_mode()
         with self.connect() as con:
             # executescript commits a transaction opened before it, so acquire
             # the migration lock inside the script itself.
@@ -1497,12 +1535,56 @@ class LiveStrategyStore:
                 float(binding["fee_delta"]) for binding in stable_fee_bindings
             )
             cash -= fee_cash_delta + stable_fee_cash_delta
-            for binding in stable_fee_bindings:
-                if binding["fee_delta"]:
-                    positions[binding["symbol"]]["realized_pnl"] = (
-                        float(positions[binding["symbol"]]["realized_pnl"])
-                        - float(binding["fee_delta"])
-                    )
+
+            # A stable per-deal fee is part of that fill's original economics.
+            # Replaying the affected symbol makes a late fee indistinguishable
+            # from one present on first observation, including after partial sells.
+            if stable_fee_bindings:
+                fee_overrides = {
+                    str(binding["fill_hash"]): float(binding["fee"])
+                    for binding in stable_fee_bindings
+                }
+                affected_symbols = {
+                    str(binding["symbol"]) for binding in stable_fee_bindings
+                }
+                persisted_fills = con.execute(
+                    "SELECT rowid,fill_hash,symbol,side,quantity,price,fee "
+                    "FROM applied_fills ORDER BY rowid"
+                ).fetchall()
+                replay_fills = [dict(row) for row in persisted_fills]
+                replay_fills.extend(staged)
+                for symbol in affected_symbols:
+                    quantity = average_cost = realized = 0.0
+                    for fill in replay_fills:
+                        if str(fill["symbol"]) != symbol:
+                            continue
+                        fill_quantity = float(fill["quantity"])
+                        fill_price = float(fill["price"])
+                        fill_fee = fee_overrides.get(
+                            str(fill["fill_hash"]), float(fill["fee"])
+                        )
+                        if str(fill["side"]) == "BUY":
+                            new_quantity = quantity + fill_quantity
+                            average_cost = (
+                                quantity * average_cost + fill_quantity * fill_price + fill_fee
+                            ) / new_quantity
+                            quantity = new_quantity
+                        else:
+                            if fill_quantity > quantity + 1e-9:
+                                raise ControlRejected(
+                                    "Stable fee replay exceeds strategy-owned quantity"
+                                )
+                            realized += fill_quantity * (fill_price - average_cost) - fill_fee
+                            quantity = max(0.0, quantity - fill_quantity)
+                            if quantity == 0:
+                                average_cost = 0.0
+                    expected_quantity = float(positions[symbol]["quantity"])
+                    if abs(quantity - expected_quantity) > 1e-9:
+                        raise ControlRejected(
+                            "Stable fee replay disagrees with strategy-owned quantity"
+                        )
+                    positions[symbol]["average_cost"] = average_cost
+                    positions[symbol]["realized_pnl"] = realized
 
             market_value = unrealized = realized_total = 0.0
             for symbol, position in positions.items():

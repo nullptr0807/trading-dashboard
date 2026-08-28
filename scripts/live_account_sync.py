@@ -99,17 +99,20 @@ def fee_number(row: dict[str, Any], key: str, *, source: str) -> float:
 
 
 def fee_total(row: dict[str, Any]) -> float:
-    for key in ("total_fee", "fee_amount", "total_fees"):
-        if row.get(key) is not None:
-            value = fee_number(row, key, source="fee record")
-            if value < 0:
-                raise ControlRejected("Moomoo fee record contains a negative amount")
-            return value
+    aliases = ("total_fee", "fee_amount", "total_fees", "commission")
+    values = [
+        fee_number(row, key, source="fee record")
+        for key in aliases if row.get(key) is not None
+    ]
+    if any(value < 0 for value in values):
+        raise ControlRejected("Moomoo fee record contains a negative amount")
+    if values:
+        if any(value != values[0] for value in values[1:]):
+            raise ControlRejected("Moomoo fee record contains conflicting fee aliases")
+        return values[0]
     values = [
         fee_number(row, key, source="fee record") if row.get(key) is not None else 0.0
-        for key in (
-            "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee"
-        )
+        for key in ("platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee")
     ]
     if any(value < 0 for value in values):
         raise ControlRejected("Moomoo fee record contains a negative component")
@@ -136,15 +139,18 @@ def deal_number(deal: dict[str, Any], primary: str, alias: str) -> float:
 
 def deal_fee(deal: dict[str, Any]) -> float | None:
     """Return a Broker-provided per-deal fee, never an inferred allocation."""
-    for key in ("deal_fee", "fee_amount", "total_fee", "total_fees"):
-        if deal.get(key) is not None:
-            value = fee_number(deal, key, source="deal fee")
-            if value < 0:
-                raise ControlRejected("Moomoo deal fee contains a negative amount")
-            return value
-    component_keys = (
-        "commission", "platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee",
-    )
+    aliases = ("deal_fee", "fee_amount", "total_fee", "total_fees", "commission")
+    values = [
+        fee_number(deal, key, source="deal fee")
+        for key in aliases if deal.get(key) is not None
+    ]
+    if any(value < 0 for value in values):
+        raise ControlRejected("Moomoo deal fee contains a negative amount")
+    if values:
+        if any(value != values[0] for value in values[1:]):
+            raise ControlRejected("Moomoo deal fee contains conflicting fee aliases")
+        return values[0]
+    component_keys = ("platform_fee", "settlement_fee", "stamp_duty", "sec_fee", "taf_fee")
     if any(deal.get(key) is not None for key in component_keys):
         values = [
             fee_number(deal, key, source="deal fee") if deal.get(key) is not None else 0.0
@@ -165,6 +171,17 @@ def normalized_deal_identity(deal: dict[str, Any]) -> tuple[str, str, float, flo
         deal_number(deal, "deal_price", "price"),
         deal_fee(deal),
     )
+
+
+def order_number(order: dict[str, Any], key: str) -> float:
+    """Read required module-order economics without coercing bad data to zero."""
+    try:
+        value = float(order[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ControlRejected("Moomoo module order contains an invalid numeric value") from exc
+    if not math.isfinite(value):
+        raise ControlRejected("Moomoo module order contains an invalid numeric value")
+    return value
 
 
 def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> dict[str, Any]:
@@ -205,18 +222,32 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         if not order_id or not preview_id or not proof(order_id, preview_id):
             raise ControlRejected("Unproven dashboard order remark; possible ownership forgery")
         previous_order = module_orders.get(order_id)
+        symbol = str(row.get("code") or "").strip().upper()
+        try:
+            quantity = order_number(row, "qty")
+            price = order_number(row, "price")
+            dealt_quantity = order_number(row, "dealt_qty")
+            if quantity <= 0 or price < 0 or dealt_quantity < 0:
+                raise ControlRejected("Moomoo module order contains negative or invalid economics")
+            if dealt_quantity > quantity + 1e-9:
+                raise ControlRejected("Moomoo module order contains contradictory quantities")
+        except ControlRejected:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", symbol, ["quantity", "price"],
+                "Authorized module order contains invalid numeric economics",
+            )
+            raise
         if previous_order is not None:
             fields = ("symbol", "side", "quantity", "price", "quantity")
             old_identity = (
                 str(previous_order.get("code") or "").strip().upper(),
                 str(previous_order.get("trd_side") or "").strip().upper(),
-                number(previous_order, "qty"), number(previous_order, "price"),
-                number(previous_order, "dealt_qty"),
+                order_number(previous_order, "qty"), order_number(previous_order, "price"),
+                order_number(previous_order, "dealt_qty"),
             )
             new_identity = (
-                str(row.get("code") or "").strip().upper(),
-                str(row.get("trd_side") or "").strip().upper(),
-                number(row, "qty"), number(row, "price"), number(row, "dealt_qty"),
+                symbol, str(row.get("trd_side") or "").strip().upper(),
+                quantity, price, dealt_quantity,
             )
             if old_identity != new_identity:
                 store.latch_reconciliation_snapshot_conflict(
@@ -241,7 +272,8 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             continue
         symbol = str(deal.get("code") or "").strip().upper()
         try:
-            deal_number(deal, "deal_qty", "qty")
+            if deal_number(deal, "deal_qty", "qty") <= 0:
+                raise ControlRejected("Moomoo deal contains a negative or invalid quantity")
         except ControlRejected:
             store.latch_reconciliation_snapshot_conflict(
                 "numeric", symbol, ["quantity"],
@@ -249,11 +281,20 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             )
             raise
         try:
-            deal_number(deal, "deal_price", "price")
+            if deal_number(deal, "deal_price", "price") <= 0:
+                raise ControlRejected("Moomoo deal contains a negative or invalid price")
         except ControlRejected:
             store.latch_reconciliation_snapshot_conflict(
                 "numeric", symbol, ["price"],
                 "Broker deal price aliases are invalid or contradictory",
+            )
+            raise
+        try:
+            deal_fee(deal)
+        except ControlRejected:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", symbol, ["fee"],
+                "Broker deal fee aliases are invalid, negative, or contradictory",
             )
             raise
         order_symbol = str(order.get("code") or "").strip().upper()
@@ -289,9 +330,19 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         if row.get("order_id") is None:
             continue
         order_id = str(row.get("order_id"))
-        total = fee_total(row)
+        if order_id not in module_orders:
+            continue
+        try:
+            total = fee_total(row)
+        except ControlRejected:
+            order = module_orders[order_id]
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", str(order.get("code") or ""), ["fee"],
+                "Authorized module order fee aliases are invalid, negative, or contradictory",
+            )
+            raise
         if order_id in fee_by_order and fee_by_order[order_id] != total:
-            order = module_orders.get(order_id, {})
+            order = module_orders[order_id]
             store.latch_reconciliation_snapshot_conflict(
                 "numeric", str(order.get("code") or ""), ["fee"],
                 "Broker snapshot repeated an order fee reference with conflicting totals",
@@ -335,18 +386,30 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     # Broker order rows can lead deal-detail rows. Never publish a sync proof
     # until both views agree, including when no deal row has arrived at all.
     for order_id, order in module_orders.items():
-        order_qty = number(order, "qty")
-        dealt_qty = number(order, "dealt_qty")
+        order_qty = order_number(order, "qty")
+        dealt_qty = order_number(order, "dealt_qty")
         deal_qty_total = sum(
             deal_number(deal, "deal_qty", "qty")
             for deal in deals_by_order.get(order_id, [])
         )
         if order_qty <= 0 or dealt_qty < 0 or dealt_qty > order_qty + 1e-9:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", str(order.get("code") or ""), ["quantity"],
+                "Authorized module order quantities are invalid or contradictory",
+            )
             raise ControlRejected("Module order has an invalid authorized or dealt quantity")
         order_status = str(order.get("order_status") or "").upper()
         if order_status == "FILLED_ALL" and abs(dealt_qty - order_qty) > 1e-9:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", str(order.get("code") or ""), ["quantity"],
+                "Module order status contradicts its filled quantity",
+            )
             raise ControlRejected("Module order filled status leads complete fill details")
         if abs(dealt_qty - deal_qty_total) > 1e-9:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", str(order.get("code") or ""), ["quantity"],
+                "Module order filled quantity contradicts its deal details",
+            )
             raise ControlRejected("Module order dealt quantity differs from deal detail total")
         direct_deal_fees = [deal_fee(deal) for deal in deals_by_order.get(order_id, [])]
         all_deal_fees_known = bool(direct_deal_fees) and all(
@@ -371,8 +434,8 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     for order_id, deals in deals_by_order.items():
         order = module_orders[order_id]
         deal_qty_total = sum(deal_number(d, "deal_qty", "qty") for d in deals)
-        dealt_qty = number(order, "dealt_qty")
-        order_qty = number(order, "qty")
+        dealt_qty = order_number(order, "dealt_qty")
+        order_qty = order_number(order, "qty")
         if dealt_qty <= 0 or deal_qty_total <= 0:
             raise ControlRejected("Module order has deals but no valid dealt quantity")
         if abs(dealt_qty - deal_qty_total) > 1e-9:
