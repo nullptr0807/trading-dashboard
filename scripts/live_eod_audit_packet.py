@@ -96,6 +96,11 @@ def collect_strategy(start: datetime, end: datetime) -> dict[str, Any]:
         positions = rows(con, "SELECT * FROM owned_positions ORDER BY symbol")
         fills = [r for r in rows(con, "SELECT * FROM applied_fills ORDER BY applied_at")
                  if in_window(r["applied_at"], start, end)]
+        all_fills = rows(con, "SELECT * FROM applied_fills ORDER BY applied_at,fill_hash")
+        fee_accounts = rows(con, "SELECT * FROM order_fee_accounts ORDER BY order_hash")
+        fee_adjustments = rows(
+            con, "SELECT * FROM order_fee_adjustments ORDER BY applied_at,id"
+        )
         equity = [r for r in rows(con, "SELECT * FROM strategy_equity ORDER BY ts")
                   if in_window(r["ts"], start, end)]
         events = [r for r in rows(con, "SELECT * FROM strategy_events ORDER BY ts,id")
@@ -109,12 +114,56 @@ def collect_strategy(start: datetime, end: datetime) -> dict[str, Any]:
                 row["preview_id"] = ref(row.get("preview_id"))
                 intents.append(row)
         quick_check = con.execute("PRAGMA quick_check").fetchone()[0]
+    for row in [*fills, *all_fills]:
+        row["fill_hash"] = ref(row.get("fill_hash"))
+        row["order_hash"] = ref(row.get("order_hash"))
+    for row in fee_accounts:
+        row["order_hash"] = ref(row.get("order_hash"))
+    for row in fee_adjustments:
+        row["order_hash"] = ref(row.get("order_hash"))
+        row.pop("adjustment_hash", None)
+    fill_fee_total = sum(float(row["fee"]) for row in all_fills)
+    adjustment_delta_total = sum(float(row["delta"]) for row in fee_adjustments)
+    fill_fees_by_order: dict[str | None, float] = {}
+    for row in all_fills:
+        key = row.get("order_hash")
+        fill_fees_by_order[key] = fill_fees_by_order.get(key, 0.0) + float(row["fee"])
+    adjustment_by_order: dict[str | None, float] = {}
+    for row in fee_adjustments:
+        key = row.get("order_hash")
+        adjustment_by_order[key] = adjustment_by_order.get(key, 0.0) + float(row["delta"])
+    fee_reconciliation = []
+    for account in fee_accounts:
+        key = account.get("order_hash")
+        fill_total = fill_fees_by_order.get(key, 0.0)
+        delta_total = adjustment_by_order.get(key, 0.0)
+        current_total = float(account["cumulative_fee"])
+        fee_reconciliation.append({
+            "order_hash": key, "revision": int(account["revision"]),
+            "fill_fee_total": fill_total, "adjustment_delta_total": delta_total,
+            "reconstructed_total": fill_total + delta_total,
+            "current_total": current_total,
+            "matches_current_total": abs(fill_total + delta_total - current_total) <= 1e-9,
+        })
     return sanitize({
         "quick_check": quick_check,
         "state_at_collection": {k: v for k, v in state.items() if k != "id"},
         "active_config": config,
         "owned_positions_at_collection": positions,
         "fills_during_window": fills,
+        "applied_fills_at_collection": all_fills,
+        "order_fee_accounts_at_collection": fee_accounts,
+        "order_fee_adjustments_at_collection": fee_adjustments,
+        "fee_accounting": {
+            "identity": "total_fees = all applied fill fees + all order adjustment deltas",
+            "fill_fee_total": fill_fee_total,
+            "adjustment_delta_total": adjustment_delta_total,
+            "reconstructed_total_fees": fill_fee_total + adjustment_delta_total,
+            "current_order_cumulative_fee_total": sum(
+                float(row["cumulative_fee"]) for row in fee_accounts
+            ),
+            "by_order": fee_reconciliation,
+        },
         "equity_samples_during_window": equity,
         "events_during_window": events,
         "auto_intents_touched_or_unresolved": intents,
@@ -313,7 +362,7 @@ def compact_review_packet(evidence: dict[str, Any]) -> dict[str, Any]:
     ]
     strategy = evidence["strategy"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "trading_day_ny": evidence["trading_day_ny"],
         "window": evidence["window"],
         "collected_at": evidence["collected_at"],
@@ -370,7 +419,7 @@ def main() -> int:
     report_path = archive / "analysis.md"
     candidates_path = archive / "optimization_candidates.json"
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "trading_day_ny": trading_day.isoformat(),
         "window": {"start_utc": start.isoformat(), "end_utc": end.isoformat()},
         "collected_at": collected_at.isoformat(),
@@ -405,6 +454,12 @@ def main() -> int:
         "optimization_candidates_path": str(candidates_path),
         "record_counts": {
             "fills": len(evidence["strategy"]["fills_during_window"]),
+            "order_fee_accounts": len(
+                evidence["strategy"]["order_fee_accounts_at_collection"]
+            ),
+            "order_fee_adjustments": len(
+                evidence["strategy"]["order_fee_adjustments_at_collection"]
+            ),
             "events": len(evidence["strategy"]["events_during_window"]),
             "intents": len(evidence["strategy"]["auto_intents_touched_or_unresolved"]),
             "order_audit": len(evidence["order_audit"]["order_audit"]),

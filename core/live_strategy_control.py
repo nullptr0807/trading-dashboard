@@ -150,7 +150,10 @@ class LiveStrategyStore:
 
     def _initialize(self) -> None:
         with self.connect() as con:
+            # executescript commits a transaction opened before it, so acquire
+            # the migration lock inside the script itself.
             con.executescript("""
+                BEGIN EXCLUSIVE;
                 CREATE TABLE IF NOT EXISTS strategy_state (
                     id INTEGER PRIMARY KEY CHECK(id=1),
                     lifecycle TEXT NOT NULL CHECK(lifecycle IN ('UNCONFIGURED','FROZEN','ACTIVE','CLEANED')),
@@ -313,6 +316,7 @@ class LiveStrategyStore:
                 con.execute("ALTER TABLE applied_fills ADD COLUMN fee_is_stable INTEGER NOT NULL DEFAULT 0")
             if "order_hash" not in fill_columns:
                 con.execute("ALTER TABLE applied_fills ADD COLUMN order_hash TEXT")
+            con.execute("PRAGMA user_version=1")
             exists = con.execute("SELECT 1 FROM strategy_state WHERE id=1").fetchone()
             if not exists:
                 now = utcnow()
@@ -344,6 +348,7 @@ class LiveStrategyStore:
         self, con: sqlite3.Connection, symbol: str,
         replay: tuple[str, str, float, float, float],
         persisted: tuple[str, str, float, float, float],
+        extra_fields: tuple[str, ...] = (),
     ) -> None:
         """Latch an immutable-fill conflict without persisting Broker identifiers."""
         now = utcnow()
@@ -362,14 +367,19 @@ class LiveStrategyStore:
             (reason, now, now),
         )
         field_names = ("symbol", "side", "quantity", "price", "fee")
+        conflicting_fields = [
+            name for name, old, new in zip(field_names, persisted, replay) if old != new
+        ]
+        conflicting_fields.extend(
+            field for field in extra_fields
+            if field == "order_ownership" and field not in conflicting_fields
+        )
         self._event_tx(
             con, "reconciliation_fill_conflict", "moomoo_reconciler", "critical",
             "Immutable fill reference was replayed with conflicting economics",
             {
                 "symbol": symbol,
-                "conflicting_fields": [
-                    name for name, old, new in zip(field_names, persisted, replay) if old != new
-                ],
+                "conflicting_fields": conflicting_fields,
             },
         )
 
@@ -405,6 +415,45 @@ class LiveStrategyStore:
             )
             con.commit()
         raise ControlRejected("Moomoo returned a conflicting duplicate deal reference")
+
+    def latch_reconciliation_snapshot_conflict(
+        self, category: str, symbol: str, conflicting_fields: list[str], message: str,
+    ) -> None:
+        """Atomically persist a classified, non-recoverable snapshot conflict."""
+        event_type = {
+            "numeric": "reconciliation_snapshot_numeric_conflict",
+            "order_economics": "reconciliation_snapshot_order_conflict",
+        }.get(str(category))
+        if event_type is None:
+            raise ValueError("Unsupported reconciliation conflict category")
+        safe_symbol = str(symbol or "").strip().upper()
+        requested = set(conflicting_fields)
+        safe_fields = [field for field in (
+            "symbol", "side", "quantity", "price", "fee", "order_ownership",
+        )
+                       if field in requested]
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            now = utcnow()
+            current = con.execute(
+                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+            ).fetchone()
+            existing_reason = str(current["freeze_reason"] or "") if current else ""
+            preserve_existing = bool(
+                current and current["lifecycle"] == "FROZEN" and existing_reason
+                and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
+            )
+            reason = existing_reason if preserve_existing else event_type
+            con.execute(
+                "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
+                (reason, now, now),
+            )
+            self._event_tx(
+                con, event_type, "moomoo_reconciler", "critical", message,
+                {"symbol": safe_symbol, "conflicting_fields": safe_fields},
+            )
+            con.commit()
 
     def _invalidate_runtime_tx(self, con: sqlite3.Connection, reason: str) -> int:
         row = con.execute("SELECT generation FROM control_runtime WHERE id=1").fetchone()
@@ -1220,6 +1269,8 @@ class LiveStrategyStore:
             if reserved_buy_notional < 0 or not sync_fingerprint:
                 raise ControlRejected("Invalid reconciliation reservation or sync fingerprint")
             staged: list[dict[str, Any]] = []
+            stable_fee_bindings: list[dict[str, Any]] = []
+            order_hash_bindings: list[tuple[str, str]] = []
             staged_by_hash: dict[str, tuple[str, str, float, float, float]] = {}
             replayed_fees_by_order: dict[str, float] = {}
             new_fees_by_order: dict[str, float] = {}
@@ -1239,7 +1290,7 @@ class LiveStrategyStore:
                     raise ControlRejected("Invalid fill in reconciliation batch")
                 replay = (symbol, side, quantity, price, fee)
                 existing = con.execute(
-                    "SELECT symbol,side,quantity,price,fee,fee_is_stable "
+                    "SELECT symbol,side,quantity,price,fee,fee_is_stable,order_hash "
                     "FROM applied_fills WHERE fill_hash=?",
                     (reference_hash,),
                 ).fetchone()
@@ -1253,11 +1304,41 @@ class LiveStrategyStore:
                     stable_fee_conflict = bool(
                         existing["fee_is_stable"] and fee_is_stable and fee != persisted[4]
                     )
+                    persisted_order_hash = existing["order_hash"]
+                    if (persisted_order_hash is not None and order_hash is not None
+                            and not hmac.compare_digest(str(persisted_order_hash), order_hash)):
+                        self._latch_fill_conflict_tx(
+                            con, symbol, replay, persisted, ("order_ownership",)
+                        )
+                        con.commit()
+                        raise ControlRejected(
+                            "Existing deal reference belongs to a different order"
+                        )
                     if same_fill and not stable_fee_conflict:
+                        if persisted_order_hash is None and order_hash is not None:
+                            order_hash_bindings.append((reference_hash, order_hash))
+                        late_fee_credit = 0.0
+                        if fee_is_stable and not existing["fee_is_stable"]:
+                            if persisted[4] not in {0.0, fee}:
+                                self._latch_fill_conflict_tx(con, symbol, replay, persisted)
+                                con.commit()
+                                raise ControlRejected(
+                                    "Existing provisional deal fee conflicts with stable fee"
+                                )
+                            late_fee_credit = fee - persisted[4]
+                            stable_fee_bindings.append({
+                                "fill_hash": reference_hash, "symbol": symbol,
+                                "fee": fee, "fee_delta": late_fee_credit,
+                                "order_hash": order_hash or persisted_order_hash,
+                            })
                         if order_hash:
                             replayed_fees_by_order[order_hash] = (
                                 replayed_fees_by_order.get(order_hash, 0.0) + persisted[4]
                             )
+                            if late_fee_credit:
+                                new_fees_by_order[order_hash] = (
+                                    new_fees_by_order.get(order_hash, 0.0) + late_fee_credit
+                                )
                         continue
                     self._latch_fill_conflict_tx(con, symbol, replay, persisted)
                     con.commit()
@@ -1412,7 +1493,16 @@ class LiveStrategyStore:
                     "finalized": bool(finalized or (existing_account and existing_account["finalized"])),
                     "revision": revision,
                 })
-            cash -= fee_cash_delta
+            stable_fee_cash_delta = sum(
+                float(binding["fee_delta"]) for binding in stable_fee_bindings
+            )
+            cash -= fee_cash_delta + stable_fee_cash_delta
+            for binding in stable_fee_bindings:
+                if binding["fee_delta"]:
+                    positions[binding["symbol"]]["realized_pnl"] = (
+                        float(positions[binding["symbol"]]["realized_pnl"])
+                        - float(binding["fee_delta"])
+                    )
 
             market_value = unrealized = realized_total = 0.0
             for symbol, position in positions.items():
@@ -1468,6 +1558,19 @@ class LiveStrategyStore:
                 self._event_tx(con, "fill_applied", "moomoo_reconciler", "info",
                                f"Strategy {fill['side'].lower()} fill reconciled",
                                {"symbol": fill["symbol"], "quantity": fill["quantity"]})
+            for fill_hash, bound_order_hash in order_hash_bindings:
+                con.execute(
+                    "UPDATE applied_fills SET order_hash=? "
+                    "WHERE fill_hash=? AND order_hash IS NULL",
+                    (bound_order_hash, fill_hash),
+                )
+            for binding in stable_fee_bindings:
+                con.execute(
+                    "UPDATE applied_fills SET fee=?,fee_is_stable=1,"
+                    "order_hash=COALESCE(order_hash,?) "
+                    "WHERE fill_hash=? AND fee_is_stable=0",
+                    (binding["fee"], binding["order_hash"], binding["fill_hash"]),
+                )
             for account in staged_fee_accounts:
                 con.execute(
                     """INSERT INTO order_fee_accounts

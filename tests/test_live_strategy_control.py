@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 import tarfile
+import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -214,3 +218,54 @@ def test_events_redact_sensitive_runtime_fields(tmp_path):
     assert event["details"]["symbol"] == "US.AAPL"
     assert "do-not-store" not in event["message"]
     assert "12345678" not in event["message"]
+
+
+def test_concurrent_first_open_serializes_schema_migration(tmp_path):
+    path = tmp_path / "concurrent.db"
+    with sqlite3.connect(path) as con:
+        con.execute("""CREATE TABLE applied_fills (
+            fill_hash TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+            quantity REAL NOT NULL, price REAL NOT NULL, fee REAL NOT NULL,
+            applied_at TEXT NOT NULL
+        )""")
+    barrier = threading.Barrier(12)
+    failures = []
+
+    def open_store():
+        try:
+            barrier.wait()
+            LiveStrategyStore(path, tmp_path / "archives").snapshot()
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=open_store) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert failures == []
+    with sqlite3.connect(path) as con:
+        assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
+        assert {"fee_is_stable", "order_hash"} <= columns
+        assert con.execute("SELECT COUNT(*) FROM strategy_state").fetchone()[0] == 1
+
+
+def test_concurrent_process_first_open_is_retry_safe(tmp_path):
+    path = tmp_path / "processes.db"
+    code = (
+        "from core.live_strategy_control import LiveStrategyStore;"
+        f"LiveStrategyStore({str(path)!r}, {str(tmp_path / 'archives')!r}).snapshot()"
+    )
+    processes = [
+        subprocess.Popen([sys.executable, "-c", code], cwd=str(Path(__file__).parents[1]))
+        for _ in range(8)
+    ]
+    return_codes = [process.wait(timeout=30) for process in processes]
+
+    assert return_codes == [0] * 8
+    with sqlite3.connect(path) as con:
+        assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 1

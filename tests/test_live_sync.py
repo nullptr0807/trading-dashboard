@@ -297,6 +297,22 @@ def test_deal_symbol_must_match_authorized_order(tmp_path):
     with pytest.raises(ControlRejected, match="deal symbol differs"):
         reconcile(client, store, ownership_proof=lambda *_: True)
     assert store.positions() == []
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+
+
+def test_deal_side_conflict_latches_nonrecoverable_freeze(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["deals"][0]["trd_side"] = "SELL"
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="deal side differs"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["side"]
 
 
 @pytest.mark.parametrize("missing_field", ["code", "trd_side"])
@@ -579,6 +595,24 @@ def test_conflicting_numeric_aliases_are_rejected_without_mutation(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["quantity"]
+
+
+@pytest.mark.parametrize("key,bad", [("qty", "bad"), ("deal_price", float("nan"))])
+def test_invalid_deal_numeric_alias_latches_nonrecoverable_conflict(tmp_path, key, bad):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["deals"][0][key] = bad
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid numeric"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert store.recent_events(1)[0]["event_type"] == "reconciliation_snapshot_numeric_conflict"
 
 
 def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
@@ -776,6 +810,152 @@ def test_cross_sync_stable_deal_fee_conflict_is_latched(tmp_path):
     assert store.fills(limit=10) == original_fills
     assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
+
+
+def test_delayed_stable_deal_fee_binds_once_without_double_charging(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.snapshot().allocated_cash == pytest.approx(9799.0)
+
+    delayed = client.snapshot()
+    delayed["deals"][0]["deal_fee"] = 0.6
+    client.snapshot = lambda: delayed
+    reconcile(client, store, ownership_proof=lambda *_: True)
+
+    restarted = LiveStrategyStore(store.path, tmp_path / "archives")
+    reconcile(client, restarted, ownership_proof=lambda *_: True)
+    assert restarted.snapshot().allocated_cash == pytest.approx(9799.0)
+    assert restarted.execution_summary()["total_fees"] == pytest.approx(1.0)
+    with restarted.connect() as con:
+        fill = con.execute(
+            "SELECT fee,fee_is_stable,order_hash FROM applied_fills"
+        ).fetchone()
+        adjustments = con.execute(
+            "SELECT previous_total,new_total,fill_fee_credit,delta "
+            "FROM order_fee_adjustments ORDER BY id"
+        ).fetchall()
+    assert tuple(fill[0:2]) == pytest.approx((0.6, 1))
+    assert fill[2] == hashlib.sha256(b"module-order").hexdigest()
+    assert [tuple(row) for row in adjustments] == [
+        (0.0, 1.0, 0.0, 1.0),
+        (1.0, 1.0, 0.6, -0.6),
+    ]
+
+
+def test_delayed_stable_fee_binding_rolls_back_and_replays_atomically(tmp_path, monkeypatch):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    delayed = client.snapshot()
+    delayed["deals"][0]["deal_fee"] = 0.6
+    client.snapshot = lambda: delayed
+    original_event_tx = store._event_tx
+
+    def crash(con, event_type, *args, **kwargs):
+        if event_type == "order_fee_adjusted":
+            raise RuntimeError("binding rollback probe")
+        return original_event_tx(con, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_event_tx", crash)
+    with pytest.raises(RuntimeError, match="rollback probe"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+    with store.connect() as con:
+        assert tuple(con.execute(
+            "SELECT fee,fee_is_stable FROM applied_fills"
+        ).fetchone()) == (0.0, 0)
+        assert con.execute("SELECT COUNT(*) FROM order_fee_adjustments").fetchone()[0] == 1
+
+    monkeypatch.setattr(store, "_event_tx", original_event_tx)
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.0)
+
+
+def test_deal_cannot_be_reassociated_to_a_different_order(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    replay = client.snapshot()
+    replay["orders"][0]["order_id"] = "different-order"
+    replay["order_fees"][0]["order_id"] = "different-order"
+    replay["deals"][0]["order_id"] = "different-order"
+    client.snapshot = lambda: replay
+
+    with pytest.raises(ControlRejected, match="different order"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    assert store.execution_summary()["total_fees"] == pytest.approx(1.0)
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
+        "order_ownership"
+    ]
+
+
+def test_same_snapshot_deal_reference_cannot_belong_to_two_orders(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"].append(dict(data["orders"][0], order_id="second-order"))
+    data["deals"].append(dict(data["deals"][0], order_id="second-order"))
+    data["order_fees"].append({"order_id": "second-order", "fee_amount": 1.0})
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="multiple orders"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.positions() == []
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
+        "order_ownership"
+    ]
+
+
+def test_duplicate_order_reference_with_conflicting_economics_latches(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"].append(dict(data["orders"][0], code="US.MSFT"))
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="duplicate order"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+
+
+def test_duplicate_order_fee_reference_with_conflicting_total_latches(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    data = client.snapshot()
+    data["order_fees"].append({"order_id": "module-order", "fee_amount": 2.0})
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="duplicate fee"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
+
+
+def test_legacy_null_order_hash_binds_once_then_is_immutable(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    with store.connect() as con:
+        con.execute("UPDATE applied_fills SET order_hash=NULL")
+
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    with store.connect() as con:
+        bound = con.execute("SELECT order_hash FROM applied_fills").fetchone()[0]
+    assert bound == hashlib.sha256(b"module-order").hexdigest()
+
+    replay = client.snapshot()
+    replay["orders"][0]["order_id"] = "different-order"
+    replay["order_fees"][0]["order_id"] = "different-order"
+    replay["deals"][0]["order_id"] = "different-order"
+    client.snapshot = lambda: replay
+    with pytest.raises(ControlRejected, match="different order"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
 
 
 def test_restarted_store_recovers_acked_only_after_complete_broker_snapshot(tmp_path):

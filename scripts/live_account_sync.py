@@ -204,9 +204,102 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         preview_id = remark.rsplit(":", 1)[-1]
         if not order_id or not preview_id or not proof(order_id, preview_id):
             raise ControlRejected("Unproven dashboard order remark; possible ownership forgery")
+        previous_order = module_orders.get(order_id)
+        if previous_order is not None:
+            fields = ("symbol", "side", "quantity", "price", "quantity")
+            old_identity = (
+                str(previous_order.get("code") or "").strip().upper(),
+                str(previous_order.get("trd_side") or "").strip().upper(),
+                number(previous_order, "qty"), number(previous_order, "price"),
+                number(previous_order, "dealt_qty"),
+            )
+            new_identity = (
+                str(row.get("code") or "").strip().upper(),
+                str(row.get("trd_side") or "").strip().upper(),
+                number(row, "qty"), number(row, "price"), number(row, "dealt_qty"),
+            )
+            if old_identity != new_identity:
+                store.latch_reconciliation_snapshot_conflict(
+                    "order_economics", str(row.get("code") or ""),
+                    list(dict.fromkeys(
+                        name for name, old, new in zip(fields, old_identity, new_identity)
+                        if old != new
+                    )),
+                    "Broker snapshot repeated an order reference with conflicting economics",
+                )
+                raise ControlRejected(
+                    "Moomoo returned a duplicate order reference with conflicting economics"
+                )
+            continue
         module_orders[order_id] = row
-    fee_by_order = {str(row.get("order_id")): fee_total(row)
-                    for row in snapshot.get("order_fees", []) if row.get("order_id") is not None}
+    # Contradictory Broker economics are permanent reconciliation conflicts,
+    # unlike an unavailable API.  Persist the conflict before propagating it.
+    for deal in snapshot.get("deals", []):
+        order_id = str(deal.get("order_id") or "")
+        order = module_orders.get(order_id)
+        if order is None:
+            continue
+        symbol = str(deal.get("code") or "").strip().upper()
+        try:
+            deal_number(deal, "deal_qty", "qty")
+        except ControlRejected:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", symbol, ["quantity"],
+                "Broker deal quantity aliases are invalid or contradictory",
+            )
+            raise
+        try:
+            deal_number(deal, "deal_price", "price")
+        except ControlRejected:
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", symbol, ["price"],
+                "Broker deal price aliases are invalid or contradictory",
+            )
+            raise
+        order_symbol = str(order.get("code") or "").strip().upper()
+        order_side = str(order.get("trd_side") or "").strip().upper()
+        deal_side = str(deal.get("trd_side") or "").strip().upper()
+        missing = [name for name, value in (("symbol", symbol), ("side", deal_side))
+                   if not value]
+        if missing:
+            store.latch_reconciliation_snapshot_conflict(
+                "order_economics", symbol or order_symbol, missing,
+                "Broker deal omitted symbol or side required by its authorized order",
+            )
+            raise ControlRejected("Moomoo deal must explicitly provide symbol and side")
+        conflicting = []
+        if symbol != order_symbol:
+            conflicting.append("symbol")
+        if deal_side != order_side:
+            conflicting.append("side")
+        if conflicting:
+            store.latch_reconciliation_snapshot_conflict(
+                "order_economics", symbol or order_symbol, conflicting,
+                "Broker deal economics differ from the authorized module order",
+            )
+            if conflicting == ["symbol"]:
+                raise ControlRejected("Moomoo deal symbol differs from its authorized order")
+            if conflicting == ["side"]:
+                raise ControlRejected("Moomoo deal side differs from its authorized order")
+            raise ControlRejected(
+                "Moomoo deal symbol and side differ from its authorized order"
+            )
+    fee_by_order: dict[str, float] = {}
+    for row in snapshot.get("order_fees", []):
+        if row.get("order_id") is None:
+            continue
+        order_id = str(row.get("order_id"))
+        total = fee_total(row)
+        if order_id in fee_by_order and fee_by_order[order_id] != total:
+            order = module_orders.get(order_id, {})
+            store.latch_reconciliation_snapshot_conflict(
+                "numeric", str(order.get("code") or ""), ["fee"],
+                "Broker snapshot repeated an order fee reference with conflicting totals",
+            )
+            raise ControlRejected(
+                "Moomoo returned a duplicate fee reference with conflicting totals"
+            )
+        fee_by_order[order_id] = total
     deals_by_order: dict[str, list[dict[str, Any]]] = {}
     deals_by_reference: dict[str, dict[str, Any]] = {}
     for deal in snapshot.get("deals", []):
@@ -215,6 +308,15 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             deal_ref = str(deal.get("deal_id") or "")
             if deal_ref and deal_ref in deals_by_reference:
                 previous = deals_by_reference[deal_ref]
+                if str(previous.get("order_id") or "") != oid:
+                    store.latch_reconciliation_snapshot_conflict(
+                        "order_economics", str(deal.get("code") or ""),
+                        ["order_ownership"],
+                        "Broker deal reference appeared under multiple authorized orders",
+                    )
+                    raise ControlRejected(
+                        "Moomoo deal reference appeared under multiple orders"
+                    )
                 previous_identity = normalized_deal_identity(previous)
                 replay_identity = normalized_deal_identity(deal)
                 if previous_identity != replay_identity:
