@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -219,6 +220,27 @@ def test_events_redact_sensitive_runtime_fields(tmp_path):
     assert event["details"]["symbol"] == "US.AAPL"
     assert "do-not-store" not in event["message"]
     assert "12345678" not in event["message"]
+
+
+def test_events_redact_natural_language_broker_references_and_long_identifiers(tmp_path):
+    s = store(tmp_path)
+    secrets = [
+        "abcNaturalToken", "ORDER-ABC-998877", "DEAL-SECRET-776655",
+        "123456789", "BRK-REFERENCE-445566", "bearer-secret-0123456789",
+        "opaque_ZYXWVUTSRQPONMLK987654321",
+    ]
+    message = (
+        "token abcNaturalToken order_id ORDER-ABC-998877 "
+        "deal reference DEAL-SECRET-776655 account 123456789 "
+        "broker reference BRK-REFERENCE-445566 "
+        "Authorization Bearer bearer-secret-0123456789 "
+        "opaque_ZYXWVUTSRQPONMLK987654321"
+    )
+
+    s.event("api", "test", "critical", message, {"error": message})
+
+    serialized = json.dumps(s.recent_events(1), sort_keys=True)
+    assert all(secret not in serialized for secret in secrets)
 
 
 def test_concurrent_first_open_serializes_schema_migration(tmp_path):

@@ -11,8 +11,27 @@ from pathlib import Path
 from typing import Any
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs" / "live_account"
-_SECRET_KEY = re.compile(r"(password|token|secret|credential|authorization|account.?id)", re.I)
-_SECRET_TEXT = re.compile(r"(?i)(password|token|secret|authorization)\s*[:=]\s*[^\s,;]+")
+_SECRET_KEY = re.compile(
+    r"(password|token|secret|credential|authorization|account.?id|"
+    r"order.?id|deal.?id|broker.?reference|reference)", re.I,
+)
+_LABELED_SECRET = re.compile(
+    r"(?i)\b(password|token|secret|credential|authorization|account(?:\s*id)?|"
+    r"order[ _-]?id|deal(?:[ _-]?id|\s+reference)|broker\s+reference)"
+    r"\s*(?:[:=]\s*|\s+)(?:bearer\s+)?[^\s,;]+"
+)
+_BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_KNOWN_TOKEN = re.compile(r"\b(?:gh[opusr]_[A-Za-z0-9]{12,}|sk-[A-Za-z0-9_-]{12,})\b")
+_LONG_NUMBER = re.compile(r"\b\d{6,}\b")
+_LONG_OPAQUE = re.compile(r"\b(?=[A-Za-z0-9_-]{24,}\b)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\b")
+
+
+def _redact_text(value: str) -> str:
+    value = _LABELED_SECRET.sub(lambda match: match.group(1) + "=[REDACTED]", value)
+    value = _BEARER.sub("Bearer [REDACTED]", value)
+    value = _KNOWN_TOKEN.sub("[REDACTED]", value)
+    value = _LONG_NUMBER.sub("[REDACTED_ID]", value)
+    return _LONG_OPAQUE.sub("[REDACTED_ID]", value)
 
 
 def redact(value: Any) -> Any:
@@ -24,7 +43,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact(v) for v in value)
     if isinstance(value, str):
-        return _SECRET_TEXT.sub(lambda m: m.group(1) + "=[REDACTED]", value)
+        return _redact_text(value)
     return value
 
 

@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.live_logging import redact as _redact
+
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "live_strategy.db"
 ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "data" / "live_strategy_archives"
 INITIAL_CAPITAL = 10_000.0
@@ -46,12 +48,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 EDITABLE_FIELDS = frozenset(DEFAULT_CONFIG) - {"strategy_id"}
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(password|token|secret|credential|authorization|account.?id|order.?id|deal.?id)"
-    r"\s*[:=]\s*[^\s,;]+"
-)
-_LONG_NUMBER = re.compile(r"\b\d{6,}\b")
-_OPAQUE_WITH_DIGIT = re.compile(r"\b(?=[A-Za-z0-9_-]{12,}\b)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\b")
 _INTENT_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 AUTO_INTENT_STATUSES = frozenset({
@@ -78,20 +74,6 @@ def _finite(value: Any, name: str) -> float:
     if not math.isfinite(result):
         raise ControlRejected(f"Invalid {name}")
     return result
-
-
-def _redact(value: Any) -> Any:
-    secret_words = ("password", "token", "secret", "account_id", "order_id", "deal_id", "preview")
-    if isinstance(value, dict):
-        return {str(k): ("[REDACTED]" if any(w in str(k).lower() for w in secret_words) else _redact(v))
-                for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact(v) for v in value]
-    if isinstance(value, str):
-        value = _SECRET_ASSIGNMENT.sub(lambda m: m.group(1) + "=[REDACTED]", value)
-        value = _LONG_NUMBER.sub("[REDACTED_ID]", value)
-        return _OPAQUE_WITH_DIGIT.sub("[REDACTED_ID]", value)
-    return value
 
 
 @dataclass(frozen=True)
@@ -426,7 +408,9 @@ class LiveStrategyStore:
         safe_symbol = str(symbol or "").strip().upper()
         requested = set(conflicting_fields)
         safe_fields = [
-            field for field in ("symbol", "side", "quantity", "price", "fee")
+            field for field in (
+                "symbol", "side", "quantity", "price", "fee", "deal_identity",
+            )
             if field in requested
         ]
         with self.connect() as con:
@@ -446,6 +430,7 @@ class LiveStrategyStore:
                 "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
                 (reason, now, now),
             )
+            con.execute("DELETE FROM broker_sync_proof")
             self._event_tx(
                 con, "reconciliation_snapshot_deal_conflict", "moomoo_reconciler", "critical",
                 "Broker snapshot repeated a deal reference with conflicting economics",
@@ -461,6 +446,7 @@ class LiveStrategyStore:
         event_type = {
             "numeric": "reconciliation_snapshot_numeric_conflict",
             "order_economics": "reconciliation_snapshot_order_conflict",
+            "positions": "reconciliation_snapshot_position_conflict",
         }.get(str(category))
         if event_type is None:
             raise ValueError("Unsupported reconciliation conflict category")
@@ -468,6 +454,7 @@ class LiveStrategyStore:
         requested = set(conflicting_fields)
         safe_fields = [field for field in (
             "symbol", "side", "quantity", "price", "fee", "order_ownership",
+            "deal_identity",
         )
                        if field in requested]
         with self.connect() as con:
@@ -487,6 +474,7 @@ class LiveStrategyStore:
                 "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
                 (reason, now, now),
             )
+            con.execute("DELETE FROM broker_sync_proof")
             self._event_tx(
                 con, event_type, "moomoo_reconciler", "critical", message,
                 {"symbol": safe_symbol, "conflicting_fields": safe_fields},

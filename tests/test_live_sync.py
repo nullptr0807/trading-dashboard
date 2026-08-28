@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
+import logging
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -12,7 +15,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.live_logging import JsonFormatter
 from core.live_strategy_control import ControlRejected, LiveStrategyStore
+from core.moomoo_audit import (
+    claim_preview, finalize_preview, is_module_order, is_module_preview,
+    module_preview_record, register_preview,
+)
 from core.moomoo_client import MoomooSettings
 
 _spec = importlib.util.spec_from_file_location(
@@ -71,6 +79,32 @@ def active_store(tmp_path):
         con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
                     "freeze_reason=NULL,last_sync_at='synced' WHERE id=1")
     return store
+
+
+def bind_fake_order_to_real_preview(tmp_path, monkeypatch):
+    """Use the real audit DB API while exercising reconcile's default proof."""
+    audit_db = tmp_path / "audit.db"
+    payload = {
+        "preview_id": "preview", "account_id": 1, "code": "US.AAPL",
+        "side": "BUY", "qty": 2, "limit_price": 100,
+    }
+    register_preview(payload, 60, path=audit_db)
+    assert claim_preview("preview", path=audit_db)
+    finalize_preview("preview", "accepted", "module-order", path=audit_db)
+    monkeypatch.setattr(
+        _module, "module_preview_record",
+        lambda preview_id, account_id: module_preview_record(
+            preview_id, account_id, path=audit_db,
+        ),
+    )
+    monkeypatch.setattr(
+        _module, "is_module_preview",
+        lambda preview_id, account_id: is_module_preview(preview_id, account_id, path=audit_db),
+    )
+    monkeypatch.setattr(
+        _module, "is_module_order",
+        lambda order_id, account_id: is_module_order(order_id, account_id, path=audit_db),
+    )
 
 
 def test_reconciliation_imports_only_module_tagged_moomoo_fills(tmp_path):
@@ -1624,3 +1658,190 @@ def test_delayed_stable_sell_fee_matches_immediate_path(tmp_path):
     ):
         assert getattr(delayed[1], field) == pytest.approx(getattr(immediate[1], field))
     assert delayed[2]["total_fees"] == pytest.approx(immediate[2]["total_fees"])
+
+
+@pytest.mark.parametrize("mutation,field", [
+    (lambda order: order.update(qty=float("nan")), "quantity"),
+    (lambda order: order.update(qty=float("inf")), "quantity"),
+    (lambda order: order.update(qty=-1), "quantity"),
+    (lambda order: order.update(qty=3), "quantity"),
+    (lambda order: order.update(price=101), "price"),
+])
+def test_real_default_proof_latches_bound_order_economic_corruption(
+    tmp_path, monkeypatch, mutation, field,
+):
+    store = active_store(tmp_path)
+    store.observe_runtime_fingerprint("test-sync-fingerprint")
+    store.record_broker_sync_proof("test-sync-fingerprint", "synced")
+    bind_fake_order_to_real_preview(tmp_path, monkeypatch)
+    client = FakeClient()
+    data = client.snapshot()
+    mutation(data["orders"][0])
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid|contradict|differs") as rejected:
+        reconcile(client, store)
+
+    assert "ownership forgery" not in str(rejected.value)
+    assert store.snapshot().freeze_reason in {
+        "reconciliation_snapshot_numeric_conflict",
+        "reconciliation_snapshot_order_conflict",
+    }
+    event = store.recent_events(1)[0]
+    assert field in event["details"]["conflicting_fields"]
+    assert set(event["details"]) == {"symbol", "conflicting_fields"}
+    assert store.positions() == []
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
+
+
+@pytest.mark.parametrize("field,bad", [("code", ""), ("trd_side", "HOLD")])
+def test_real_default_proof_latches_bound_order_invalid_identity_even_without_deals(
+    tmp_path, monkeypatch, field, bad,
+):
+    store = active_store(tmp_path)
+    bind_fake_order_to_real_preview(tmp_path, monkeypatch)
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"][0].update(order_status="CANCELLED_ALL", dealt_qty=0)
+    data["orders"][0][field] = bad
+    data.update(deals=[], order_fees=[], positions=[])
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="symbol|side"):
+        reconcile(client, store)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
+        "symbol" if field == "code" else "side"
+    ]
+
+
+@pytest.mark.parametrize("mutation,expected_field", [
+    (lambda deal: deal.pop("deal_id"), "deal_identity"),
+    (lambda deal: deal.update(trd_side="HOLD"), "side"),
+])
+def test_proven_module_deal_invalid_identity_latches_and_blocks_sync_proof(
+    tmp_path, monkeypatch, mutation, expected_field,
+):
+    store = active_store(tmp_path)
+    bind_fake_order_to_real_preview(tmp_path, monkeypatch)
+    client = FakeClient()
+    data = client.snapshot()
+    mutation(data["deals"][0])
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="deal|side|identity"):
+        reconcile(client, store)
+
+    state = store.snapshot()
+    assert state.lifecycle == "FROZEN"
+    assert state.freeze_reason == "reconciliation_snapshot_order_conflict"
+    event = store.recent_events(1)[0]
+    assert expected_field in event["details"]["conflicting_fields"]
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
+
+
+@pytest.mark.parametrize("mode", ["DEDICATED", "SHARED_RESTRICTED"])
+@pytest.mark.parametrize("positions,field", [
+    ([{"code": "US.MSFT", "qty": float("nan")}], "quantity"),
+    ([{"code": "US.MSFT", "qty": float("inf")}], "quantity"),
+    ([{"code": "US.MSFT", "qty": "invalid"}], "quantity"),
+    ([{"code": "US.MSFT", "qty": -1}], "quantity"),
+    ([{"code": "", "qty": 1}], "symbol"),
+    ([{"code": "US.MSFT", "qty": 1, "position_side": "SHORT"}], "side"),
+    ([{"code": "US.MSFT", "qty": 1}, {"code": "us.msft", "qty": 2}], "quantity"),
+])
+def test_untrusted_position_snapshot_permanently_latches_by_account_scope(
+    tmp_path, mode, positions, field,
+):
+    store = active_store(tmp_path)
+    store.observe_runtime_fingerprint("test-sync-fingerprint")
+    store.record_broker_sync_proof("test-sync-fingerprint", "synced")
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode=mode,
+        dedicated_account_confirmed=mode == "DEDICATED",
+        shared_account_risk_accepted=mode == "SHARED_RESTRICTED",
+        trading_enabled=mode == "SHARED_RESTRICTED",
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data.update(orders=[], deals=[], order_fees=[], positions=positions)
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="position"):
+        reconcile(client, store)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+    event = store.recent_events(1)[0]
+    assert event["event_type"] == "reconciliation_snapshot_position_conflict"
+    assert field in event["details"]["conflicting_fields"]
+    assert store.positions() == []
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
+
+
+@pytest.mark.parametrize("mode", ["DEDICATED", "SHARED_RESTRICTED"])
+def test_identical_duplicate_position_rows_are_idempotent(tmp_path, mode):
+    store = active_store(tmp_path)
+    store.observe_runtime_fingerprint("test-sync-fingerprint")
+    store.record_broker_sync_proof("test-sync-fingerprint", "synced")
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode=mode,
+        dedicated_account_confirmed=mode == "DEDICATED",
+        shared_account_risk_accepted=mode == "SHARED_RESTRICTED",
+        trading_enabled=mode == "SHARED_RESTRICTED",
+        auto_trading_enabled=False,
+        trade_api_token="",
+        password_md5="",
+    )
+    data = client.snapshot()
+    data["positions"].append(dict(data["positions"][0], code="us.aapl", qty=2.0))
+    client.snapshot = lambda: data
+
+    result = reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert result["applied_fills"] == 1
+    assert store.owned_quantity("US.AAPL") == 2
+
+
+def test_generic_sync_failure_never_persists_or_outputs_raw_exception_secrets(
+    tmp_path, monkeypatch, capsys,
+):
+    store = active_store(tmp_path)
+    malicious = (
+        "token abcSUPERSECRET order_id ABC-ORDER-9988 deal reference DEAL-778899 "
+        "account 123456789 broker reference BRK-SECRET-445566 "
+        "Authorization: Bearer bearer-secret-abcdef0123456789 "
+        "opaque_ZYXWVUTSRQPONMLK987654321"
+    )
+    monkeypatch.setattr(_module, "LiveStrategyStore", lambda: store)
+    monkeypatch.setattr(_module, "MoomooClient", lambda control_store: object())
+    monkeypatch.setattr(
+        _module, "reconcile",
+        lambda *_: (_ for _ in ()).throw(RuntimeError(malicious)),
+    )
+    stream = io.StringIO()
+    test_logger = logging.Logger("sync-secret-probe")
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonFormatter())
+    test_logger.addHandler(handler)
+    monkeypatch.setattr(_module, "logger", test_logger)
+    monkeypatch.setattr(sys, "argv", ["live_account_sync.py"])
+
+    assert _module.main() == 2
+
+    combined = "\n".join([
+        capsys.readouterr().out,
+        stream.getvalue(),
+        json.dumps(store.recent_events(10), sort_keys=True),
+    ])
+    for secret in (
+        "abcSUPERSECRET", "ABC-ORDER-9988", "DEAL-778899", "123456789",
+        "BRK-SECRET-445566", "bearer-secret-abcdef0123456789",
+        "opaque_ZYXWVUTSRQPONMLK987654321",
+    ):
+        assert secret not in combined
+    assert "RECONCILIATION_INTERNAL_ERROR" in combined

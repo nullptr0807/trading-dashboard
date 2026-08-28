@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from core.live_logging import redact
+
 ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_DB = ROOT / "data" / "live_strategy.db"
 AUDIT_DB = ROOT / "data" / "moomoo_live_audit.db"
@@ -46,7 +48,7 @@ def sanitize(value: Any, key: str = "") -> Any:
     if isinstance(value, tuple):
         return [sanitize(v) for v in value]
     if isinstance(value, str):
-        text = TOKEN_TEXT.sub("[REDACTED]", value)
+        text = str(redact(TOKEN_TEXT.sub("[REDACTED]", value)))
         if key not in {"ts", "created_at", "updated_at", "applied_at", "started_at", "finished_at", "claimed_at"}:
             text = LONG_NUMBER.sub(lambda m: "[NUMREF:" + hashlib.sha256(m.group().encode()).hexdigest()[:10] + "]", text)
         return text

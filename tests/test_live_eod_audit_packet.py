@@ -65,3 +65,22 @@ def test_strategy_evidence_contains_complete_reconstructable_fee_ledgers(tmp_pat
     serialized = json.dumps(evidence)
     assert order_hash not in serialized
     assert "sha256:" in serialized
+
+
+def test_eod_application_log_sanitization_cannot_reemit_generic_failure_secrets():
+    malicious = (
+        "token abcNaturalToken order_id ORDER-ABC-998877 "
+        "deal reference DEAL-SECRET-776655 account 123456789 "
+        "broker reference BRK-REFERENCE-445566 "
+        "Authorization: Bearer bearer-secret-0123456789 "
+        "opaque_ZYXWVUTSRQPONMLK987654321"
+    )
+
+    serialized = json.dumps(eod.sanitize({"message": malicious, "data": {"error": malicious}}))
+
+    for secret in (
+        "abcNaturalToken", "ORDER-ABC-998877", "DEAL-SECRET-776655",
+        "123456789", "BRK-REFERENCE-445566", "bearer-secret-0123456789",
+        "opaque_ZYXWVUTSRQPONMLK987654321",
+    ):
+        assert secret not in serialized

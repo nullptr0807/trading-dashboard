@@ -74,19 +74,6 @@ def _recover_intents_and_transient_freeze(
     return True
 
 
-def number(row: dict[str, Any], *keys: str) -> float:
-    for key in keys:
-        try:
-            value = row.get(key)
-            if value is not None:
-                result = float(value)
-                if math.isfinite(result):
-                    return result
-        except (TypeError, ValueError):
-            pass
-    return 0.0
-
-
 def fee_number(row: dict[str, Any], key: str, *, source: str) -> float:
     """Parse an explicitly present fee field without coercing bad data to zero."""
     try:
@@ -184,6 +171,48 @@ def order_number(order: dict[str, Any], key: str) -> float:
     return value
 
 
+def preview_number(payload: dict[str, Any], key: str) -> float:
+    """Read immutable local preview economics without permissive coercion."""
+    try:
+        value = float(payload[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ControlRejected("Local module preview contains an invalid numeric value") from exc
+    if not math.isfinite(value):
+        raise ControlRejected("Local module preview contains an invalid numeric value")
+    return value
+
+
+def position_number(position: dict[str, Any]) -> float:
+    """Parse all populated position quantity aliases and require agreement."""
+    values = []
+    for key in ("qty", "position_qty"):
+        if position.get(key) is None:
+            continue
+        try:
+            value = float(position[key])
+        except (TypeError, ValueError) as exc:
+            raise ControlRejected("Broker position contains an invalid quantity") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ControlRejected("Broker position contains an invalid quantity")
+        values.append(value)
+    if not values:
+        raise ControlRejected("Broker position omitted its quantity")
+    if any(value != values[0] for value in values[1:]):
+        raise ControlRejected("Broker position contains conflicting quantity aliases")
+    return values[0]
+
+
+def _failure_code(exc: Exception) -> str:
+    """Return a bounded public error class; never serialize the exception text."""
+    if isinstance(exc, ControlRejected):
+        return "RECONCILIATION_REJECTED"
+    if isinstance(exc, TimeoutError):
+        return "RECONCILIATION_TIMEOUT"
+    if isinstance(exc, ConnectionError):
+        return "BROKER_UNAVAILABLE"
+    return "RECONCILIATION_INTERNAL_ERROR"
+
+
 def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> dict[str, Any]:
     snapshot = client.snapshot()
     snapshot_observed_at = utcnow()
@@ -191,25 +220,41 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         raise ControlRejected("Moomoo history or fee data is incomplete")
     account_id = snapshot.get("account_id")
 
+    proven_records: dict[str, dict[str, Any]] = {}
+
     def default_proof(order_id: str, preview_id: str) -> bool:
         if not account_id:
             return False
         record = module_preview_record(preview_id, account_id)
         if not record:
             return False
-        payload = record["payload"]
+        bound_order_id = str(record.get("order_id") or "")
+        if bound_order_id:
+            if bound_order_id != order_id:
+                return False
+            # The immutable local binding proves ownership before untrusted
+            # Broker economics are parsed and classified below.
+            proven_records[order_id] = record
+            return True
+        payload = record.get("payload") or {}
         broker = next((item for item in snapshot.get("orders", [])
                        if str(item.get("order_id") or "") == order_id), {})
-        if record.get("order_id") and str(record["order_id"]) != order_id:
+        try:
+            matches = (
+                str(broker.get("code") or "").strip().upper()
+                == str(payload.get("code") or "").strip().upper()
+                and str(broker.get("trd_side") or "").strip().upper()
+                == str(payload.get("side") or "").strip().upper()
+                and abs(order_number(broker, "qty") - preview_number(payload, "qty")) <= 1e-9
+                and abs(order_number(broker, "price")
+                        - preview_number(payload, "limit_price")) <= 1e-6
+                and str(payload.get("account_id") or "") == str(account_id)
+            )
+        except ControlRejected:
             return False
-        checks = [
-            str(broker.get("code") or "").upper() == str(payload.get("code") or "").upper(),
-            str(broker.get("trd_side") or "").upper() == str(payload.get("side") or "").upper(),
-            abs(number(broker, "qty") - number(payload, "qty")) <= 1e-9,
-            abs(number(broker, "price") - number(payload, "limit_price")) <= 1e-6,
-            int(payload.get("account_id") or 0) == int(account_id),
-        ]
-        return all(checks)
+        if matches:
+            proven_records[order_id] = record
+        return matches
 
     proof = ownership_proof or default_proof
     module_orders: dict[str, dict[str, Any]] = {}
@@ -223,6 +268,18 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             raise ControlRejected("Unproven dashboard order remark; possible ownership forgery")
         previous_order = module_orders.get(order_id)
         symbol = str(row.get("code") or "").strip().upper()
+        side = str(row.get("trd_side") or "").strip().upper()
+        invalid_identity = []
+        if not symbol:
+            invalid_identity.append("symbol")
+        if side not in {"BUY", "SELL"}:
+            invalid_identity.append("side")
+        if invalid_identity:
+            store.latch_reconciliation_snapshot_conflict(
+                "order_economics", symbol, invalid_identity,
+                "Authorized module order contains invalid identity fields",
+            )
+            raise ControlRejected("Moomoo module order must provide a valid symbol and side")
         try:
             quantity = order_number(row, "qty")
             price = order_number(row, "price")
@@ -237,6 +294,34 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                 "Authorized module order contains invalid numeric economics",
             )
             raise
+        if ownership_proof is None:
+            payload = proven_records[order_id].get("payload") or {}
+            try:
+                preview_qty = preview_number(payload, "qty")
+                preview_price = preview_number(payload, "limit_price")
+            except ControlRejected:
+                store.latch_reconciliation_snapshot_conflict(
+                    "numeric", symbol, ["quantity", "price"],
+                    "Authorized module preview contains invalid immutable economics",
+                )
+                raise
+            conflicting_preview_fields = []
+            if symbol != str(payload.get("code") or "").strip().upper():
+                conflicting_preview_fields.append("symbol")
+            if side != str(payload.get("side") or "").strip().upper():
+                conflicting_preview_fields.append("side")
+            if str(payload.get("account_id") or "") != str(account_id):
+                conflicting_preview_fields.append("order_ownership")
+            if abs(quantity - preview_qty) > 1e-9:
+                conflicting_preview_fields.append("quantity")
+            if abs(price - preview_price) > 1e-6:
+                conflicting_preview_fields.append("price")
+            if conflicting_preview_fields:
+                store.latch_reconciliation_snapshot_conflict(
+                    "order_economics", symbol, conflicting_preview_fields,
+                    "Authorized module order differs from its immutable local preview",
+                )
+                raise ControlRejected("Moomoo module order differs from its authorized preview")
         if previous_order is not None:
             fields = ("symbol", "side", "quantity", "price", "quantity")
             old_identity = (
@@ -271,6 +356,23 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         if order is None:
             continue
         symbol = str(deal.get("code") or "").strip().upper()
+        deal_side = str(deal.get("trd_side") or "").strip().upper()
+        invalid_identity = []
+        if not str(deal.get("deal_id") or "").strip():
+            invalid_identity.append("deal_identity")
+        if not symbol:
+            invalid_identity.append("symbol")
+        if deal_side not in {"BUY", "SELL"}:
+            invalid_identity.append("side")
+        if invalid_identity:
+            store.latch_reconciliation_snapshot_conflict(
+                "order_economics", symbol or str(order.get("code") or ""),
+                invalid_identity,
+                "Authorized module deal contains invalid identity fields",
+            )
+            raise ControlRejected(
+                "Moomoo deal must explicitly provide symbol and side; identity is required"
+            )
         try:
             if deal_number(deal, "deal_qty", "qty") <= 0:
                 raise ControlRejected("Moomoo deal contains a negative or invalid quantity")
@@ -299,15 +401,6 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             raise
         order_symbol = str(order.get("code") or "").strip().upper()
         order_side = str(order.get("trd_side") or "").strip().upper()
-        deal_side = str(deal.get("trd_side") or "").strip().upper()
-        missing = [name for name, value in (("symbol", symbol), ("side", deal_side))
-                   if not value]
-        if missing:
-            store.latch_reconciliation_snapshot_conflict(
-                "order_economics", symbol or order_symbol, missing,
-                "Broker deal omitted symbol or side required by its authorized order",
-            )
-            raise ControlRejected("Moomoo deal must explicitly provide symbol and side")
         conflicting = []
         if symbol != order_symbol:
             conflicting.append("symbol")
@@ -475,8 +568,6 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                 "cumulative_fee": cumulative_fee,
                 "finalized": str(order.get("order_status") or "").upper() in TERMINAL,
             })
-    broker_positions = {str(row.get("code") or "").upper(): number(row, "qty")
-                        for row in snapshot.get("positions", [])}
     settings = getattr(client, "settings", None)
     if not settings or not hasattr(settings, "account_mode"):
         raise ControlRejected("Explicit Moomoo account_mode is required for reconciliation")
@@ -497,6 +588,45 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     )
     if account_isolation_mode == "invalid":
         raise ControlRejected("Invalid account isolation configuration cannot produce a broker sync proof")
+    broker_positions: dict[str, float] = {}
+    broker_position_sides: dict[str, str] = {}
+    for row in snapshot.get("positions", []):
+        symbol = str(row.get("code") or "").strip().upper()
+        try:
+            if not symbol:
+                raise ControlRejected("Broker position omitted its symbol")
+            quantity = position_number(row)
+            side_values = [
+                str(row[key]).strip().upper()
+                for key in ("position_side", "side")
+                if row.get(key) is not None
+            ]
+            if any(side not in {"LONG", "BUY"} for side in side_values):
+                raise ControlRejected("Broker position contains an invalid side")
+            canonical_side = "LONG"
+            if symbol in broker_positions:
+                if (broker_positions[symbol] != quantity
+                        or broker_position_sides[symbol] != canonical_side):
+                    raise ControlRejected(
+                        "Broker position duplicate contains conflicting economics"
+                    )
+                continue
+            broker_positions[symbol] = quantity
+            broker_position_sides[symbol] = canonical_side
+        except ControlRejected as exc:
+            fields = []
+            text = str(exc).lower()
+            if "symbol" in text:
+                fields.append("symbol")
+            if "side" in text:
+                fields.append("side")
+            if "quantity" in text or "economics" in text:
+                fields.append("quantity")
+            store.latch_reconciliation_snapshot_conflict(
+                "positions", symbol, fields or ["quantity"],
+                "Broker position snapshot contains invalid or conflicting identity/economics",
+            )
+            raise
     shared_external_allowed = shared_read_only or account_isolation_mode == "shared_restricted"
     owned_before = {row["symbol"] for row in store.positions()}
     staged_symbols = {str(fill["symbol"]).upper() for fill in staged_fills}
@@ -511,7 +641,8 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     prospective_symbols = owned_before | staged_symbols
     prices = {symbol: client.quote(symbol)["last_price"] for symbol in prospective_symbols}
     pending_buy = sum(
-        max(0.0, number(row, "qty") - number(row, "dealt_qty")) * number(row, "price")
+        max(0.0, order_number(row, "qty") - order_number(row, "dealt_qty"))
+        * order_number(row, "price")
         for row in module_orders.values()
         if str(row.get("trd_side") or "").upper() == "BUY"
         and str(row.get("order_status") or "").upper() not in TERMINAL
@@ -577,20 +708,26 @@ def main() -> int:
             print(json.dumps(result, sort_keys=True))
         return 0
     except Exception as exc:
+        error_code = _failure_code(exc)
         try:
             state = store.freeze(
                 "five_minute_reconciliation_failed", "moomoo_sync", preserve_existing=True,
             )
-            store.event("sync_failed", "moomoo_sync", "critical",
-                        "Moomoo five-minute reconciliation failed", {"error": str(exc)})
+            store.event(
+                "sync_failed", "moomoo_sync", "critical",
+                "Moomoo five-minute reconciliation failed",
+                {"error_code": error_code},
+            )
             lifecycle = state.lifecycle
         except Exception:
             lifecycle = "UNKNOWN"
-        log_event(logger, "critical", "moomoo_reconciliation_failed",
-                  error=str(exc), lifecycle=lifecycle)
+        log_event(
+            logger, "critical", "moomoo_reconciliation_failed",
+            error_code=error_code, lifecycle=lifecycle,
+        )
         print(json.dumps({"ok": False, "alert": "LIVE_SYSTEM_FROZEN",
                           "reason": "five_minute_reconciliation_failed",
-                          "error": str(exc)}, sort_keys=True))
+                          "error_code": error_code}, sort_keys=True))
         return 2
 
 
