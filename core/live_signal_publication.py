@@ -377,56 +377,238 @@ def _process_lock(path: Path) -> Any:
         return _process_locks.setdefault(os.fspath(path), threading.Lock())
 
 
-@contextmanager
-def publication_lock(path: str | Path, *, exclusive: bool) -> Iterator[int]:
-    """Serialize publishers and keep readers out until late commits are revoked."""
-    destination = _store_path(path)
-    lock_path = _lock_path(destination)
-    process_lock = _process_lock(lock_path)
-    deadline = time.monotonic() + STORE_BUSY_TIMEOUT_SECONDS
-    if not process_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-        raise PublicationError("Publication store lock busy timeout")
+def _path_quarantine_name(destination: Path) -> str:
+    digest = hashlib.sha256(os.fsencode(destination)).hexdigest()[:24]
+    return f".signal-publication-{digest}.quarantine"
+
+
+def _open_directory(path: Path, *, label: str) -> int:
+    flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
-        _ensure_private_store_parent(destination)
-        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-                 | getattr(os, "O_NOFOLLOW", 0))
-        descriptor = os.open(lock_path, flags, 0o600)
-    except PublicationError:
-        process_lock.release()
-        raise
+        return os.open(path, flags)
     except OSError as exc:
-        process_lock.release()
-        raise PublicationError("Unable to safely open publication store lock") from exc
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        raise PublicationError(f"Unable to safely open {label}") from exc
+
+
+def _require_directory_descriptor_path(
+    path: Path, descriptor: int, *, label: str, private: bool = False,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+    except OSError as exc:
+        raise PublicationError(f"Unable to verify {label}") from exc
+    if (not stat_module.S_ISDIR(opened.st_mode)
+            or not stat_module.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise PublicationError(f"{label.capitalize()} path was replaced")
+    if private and (opened.st_uid != os.getuid() or opened.st_mode & 0o022):
+        raise PublicationError("Publication store directory owner or permissions are unsafe")
+
+
+def _flock_until(descriptor: int, operation: int, deadline: float) -> None:
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise PublicationError("Publication store lock busy timeout")
+            time.sleep(0.01)
+
+
+def _path_quarantine_state(guard_descriptor: int, name: str) -> dict[str, Any] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=guard_descriptor)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PublicationError("Unable to verify publication path quarantine") from exc
     try:
         stat = os.fstat(descriptor)
         if (not stat_module.S_ISREG(stat.st_mode)
                 or stat.st_uid != os.getuid() or stat.st_mode & 0o077):
+            raise PublicationError("Publication path quarantine is unsafe")
+        raw = os.read(descriptor, 65536)
+    finally:
+        os.close(descriptor)
+    try:
+        state = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PublicationError("Publication path quarantine is malformed") from exc
+    required = {"state", "expected_directory_dev", "expected_directory_ino"}
+    identities = (state.get("expected_directory_dev"), state.get("expected_directory_ino")) \
+        if isinstance(state, dict) else ()
+    if (not isinstance(state, dict) or state.get("state") != "path_replaced"
+            or not required.issubset(state)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in identities)):
+        raise PublicationError("Publication path quarantine is unverifiable")
+    return state
+
+
+def _set_path_quarantine(
+    guard_descriptor: int, name: str, publication_directory_descriptor: int, reason: str,
+) -> None:
+    """Persist replacement evidence outside the replaceable publication directory."""
+    identity = os.fstat(publication_directory_descriptor)
+    content = canonical_json({
+        "state": "path_replaced",
+        "reason": reason,
+        "expected_directory_dev": identity.st_dev,
+        "expected_directory_ino": identity.st_ino,
+    }).encode("utf-8")
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=guard_descriptor)
+    except FileExistsError:
+        # Never truncate or replace an existing marker (including a hard link).
+        # A valid prior marker already preserves fail-closed state; malformed or
+        # unsafe markers are themselves permanent fail-closed evidence.
+        _path_quarantine_state(guard_descriptor, name)
+        return
+    except OSError as exc:
+        raise PublicationError("Unable to persist publication path quarantine") from exc
+    try:
+        stat = os.fstat(descriptor)
+        if (not stat_module.S_ISREG(stat.st_mode)
+                or stat.st_uid != os.getuid() or stat.st_mode & 0o077):
+            raise PublicationError("Publication path quarantine is unsafe")
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise PublicationError("Unable to persist publication path quarantine")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.fsync(guard_descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _clear_path_quarantine(destination: Path) -> None:
+    guard_directory = destination.parent.parent
+    guard_descriptor = _open_directory(guard_directory, label="publication guard directory")
+    try:
+        _require_directory_descriptor_path(
+            guard_directory, guard_descriptor, label="publication guard directory",
+        )
+        os.unlink(_path_quarantine_name(destination), dir_fd=guard_descriptor)
+        os.fsync(guard_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PublicationError("Unable to clear publication path quarantine") from exc
+    finally:
+        os.close(guard_descriptor)
+
+
+@contextmanager
+def publication_lock(
+    path: str | Path, *, exclusive: bool, _allow_path_quarantine: bool = False,
+) -> Iterator[int]:
+    """Lock stable directory inodes before touching replaceable store children.
+
+    The private publication directory is the primary cross-process lock.  Its
+    parent is also locked first so replacing the private directory cannot let a
+    second cooperative process enter through a new inode.  The child lock file
+    remains only as the durable append-quarantine marker.  This coordinates
+    cooperative publishers/loaders; an administrator or same-UID process with
+    arbitrary ongoing filesystem control can still bypass or remove advisory
+    locks and quarantine evidence, which is outside this trust boundary.
+    """
+    destination = _store_path(path)
+    publication_directory = destination.parent
+    guard_directory = publication_directory.parent
+    lock_path = _lock_path(destination)
+    quarantine_name = _path_quarantine_name(destination)
+    process_lock = _process_lock(publication_directory)
+    deadline = time.monotonic() + STORE_BUSY_TIMEOUT_SECONDS
+    if not process_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise PublicationError("Publication store lock busy timeout")
+
+    guard_descriptor = directory_descriptor = lock_descriptor = None
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    replacement_error: PublicationError | None = None
+    try:
+        _ensure_private_store_parent(destination)
+        guard_descriptor = _open_directory(guard_directory, label="publication guard directory")
+        _flock_until(guard_descriptor, operation, deadline)
+        directory_descriptor = _open_directory(
+            publication_directory, label="publication store directory",
+        )
+        _flock_until(directory_descriptor, operation, deadline)
+        _require_directory_descriptor_path(
+            guard_directory, guard_descriptor, label="publication guard directory",
+        )
+        _require_directory_descriptor_path(
+            publication_directory, directory_descriptor, label="publication store directory",
+            private=True,
+        )
+        _require_owned_mode(publication_directory, directory=True)
+        path_quarantine = _path_quarantine_state(guard_descriptor, quarantine_name)
+        if path_quarantine is not None:
+            if not _allow_path_quarantine:
+                raise PublicationError("Publication store has an unresolved path quarantine")
+            current = os.fstat(directory_descriptor)
+            expected = (
+                int(path_quarantine["expected_directory_dev"]),
+                int(path_quarantine["expected_directory_ino"]),
+            )
+            if (current.st_dev, current.st_ino) != expected:
+                raise PublicationError(
+                    "Publication path quarantine requires restoring the original directory"
+                )
+
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            lock_descriptor = os.open(lock_path.name, flags, 0o600, dir_fd=directory_descriptor)
+        except OSError as exc:
+            raise PublicationError("Unable to safely open publication store lock") from exc
+        stat = os.fstat(lock_descriptor)
+        if (not stat_module.S_ISREG(stat.st_mode)
+                or stat.st_uid != os.getuid() or stat.st_mode & 0o077):
             raise PublicationError("Publication store lock owner or permissions are unsafe")
-        while True:
-            try:
-                fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise PublicationError("Publication store lock busy timeout")
-                time.sleep(0.01)
-        # Store validation belongs after the lock: another first publisher may
-        # be creating it.  Existing permission drift still fails closed here.
-        _require_descriptor_path(lock_path, descriptor)
-        _require_owned_mode(destination.parent, directory=True)
+        _require_descriptor_path(lock_path, lock_descriptor)
         if destination.exists() or destination.is_symlink():
             _require_owned_mode(destination, directory=False)
-        yield descriptor
+        yield lock_descriptor
     finally:
-        try:
-            _require_descriptor_path(lock_path, descriptor)
-        finally:
+        if guard_descriptor is not None and directory_descriptor is not None:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
-                process_lock.release()
+                _require_directory_descriptor_path(
+                    publication_directory, directory_descriptor,
+                    label="publication store directory", private=True,
+                )
+                if lock_descriptor is not None:
+                    _require_descriptor_path(lock_path, lock_descriptor)
+            except PublicationError as exc:
+                replacement_error = exc
+                try:
+                    _require_directory_descriptor_path(
+                        guard_directory, guard_descriptor,
+                        label="publication guard directory",
+                    )
+                    _set_path_quarantine(
+                        guard_descriptor, quarantine_name, directory_descriptor, str(exc),
+                    )
+                except PublicationError:
+                    # Preserve the original replacement finding.  A missing or
+                    # unsafe guard path independently makes future opens fail.
+                    pass
+        for descriptor in (lock_descriptor, directory_descriptor, guard_descriptor):
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+        process_lock.release()
+        if replacement_error is not None:
+            raise replacement_error
 
 
 def set_store_quarantine(descriptor: int, state: dict[str, Any] | None) -> None:
@@ -524,8 +706,18 @@ def recover_publication_store(
     """Resolve a crashed append under the exclusive lock; readers never invoke this."""
     if not test_mode and _resolved(publication_db_path) != _resolved(DEFAULT_PUBLICATION_DB_PATH):
         raise PublicationError("Live recovery requires the canonical publication store")
-    with publication_lock(publication_db_path, exclusive=True) as descriptor:
+    with publication_lock(
+        publication_db_path, exclusive=True, _allow_path_quarantine=True,
+    ) as descriptor:
         _recover_locked(publication_db_path, descriptor)
+        con = initialize_store(publication_db_path)
+        try:
+            _require_connection_path(con)
+            validate_store_schema(con)
+        finally:
+            con.close()
+        _require_descriptor_path(_lock_path(publication_db_path), descriptor)
+        _clear_path_quarantine(_store_path(publication_db_path))
 
 
 _SCHEMA_OBJECTS = {

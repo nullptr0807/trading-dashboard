@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import hashlib
+import multiprocessing
 import os
 import sqlite3
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -59,6 +62,33 @@ def _publish(source, factors, store, at, **kwargs):
 
 def _load(store, factors, **kwargs):
     return load_b16_signal_batch(store, factors, test_mode=True, **kwargs)
+
+
+def _multiprocess_lock_probe(store, entered, result):
+    """Attempt a real cross-process critical section without inherited fds."""
+    try:
+        with publication_lock(store, exclusive=True):
+            entered.set()
+        result.put("entered")
+    except Exception as exc:  # pragma: no cover - asserted in the parent process
+        result.put(f"{type(exc).__name__}: {exc}")
+
+
+def _multiprocess_publish_probe(source, factors, store, at, result):
+    try:
+        published = publish_b16_signal(
+            source, factors, store, clock=lambda: at, publish=True, test_mode=True,
+        )
+        result.put(("ok", published.version))
+    except Exception as exc:  # pragma: no cover - asserted in the parent process
+        result.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_context():
+    """Make spawn imports independent of earlier tests mutating cwd/sys.path."""
+    repository = str(Path(__file__).resolve().parents[1])
+    sys.path[:] = [repository, *(entry for entry in sys.path if entry != repository)]
+    return multiprocessing.get_context("spawn")
 
 
 def test_publication_is_dry_run_by_default_and_real_write_is_private(tmp_path):
@@ -118,6 +148,30 @@ def test_repeated_identical_publication_is_idempotent_and_concurrent_safe(tmp_pa
         ))
 
     assert {row.version for row in results} == {1}
+    with sqlite3.connect(store) as con:
+        assert con.execute("SELECT COUNT(*) FROM signal_publications").fetchone()[0] == 1
+
+
+def test_identical_publication_is_idempotent_across_real_processes(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "publications.db"
+    at = datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc)
+    context = _spawn_context()
+    result = context.Queue()
+    children = [
+        context.Process(
+            target=_multiprocess_publish_probe,
+            args=(source, factors, store, at, result),
+        )
+        for _ in range(4)
+    ]
+    for child in children:
+        child.start()
+    for child in children:
+        child.join(timeout=10)
+        assert child.exitcode == 0
+    assert [result.get(timeout=1) for _ in children] == [("ok", 1)] * 4
     with sqlite3.connect(store) as con:
         assert con.execute("SELECT COUNT(*) FROM signal_publications").fetchone()[0] == 1
 
@@ -631,8 +685,87 @@ def test_replaced_lock_path_is_detected_without_split_brain(tmp_path):
                 assert not future.done()
                 assert not entered_replacement
         assert future is not None
-        future.result(timeout=2)
-    assert entered_replacement == [True]
+        with pytest.raises(PublicationError, match="quarantine"):
+            future.result(timeout=2)
+    assert entered_replacement == []
+
+
+def test_lock_file_replacement_cannot_split_real_processes_and_quarantines(tmp_path):
+    store = tmp_path / "pub.db"
+    lock = store.with_name(store.name + ".lock")
+    context = _spawn_context()
+    entered = context.Event()
+    result = context.Queue()
+
+    child = None
+    with pytest.raises(PublicationError, match="replaced"):
+        with publication_lock(store, exclusive=True):
+            lock.rename(lock.with_suffix(".old"))
+            lock.touch(mode=0o600)
+            child = context.Process(
+                target=_multiprocess_lock_probe, args=(store, entered, result),
+            )
+            child.start()
+            assert not entered.wait(timeout=0.25)
+
+    assert child is not None
+    child.join(timeout=3)
+    assert child.exitcode == 0
+    assert not entered.is_set()
+    assert "quarantine" in result.get(timeout=1).lower()
+    with pytest.raises(PublicationError, match="quarantine"):
+        with publication_lock(store, exclusive=False):
+            pass
+
+
+def test_private_directory_replacement_blocks_cooperators_and_quarantines(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    store = private / "pub.db"
+    displaced = tmp_path / "private.displaced"
+    context = _spawn_context()
+    entered = context.Event()
+    result = context.Queue()
+
+    child = None
+    with pytest.raises(PublicationError, match="directory.*replaced|replaced.*directory"):
+        with publication_lock(store, exclusive=True):
+            private.rename(displaced)
+            private.mkdir(mode=0o700)
+            child = context.Process(
+                target=_multiprocess_lock_probe, args=(store, entered, result),
+            )
+            child.start()
+            assert not entered.wait(timeout=0.25)
+
+    assert child is not None
+    child.join(timeout=3)
+    assert child.exitcode == 0
+    assert not entered.is_set()
+    assert "quarantine" in result.get(timeout=1).lower()
+
+
+def test_path_quarantine_requires_explicit_recovery_and_original_directory(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    private = tmp_path / "private"
+    store = private / "pub.db"
+    displaced = tmp_path / "private.displaced"
+    _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+
+    with pytest.raises(PublicationError, match="directory.*replaced|replaced.*directory"):
+        with publication_lock(store, exclusive=True):
+            private.rename(displaced)
+            private.mkdir(mode=0o700)
+
+    with pytest.raises(PublicationError, match="restoring the original directory"):
+        recover_publication_store(store, test_mode=True)
+    private.rmdir()
+    displaced.rename(private)
+    recover_publication_store(store, test_mode=True)
+    assert _load(
+        store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc),
+    ).publication_version == 1
 
 
 def test_store_inode_replacement_during_sqlite_open_fails_closed(tmp_path, monkeypatch):
