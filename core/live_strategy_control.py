@@ -386,6 +386,7 @@ class LiveStrategyStore:
             "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
             (reason, now, now),
         )
+        con.execute("DELETE FROM broker_sync_proof")
         field_names = ("symbol", "side", "quantity", "price", "fee")
         conflicting_fields = [
             name for name, old, new in zip(field_names, persisted, replay) if old != new
@@ -1440,6 +1441,7 @@ class LiveStrategyStore:
                         "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
                         (reason, now, now),
                     )
+                    con.execute("DELETE FROM broker_sync_proof")
                     self._event_tx(
                         con, "reconciliation_quantity_mismatch", "moomoo_reconciler", "critical",
                         "Broker quantity differs from staged strategy quantity; batch rolled back",

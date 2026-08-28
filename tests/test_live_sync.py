@@ -107,6 +107,33 @@ def bind_fake_order_to_real_preview(tmp_path, monkeypatch):
     )
 
 
+def bind_claimed_preview(tmp_path, monkeypatch, *, reconcile_status=False):
+    """Bind the fake remark to durable local pre-finalization ownership."""
+    audit_db = tmp_path / "claimed-audit.db"
+    payload = {
+        "preview_id": "preview", "account_id": 1, "code": "US.AAPL",
+        "side": "BUY", "qty": 2, "limit_price": 100,
+    }
+    register_preview(payload, 60, path=audit_db)
+    assert claim_preview("preview", path=audit_db)
+    if reconcile_status:
+        finalize_preview("preview", "unknown", path=audit_db)
+    monkeypatch.setattr(
+        _module, "module_preview_record",
+        lambda preview_id, account_id: module_preview_record(
+            preview_id, account_id, path=audit_db,
+        ),
+    )
+    monkeypatch.setattr(
+        _module, "is_module_preview",
+        lambda preview_id, account_id: is_module_preview(preview_id, account_id, path=audit_db),
+    )
+    monkeypatch.setattr(
+        _module, "is_module_order",
+        lambda order_id, account_id: is_module_order(order_id, account_id, path=audit_db),
+    )
+
+
 def test_reconciliation_imports_only_module_tagged_moomoo_fills(tmp_path):
     store = active_store(tmp_path)
     result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
@@ -175,13 +202,15 @@ def test_forged_dashboard_remark_without_local_proof_is_rejected(tmp_path):
 def test_known_preview_cannot_authorize_modified_broker_order(tmp_path, monkeypatch):
     store = active_store(tmp_path)
     monkeypatch.setattr(_module, "module_preview_record", lambda *_: {
+        "preview_id": "preview", "account_id": "1", "status": "claimed",
         "order_id": None,
         "payload": {"code": "US.AAPL", "side": "BUY", "qty": 999,
                     "limit_price": 100, "account_id": 1},
     })
-    with pytest.raises(ControlRejected, match="ownership forgery"):
+    with pytest.raises(ControlRejected, match="differs"):
         reconcile(FakeClient(), store)
     assert store.owned_quantity("US.AAPL") == 0
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
 
 
 def test_reconciliation_fails_if_fee_truth_is_missing(tmp_path):
@@ -1694,6 +1723,31 @@ def test_real_default_proof_latches_bound_order_economic_corruption(
     assert not store.broker_sync_proof_matches("test-sync-fingerprint")
 
 
+@pytest.mark.parametrize("reconcile_status", [False, True])
+@pytest.mark.parametrize("bad_quantity", [float("nan"), -1, 1])
+def test_claimed_preview_economic_corruption_permanently_latches(
+    tmp_path, monkeypatch, reconcile_status, bad_quantity,
+):
+    store = active_store(tmp_path)
+    store.observe_runtime_fingerprint("test-sync-fingerprint")
+    store.record_broker_sync_proof("test-sync-fingerprint", "synced")
+    bind_claimed_preview(tmp_path, monkeypatch, reconcile_status=reconcile_status)
+    client = FakeClient()
+    data = client.snapshot()
+    data["orders"][0]["qty"] = bad_quantity
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="invalid|differs|contradictory") as rejected:
+        reconcile(client, store)
+
+    assert "ownership forgery" not in str(rejected.value)
+    assert store.snapshot().freeze_reason in {
+        "reconciliation_snapshot_numeric_conflict",
+        "reconciliation_snapshot_order_conflict",
+    }
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
+
+
 @pytest.mark.parametrize("field,bad", [("code", ""), ("trd_side", "HOLD")])
 def test_real_default_proof_latches_bound_order_invalid_identity_even_without_deals(
     tmp_path, monkeypatch, field, bad,
@@ -1741,7 +1795,6 @@ def test_proven_module_deal_invalid_identity_latches_and_blocks_sync_proof(
     assert not store.broker_sync_proof_matches("test-sync-fingerprint")
 
 
-@pytest.mark.parametrize("mode", ["DEDICATED", "SHARED_RESTRICTED"])
 @pytest.mark.parametrize("positions,field", [
     ([{"code": "US.MSFT", "qty": float("nan")}], "quantity"),
     ([{"code": "US.MSFT", "qty": float("inf")}], "quantity"),
@@ -1751,21 +1804,17 @@ def test_proven_module_deal_invalid_identity_latches_and_blocks_sync_proof(
     ([{"code": "US.MSFT", "qty": 1, "position_side": "SHORT"}], "side"),
     ([{"code": "US.MSFT", "qty": 1}, {"code": "us.msft", "qty": 2}], "quantity"),
 ])
-def test_untrusted_position_snapshot_permanently_latches_by_account_scope(
-    tmp_path, mode, positions, field,
+def test_dedicated_untrusted_position_snapshot_permanently_latches(
+    tmp_path, positions, field,
 ):
     store = active_store(tmp_path)
     store.observe_runtime_fingerprint("test-sync-fingerprint")
     store.record_broker_sync_proof("test-sync-fingerprint", "synced")
     client = FakeClient()
     client.settings = SimpleNamespace(
-        account_mode=mode,
-        dedicated_account_confirmed=mode == "DEDICATED",
-        shared_account_risk_accepted=mode == "SHARED_RESTRICTED",
-        trading_enabled=mode == "SHARED_RESTRICTED",
-        auto_trading_enabled=False,
-        trade_api_token="",
-        password_md5="",
+        account_mode="DEDICATED", dedicated_account_confirmed=True,
+        shared_account_risk_accepted=False, trading_enabled=False,
+        auto_trading_enabled=False, trade_api_token="", password_md5="",
     )
     data = client.snapshot()
     data.update(orders=[], deals=[], order_fees=[], positions=positions)
@@ -1783,7 +1832,7 @@ def test_untrusted_position_snapshot_permanently_latches_by_account_scope(
 
 
 @pytest.mark.parametrize("mode", ["DEDICATED", "SHARED_RESTRICTED"])
-def test_identical_duplicate_position_rows_are_idempotent(tmp_path, mode):
+def test_duplicate_in_scope_position_rows_permanently_latch(tmp_path, mode):
     store = active_store(tmp_path)
     store.observe_runtime_fingerprint("test-sync-fingerprint")
     store.record_broker_sync_proof("test-sync-fingerprint", "synced")
@@ -1793,18 +1842,73 @@ def test_identical_duplicate_position_rows_are_idempotent(tmp_path, mode):
         dedicated_account_confirmed=mode == "DEDICATED",
         shared_account_risk_accepted=mode == "SHARED_RESTRICTED",
         trading_enabled=mode == "SHARED_RESTRICTED",
-        auto_trading_enabled=False,
-        trade_api_token="",
-        password_md5="",
+        auto_trading_enabled=False, trade_api_token="", password_md5="",
     )
     data = client.snapshot()
     data["positions"].append(dict(data["positions"][0], code="us.aapl", qty=2.0))
     client.snapshot = lambda: data
 
+    with pytest.raises(ControlRejected, match="duplicate"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
+
+
+def test_shared_external_positions_skip_untrusted_economics_and_duplicates(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+        shared_account_risk_accepted=True, trading_enabled=True,
+        auto_trading_enabled=False, trade_api_token="", password_md5="",
+    )
+    data = client.snapshot()
+    data["positions"].extend([
+        {"code": "US.MSFT", "qty": "not-sensitive-economics", "position_side": "SHORT"},
+        {"code": "us.msft", "qty": float("nan")},
+    ])
+    client.snapshot = lambda: data
+
     result = reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert result["applied_fills"] == 1
+    assert result["external_positions"] == 1
     assert store.owned_quantity("US.AAPL") == 2
+
+
+@pytest.mark.parametrize("bad_symbol", ["", "not a symbol", "../ACCT-SECRET"])
+def test_shared_unrecognizable_position_symbol_permanently_latches(tmp_path, bad_symbol):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    client.settings = SimpleNamespace(
+        account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+        shared_account_risk_accepted=True, trading_enabled=True,
+        auto_trading_enabled=False, trade_api_token="", password_md5="",
+    )
+    data = client.snapshot()
+    data.update(orders=[], deals=[], order_fees=[], positions=[{"code": bad_symbol, "qty": "bad"}])
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="symbol"):
+        reconcile(client, store)
+
+    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+
+
+def test_quantity_mismatch_invalidates_previously_successful_sync_proof(tmp_path):
+    store = active_store(tmp_path)
+    client = FakeClient()
+    reconcile(client, store, ownership_proof=lambda *_: True)
+    assert store.broker_sync_proof_matches("test-sync-fingerprint")
+    data = client.snapshot()
+    data["positions"][0]["qty"] = 1
+    client.snapshot = lambda: data
+
+    with pytest.raises(ControlRejected, match="staged strategy quantity"):
+        reconcile(client, store, ownership_proof=lambda *_: True)
+
+    assert not store.broker_sync_proof_matches("test-sync-fingerprint")
 
 
 def test_generic_sync_failure_never_persists_or_outputs_raw_exception_secrets(

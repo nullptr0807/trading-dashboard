@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import argparse
 import sys
 from pathlib import Path
@@ -202,6 +203,14 @@ def position_number(position: dict[str, Any]) -> float:
     return values[0]
 
 
+def position_symbol(position: dict[str, Any]) -> str:
+    """Return a canonical, independently scopeable Broker symbol."""
+    symbol = str(position.get("code") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}\.[A-Z0-9][A-Z0-9.-]{0,31}", symbol):
+        raise ControlRejected("Broker position omitted or contains an invalid symbol")
+    return symbol
+
+
 def _failure_code(exc: Exception) -> str:
     """Return a bounded public error class; never serialize the exception text."""
     if isinstance(exc, ControlRejected):
@@ -228,33 +237,18 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         record = module_preview_record(preview_id, account_id)
         if not record:
             return False
-        bound_order_id = str(record.get("order_id") or "")
-        if bound_order_id:
-            if bound_order_id != order_id:
-                return False
-            # The immutable local binding proves ownership before untrusted
-            # Broker economics are parsed and classified below.
-            proven_records[order_id] = record
-            return True
-        payload = record.get("payload") or {}
-        broker = next((item for item in snapshot.get("orders", [])
-                       if str(item.get("order_id") or "") == order_id), {})
-        try:
-            matches = (
-                str(broker.get("code") or "").strip().upper()
-                == str(payload.get("code") or "").strip().upper()
-                and str(broker.get("trd_side") or "").strip().upper()
-                == str(payload.get("side") or "").strip().upper()
-                and abs(order_number(broker, "qty") - preview_number(payload, "qty")) <= 1e-9
-                and abs(order_number(broker, "price")
-                        - preview_number(payload, "limit_price")) <= 1e-6
-                and str(payload.get("account_id") or "") == str(account_id)
-            )
-        except ControlRejected:
+        if (str(record.get("preview_id") or "") != preview_id
+                or str(record.get("account_id") or "") != str(account_id)
+                or str(record.get("status") or "") not in {"claimed", "accepted", "reconcile"}):
             return False
-        if matches:
-            proven_records[order_id] = record
-        return matches
+        bound_order_id = str(record.get("order_id") or "")
+        if bound_order_id and bound_order_id != order_id:
+            return False
+        # Durable claimed/reconcile state proves local ownership independently
+        # of untrusted Broker economics. Parse and compare those only after the
+        # order is classified as owned so malformed values latch permanently.
+        proven_records[order_id] = record
+        return True
 
     proof = ownership_proof or default_proof
     module_orders: dict[str, dict[str, Any]] = {}
@@ -588,13 +582,22 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     )
     if account_isolation_mode == "invalid":
         raise ControlRejected("Invalid account isolation configuration cannot produce a broker sync proof")
+    shared_external_allowed = shared_read_only or account_isolation_mode == "shared_restricted"
+    owned_before = {row["symbol"] for row in store.positions()}
+    staged_symbols = {str(fill["symbol"]).upper() for fill in staged_fills}
+    prospective_symbols = owned_before | staged_symbols
     broker_positions: dict[str, float] = {}
     broker_position_sides: dict[str, str] = {}
+    external_symbols: set[str] = set()
     for row in snapshot.get("positions", []):
-        symbol = str(row.get("code") or "").strip().upper()
+        symbol = ""
         try:
-            if not symbol:
-                raise ControlRejected("Broker position omitted its symbol")
+            symbol = position_symbol(row)
+            if shared_external_allowed and symbol not in prospective_symbols:
+                # Scope is proven from identity alone. Never parse unrelated
+                # holdings' side or quantity into the strategy trust domain.
+                external_symbols.add(symbol)
+                continue
             quantity = position_number(row)
             side_values = [
                 str(row[key]).strip().upper()
@@ -605,12 +608,7 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                 raise ControlRejected("Broker position contains an invalid side")
             canonical_side = "LONG"
             if symbol in broker_positions:
-                if (broker_positions[symbol] != quantity
-                        or broker_position_sides[symbol] != canonical_side):
-                    raise ControlRejected(
-                        "Broker position duplicate contains conflicting economics"
-                    )
-                continue
+                raise ControlRejected("Broker position duplicate conflicts with scoped holdings")
             broker_positions[symbol] = quantity
             broker_position_sides[symbol] = canonical_side
         except ControlRejected as exc:
@@ -620,16 +618,13 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
                 fields.append("symbol")
             if "side" in text:
                 fields.append("side")
-            if "quantity" in text or "economics" in text:
+            if "quantity" in text or "economics" in text or "duplicate" in text:
                 fields.append("quantity")
             store.latch_reconciliation_snapshot_conflict(
                 "positions", symbol, fields or ["quantity"],
                 "Broker position snapshot contains invalid or conflicting identity/economics",
             )
             raise
-    shared_external_allowed = shared_read_only or account_isolation_mode == "shared_restricted"
-    owned_before = {row["symbol"] for row in store.positions()}
-    staged_symbols = {str(fill["symbol"]).upper() for fill in staged_fills}
     unrelated_external = [
         symbol for symbol, qty in broker_positions.items()
         if qty > 1e-9 and symbol not in owned_before and symbol not in staged_symbols
@@ -638,7 +633,6 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         raise ControlRejected(
             "Dedicated strategy account contains external holdings; strong isolation proof failed"
         )
-    prospective_symbols = owned_before | staged_symbols
     prices = {symbol: client.quote(symbol)["last_price"] for symbol in prospective_symbols}
     pending_buy = sum(
         max(0.0, order_number(row, "qty") - order_number(row, "dealt_qty"))
@@ -664,8 +658,10 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
     )
     owned = store.positions()
     owned_symbols = {row["symbol"] for row in owned}
-    external = [symbol for symbol, qty in broker_positions.items()
-                if qty > 1e-9 and symbol not in owned_symbols]
+    external = sorted(external_symbols | {
+        symbol for symbol, qty in broker_positions.items()
+        if qty > 1e-9 and symbol not in owned_symbols
+    })
     if external:
         store.event(
             "shared_account_external_holdings", "moomoo_reconciler", "info",

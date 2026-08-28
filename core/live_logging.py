@@ -12,12 +12,12 @@ from typing import Any
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs" / "live_account"
 _SECRET_KEY = re.compile(
-    r"(password|token|secret|credential|authorization|account.?id|"
-    r"order.?id|deal.?id|broker.?reference|reference)", re.I,
+    r"(password|token|secret|credential|authorization|reference|"
+    r"(?:account|order|deal|broker)[ _-]?(?:id|reference|ref|number))", re.I,
 )
 _LABELED_SECRET = re.compile(
-    r"(?i)\b(password|token|secret|credential|authorization|account(?:\s*id)?|"
-    r"order[ _-]?id|deal(?:[ _-]?id|\s+reference)|broker\s+reference)"
+    r"(?i)\b(password|token|secret|credential|authorization|broker\s+order|"
+    r"(?:account|order|deal|broker)[ _-]?(?:id|reference|ref|number)|account)"
     r"\s*(?:[:=]\s*|\s+)(?:bearer\s+)?[^\s,;]+"
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[^\s,;]+")

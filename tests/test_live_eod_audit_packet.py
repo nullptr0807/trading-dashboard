@@ -73,7 +73,9 @@ def test_eod_application_log_sanitization_cannot_reemit_generic_failure_secrets(
         "deal reference DEAL-SECRET-776655 account 123456789 "
         "broker reference BRK-REFERENCE-445566 "
         "Authorization: Bearer bearer-secret-0123456789 "
-        "opaque_ZYXWVUTSRQPONMLK987654321"
+        "opaque_ZYXWVUTSRQPONMLK987654321 "
+        "order reference ORD.NATURAL-1 broker order: BRK=NATURAL-2 "
+        "deal ref=D.NATURAL-3 account number ACCT.NATURAL-4"
     )
 
     serialized = json.dumps(eod.sanitize({"message": malicious, "data": {"error": malicious}}))
@@ -81,6 +83,7 @@ def test_eod_application_log_sanitization_cannot_reemit_generic_failure_secrets(
     for secret in (
         "abcNaturalToken", "ORDER-ABC-998877", "DEAL-SECRET-776655",
         "123456789", "BRK-REFERENCE-445566", "bearer-secret-0123456789",
-        "opaque_ZYXWVUTSRQPONMLK987654321",
+        "opaque_ZYXWVUTSRQPONMLK987654321", "ORD.NATURAL-1",
+        "BRK=NATURAL-2", "D.NATURAL-3", "ACCT.NATURAL-4",
     ):
         assert secret not in serialized

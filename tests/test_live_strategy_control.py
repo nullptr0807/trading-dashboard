@@ -227,14 +227,17 @@ def test_events_redact_natural_language_broker_references_and_long_identifiers(t
     secrets = [
         "abcNaturalToken", "ORDER-ABC-998877", "DEAL-SECRET-776655",
         "123456789", "BRK-REFERENCE-445566", "bearer-secret-0123456789",
-        "opaque_ZYXWVUTSRQPONMLK987654321",
+        "opaque_ZYXWVUTSRQPONMLK987654321", "ORD.NATURAL-1",
+        "BRK=NATURAL-2", "D.NATURAL-3", "ACCT.NATURAL-4",
     ]
     message = (
         "token abcNaturalToken order_id ORDER-ABC-998877 "
         "deal reference DEAL-SECRET-776655 account 123456789 "
         "broker reference BRK-REFERENCE-445566 "
         "Authorization Bearer bearer-secret-0123456789 "
-        "opaque_ZYXWVUTSRQPONMLK987654321"
+        "opaque_ZYXWVUTSRQPONMLK987654321 "
+        "order reference ORD.NATURAL-1 broker order: BRK=NATURAL-2 "
+        "deal ref=D.NATURAL-3 account number ACCT.NATURAL-4"
     )
 
     s.event("api", "test", "critical", message, {"error": message})
