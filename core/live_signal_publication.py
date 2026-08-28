@@ -26,17 +26,23 @@ from typing import Any, Callable, Iterator
 EXPECTED_CALENDAR_VERSION = "4.13.2"
 CALENDAR_NAME = "XNYS"
 FACTOR_GROUP = "gp_B16"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STORE_BUSY_TIMEOUT_SECONDS = 5
 ELIGIBILITY_MARGIN_SECONDS = 1
 ELIGIBILITY_DELAY_SECONDS = STORE_BUSY_TIMEOUT_SECONDS + ELIGIBILITY_MARGIN_SECONDS
 DEFAULT_SOURCE_DB_PATH = Path("/home/gexin/quant-trading/data/trading.db")
 DEFAULT_FACTORS_PATH = Path("/home/gexin/quant-trading/factors/mined_alphas_per_account.json")
-DEFAULT_PUBLICATION_DB_PATH = Path(__file__).resolve().parents[1] / "data/live_signal_publications.db"
+DEFAULT_PUBLICATION_DB_PATH = (
+    Path(__file__).resolve().parents[1] / "data/signal_publication/live_signal_publications.db"
+)
 
 
 class PublicationError(RuntimeError):
     """Raised when a source or publication cannot be proven safe."""
+
+
+class _SimulatedPublicationCrash(BaseException):
+    """Test-only abrupt process-death simulation (deliberately bypasses Exception)."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,7 @@ class CoverageBaseline:
     baseline_date: str
     size: int
     sha256: str
+    symbols: tuple[str, ...]
 
 
 def canonical_json(value: Any) -> str:
@@ -201,20 +208,70 @@ def readonly_connection(path: str | Path) -> sqlite3.Connection:
         raise PublicationError("Unable to open B16 source database read-only") from exc
 
 
+def _resolved(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def require_canonical_paths(
+    source_db_path: str | Path,
+    factors_path: str | Path,
+    publication_db_path: str | Path,
+) -> None:
+    expected = (DEFAULT_SOURCE_DB_PATH, DEFAULT_FACTORS_PATH, DEFAULT_PUBLICATION_DB_PATH)
+    actual = (source_db_path, factors_path, publication_db_path)
+    if any(_resolved(value) != _resolved(canonical)
+           for value, canonical in zip(actual, expected, strict=True)):
+        raise PublicationError("Live signal publication requires canonical source, factors, and store paths")
+
+
+def _require_owned_mode(path: Path, *, directory: bool) -> None:
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise PublicationError("Unable to verify publication store permissions") from exc
+    if stat.st_uid != os.getuid():
+        raise PublicationError("Publication store owner does not match current uid")
+    forbidden = 0o022 if directory else 0o077
+    if stat.st_mode & forbidden:
+        raise PublicationError("Publication store permissions are not restrictive")
+
+
+def validate_store_permissions(path: str | Path, *, store_may_be_missing: bool = False) -> None:
+    destination = _resolved(path)
+    if not destination.parent.exists():
+        if store_may_be_missing:
+            return
+        raise PublicationError("publication store parent is missing")
+    _require_owned_mode(destination.parent, directory=True)
+    if destination.exists():
+        _require_owned_mode(destination, directory=False)
+    elif not store_may_be_missing:
+        raise PublicationError("publication store is missing")
+    lock_path = _lock_path(destination)
+    if lock_path.exists():
+        _require_owned_mode(lock_path, directory=False)
+
+
 def _lock_path(path: str | Path) -> Path:
-    destination = Path(path).expanduser().resolve()
+    destination = _resolved(path)
     return destination.with_name(destination.name + ".lock")
 
 
 @contextmanager
 def publication_lock(path: str | Path, *, exclusive: bool) -> Iterator[int]:
     """Serialize publishers and keep readers out until late commits are revoked."""
-    lock_path = _lock_path(path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = _resolved(path)
+    lock_path = _lock_path(destination)
+    if not lock_path.parent.exists():
+        lock_path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
+    validate_store_permissions(destination, store_may_be_missing=True)
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     deadline = time.monotonic() + STORE_BUSY_TIMEOUT_SECONDS
     try:
+        stat = os.fstat(descriptor)
+        if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+            raise PublicationError("Publication store lock owner or permissions are unsafe")
         while True:
             try:
                 fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
@@ -247,6 +304,79 @@ def require_store_not_quarantined(descriptor: int) -> None:
         raise PublicationError("Publication store has an unresolved append quarantine")
 
 
+def _quarantine_state(descriptor: int) -> dict[str, Any] | None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = os.read(descriptor, 65536).strip()
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PublicationError("Publication append quarantine is malformed") from exc
+    required = {"state", "source_date", "version", "record_sha256"}
+    if not isinstance(state, dict) or not required.issubset(state):
+        raise PublicationError("Publication append quarantine is unverifiable")
+    return state
+
+
+def _recover_locked(path: str | Path, descriptor: int) -> None:
+    state = _quarantine_state(descriptor)
+    if state is None:
+        return
+    con = initialize_store(path)
+    try:
+        validate_store_schema(con)
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT * FROM signal_publications WHERE strategy_id='B16' "
+            "AND source_date=? AND version=?",
+            (str(state["source_date"]), int(state["version"])),
+        ).fetchone()
+        if row is None:
+            # BEGIN IMMEDIATE plus the process-wide exclusive lock proves absence.
+            con.commit()
+            set_store_quarantine(descriptor, None)
+            return
+        columns = [str(item[1]) for item in con.execute("PRAGMA table_info(signal_publications)")]
+        material = dict(zip(columns, row, strict=True))
+        record_valid = (
+            material.get("record_sha256") == state["record_sha256"]
+            and sha256_json(publication_record_material(material)) == material.get("record_sha256")
+            and hashlib.sha256(str(material["payload_json"]).encode("utf-8")).hexdigest()
+            == material.get("payload_sha256")
+        )
+        reason = ("recovered committed append with uncertain acknowledgement"
+                  if record_valid else "recovered unverifiable committed append")
+        existing_revocation = con.execute(
+            "SELECT 1 FROM signal_publication_revocations WHERE publication_id=?",
+            (int(material["publication_id"]),),
+        ).fetchone()
+        if existing_revocation is None:
+            con.execute(
+                "INSERT INTO signal_publication_revocations(publication_id,revoked_at,reason) "
+                "VALUES(?,?,?)",
+                (int(material["publication_id"]), timestamp_text(datetime.now(timezone.utc)), reason),
+            )
+        con.commit()
+        set_store_quarantine(descriptor, None)
+    except Exception:
+        if con.in_transaction:
+            con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def recover_publication_store(
+    publication_db_path: str | Path = DEFAULT_PUBLICATION_DB_PATH, *, test_mode: bool = False
+) -> None:
+    """Resolve a crashed append under the exclusive lock; readers never invoke this."""
+    if not test_mode and _resolved(publication_db_path) != _resolved(DEFAULT_PUBLICATION_DB_PATH):
+        raise PublicationError("Live recovery requires the canonical publication store")
+    with publication_lock(publication_db_path, exclusive=True) as descriptor:
+        _recover_locked(publication_db_path, descriptor)
+
+
 _SCHEMA_OBJECTS = {
     ("table", "signal_publications"): """CREATE TABLE signal_publications(
         publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,10 +397,12 @@ _SCHEMA_OBJECTS = {
         baseline_date TEXT NOT NULL,
         baseline_size INTEGER NOT NULL CHECK(baseline_size > 0),
         baseline_sha256 TEXT NOT NULL CHECK(length(baseline_sha256)=64),
+        baseline_symbols_json TEXT NOT NULL,
+        overlap_size INTEGER NOT NULL CHECK(overlap_size > 0),
+        overlap_sha256 TEXT NOT NULL CHECK(length(overlap_sha256)=64),
         append_started_at TEXT NOT NULL,
         record_sha256 TEXT NOT NULL CHECK(length(record_sha256)=64),
-        UNIQUE(strategy_id, source_date, version),
-        UNIQUE(strategy_id, source_date, factor_set_sha256, payload_sha256)
+        UNIQUE(strategy_id, source_date, version)
     )""",
     ("table", "signal_publication_revocations"): """CREATE TABLE signal_publication_revocations(
         publication_id INTEGER PRIMARY KEY,
@@ -292,7 +424,11 @@ _SCHEMA_OBJECTS = {
             old.publication_id=NEW.publication_id OR
             (old.strategy_id=NEW.strategy_id AND old.source_date=NEW.source_date AND old.version=NEW.version) OR
             (old.strategy_id=NEW.strategy_id AND old.source_date=NEW.source_date AND
-             old.factor_set_sha256=NEW.factor_set_sha256 AND old.payload_sha256=NEW.payload_sha256))
+             old.factor_set_sha256=NEW.factor_set_sha256 AND old.payload_sha256=NEW.payload_sha256 AND
+             NOT EXISTS(SELECT 1 FROM signal_publication_revocations revoked
+                        WHERE revoked.publication_id=old.publication_id)) OR
+            (old.strategy_id=NEW.strategy_id AND
+             (NEW.append_started_at<=old.append_started_at OR NEW.eligible_at<=old.eligible_at)))
         BEGIN SELECT RAISE(ABORT, 'signal publications are immutable'); END""",
     ("trigger", "signal_revocations_no_update"): """CREATE TRIGGER signal_revocations_no_update
         BEFORE UPDATE ON signal_publication_revocations BEGIN
@@ -318,13 +454,18 @@ def _normalized_schema_sql(sql: str) -> str:
 
 
 def initialize_store(path: str | Path) -> sqlite3.Connection:
-    destination = Path(path).expanduser().resolve()
+    destination = _resolved(path)
     parent_existed = destination.parent.exists()
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not parent_existed:
         os.chmod(destination.parent, 0o700)
+    validate_store_permissions(destination, store_may_be_missing=True)
+    existed = destination.exists()
     con = sqlite3.connect(destination, timeout=STORE_BUSY_TIMEOUT_SECONDS, isolation_level=None)
     try:
+        if not existed:
+            os.chmod(destination, 0o600)
+        validate_store_permissions(destination)
         version = int(con.execute("PRAGMA user_version").fetchone()[0])
         if version not in {0, SCHEMA_VERSION}:
             raise PublicationError(f"Unsupported publication schema version {version}")
@@ -332,7 +473,6 @@ def initialize_store(path: str | Path) -> sqlite3.Connection:
             con.execute(_create_sql(sql))
         con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         validate_store_schema(con)
-        os.chmod(destination, 0o600)
         return con
     except Exception:
         con.close()
@@ -378,20 +518,19 @@ def _universe_baseline(
     evidence = {"kind": "universe_membership", "date": source_date,
                 "source": next(iter(sources)), "universe_hash": next(iter(hashes)),
                 "symbols": symbols}
-    return CoverageBaseline("universe_membership", source_date, len(symbols), sha256_json(evidence))
+    return CoverageBaseline(
+        "universe_membership", source_date, len(symbols), sha256_json(evidence), tuple(symbols)
+    )
 
 
 def _prior_session_baseline(
     con: sqlite3.Connection, source_date: str, factor_names: tuple[str, ...], calendar: Any
 ) -> CoverageBaseline | None:
-    previous = con.execute(
-        "SELECT MAX(date) FROM factor_values WHERE factor_group=? AND date<?",
-        (FACTOR_GROUP, source_date),
-    ).fetchone()[0]
-    if not previous:
-        return None
-    previous_text = str(previous)
-    parse_session(previous_text, calendar, label="Previous")
+    try:
+        import pandas as pd
+        previous_text = calendar.previous_session(pd.Timestamp(source_date)).date().isoformat()
+    except Exception as exc:
+        raise PublicationError("Unable to determine immediately previous XNYS session") from exc
     placeholders = ",".join("?" for _ in factor_names)
     rows = con.execute(
         f"SELECT ticker,factor_name,value FROM factor_values WHERE factor_group=? AND date=? "
@@ -401,11 +540,15 @@ def _prior_session_baseline(
     normalized = [[str(row["ticker"]).strip(), str(row["factor_name"]), row["value"]]
                   for row in rows]
     if not normalized:
-        return None
+        raise PublicationError(
+            "No verifiable coverage baseline for immediately previous XNYS session"
+        )
     _, matrix = ranking_from_values(normalized, factor_names)
     evidence = {"kind": "prior_session", "date": previous_text,
                 "factor_names": factor_names, "values": normalized}
-    return CoverageBaseline("prior_session", previous_text, len(matrix), sha256_json(evidence))
+    return CoverageBaseline(
+        "prior_session", previous_text, len(matrix), sha256_json(evidence), tuple(sorted(matrix))
+    )
 
 
 def _snapshot_source(
@@ -440,7 +583,12 @@ def _snapshot_source(
                 baseline = _prior_session_baseline(con, source_date, factor_names, calendar)
             if baseline is None:
                 raise PublicationError("No verifiable B16 coverage baseline")
-            if len(matrix) / baseline.size < minimum_latest_coverage:
+            overlap = set(matrix).intersection(baseline.symbols)
+            if (len(matrix) / baseline.size < minimum_latest_coverage
+                    or len(overlap) / baseline.size < minimum_latest_coverage
+                    or len(overlap) / len(matrix) < minimum_latest_coverage):
+                if baseline.kind == "prior_session" and not overlap:
+                    raise PublicationError("Latest B16 cross-section has no prior-session symbol overlap")
                 raise PublicationError("Latest B16 cross-section coverage is partial")
             con.commit()
     except PublicationError:
@@ -457,7 +605,7 @@ def publication_record_material(values: dict[str, Any]) -> dict[str, Any]:
         "factor_set_sha256", "payload_json", "payload_sha256", "source_db_path",
         "source_content_sha256", "calendar_name", "calendar_version", "universe_size",
         "baseline_kind", "baseline_date", "baseline_size", "baseline_sha256",
-        "append_started_at",
+        "baseline_symbols_json", "overlap_size", "overlap_sha256", "append_started_at",
     )
     return {key: values[key] for key in keys}
 
@@ -470,6 +618,8 @@ def publish_b16_signal(
     clock: Callable[[], datetime] | None = None,
     publish: bool = False,
     minimum_latest_coverage: float = 0.90,
+    test_mode: bool = False,
+    _test_crash_at: str | None = None,
 ) -> PublicationResult:
     """Validate a source snapshot and optionally append an immutable publication.
 
@@ -480,6 +630,10 @@ def publish_b16_signal(
     """
     if not 0 < minimum_latest_coverage <= 1:
         raise PublicationError("Invalid publication coverage policy")
+    if _test_crash_at is not None and not test_mode:
+        raise PublicationError("Crash injection is test-only")
+    if publish and not test_mode:
+        require_canonical_paths(source_db_path, factors_path, publication_db_path)
     get_now = clock or (lambda: datetime.now(timezone.utc))
     called_at = utc_datetime(get_now(), label="clock")
     calendar, cutoff_date = latest_completed_session(called_at)
@@ -493,15 +647,23 @@ def publish_b16_signal(
         "factor_group": FACTOR_GROUP, "source_date": source_date,
         "factor_names": factors, "values": values,
     })
-    coverage_by_factor = {factor: len(matrix) / baseline.size for factor in factors}
+    source_path = str(_resolved(source_db_path))
+    baseline_symbols = tuple(sorted(baseline.symbols))
+    overlap_symbols = tuple(sorted(set(matrix).intersection(baseline_symbols)))
+    overlap_hash = sha256_json({"symbols": overlap_symbols})
+    coverage_by_factor = {factor: len(overlap_symbols) / baseline.size for factor in factors}
     payload = {
-        "schema_version": 2, "strategy_id": "B16", "source_date": source_date,
+        "schema_version": 3, "strategy_id": "B16", "source_date": source_date,
         "factor_names": list(factors), "factor_set_sha256": factor_hash,
         "values": values, "ranking": ranking, "universe_size": len(matrix),
         "coverage": {"baseline_kind": baseline.kind, "baseline_date": baseline.baseline_date,
                      "baseline_size": baseline.size, "baseline_sha256": baseline.sha256,
+                     "baseline_symbols": list(baseline_symbols),
+                     "overlap_size": len(overlap_symbols), "overlap_sha256": overlap_hash,
+                     "current_overlap": len(overlap_symbols) / len(matrix),
                      "by_factor": coverage_by_factor},
         "source_content_sha256": source_hash,
+        "source": {"db_path": source_path, "content_sha256": source_hash},
         "calendar": {"name": CALENDAR_NAME, "version": EXPECTED_CALENDAR_VERSION},
     }
     payload_text = canonical_json(payload)
@@ -514,6 +676,8 @@ def publish_b16_signal(
         return preview
 
     with publication_lock(publication_db_path, exclusive=True) as lock_descriptor:
+        if _quarantine_state(lock_descriptor) is not None:
+            _recover_locked(publication_db_path, lock_descriptor)
         require_store_not_quarantined(lock_descriptor)
         con = initialize_store(publication_db_path)
         quarantine_set = False
@@ -538,6 +702,13 @@ def publish_b16_signal(
             eligible = append_started + timedelta(seconds=ELIGIBILITY_DELAY_SECONDS)
             append_text = timestamp_text(append_started)
             eligible_text = timestamp_text(eligible)
+            latest_times = con.execute(
+                "SELECT MAX(append_started_at),MAX(eligible_at) FROM signal_publications "
+                "WHERE strategy_id='B16'"
+            ).fetchone()
+            if ((latest_times[0] is not None and append_text <= str(latest_times[0]))
+                    or (latest_times[1] is not None and eligible_text <= str(latest_times[1]))):
+                raise PublicationError("Publication wall clock is not strictly monotonic")
             version = int(con.execute(
                 "SELECT COALESCE(MAX(version),0)+1 FROM signal_publications "
                 "WHERE strategy_id='B16' AND source_date=?", (source_date,),
@@ -547,35 +718,43 @@ def publish_b16_signal(
                 "version": version, "factor_names_json": canonical_json(list(factors)),
                 "factor_set_sha256": factor_hash, "payload_json": payload_text,
                 "payload_sha256": payload_hash,
-                "source_db_path": str(Path(source_db_path).expanduser().resolve()),
+                "source_db_path": source_path,
                 "source_content_sha256": source_hash, "calendar_name": CALENDAR_NAME,
                 "calendar_version": EXPECTED_CALENDAR_VERSION, "universe_size": len(matrix),
                 "baseline_kind": baseline.kind, "baseline_date": baseline.baseline_date,
                 "baseline_size": baseline.size, "baseline_sha256": baseline.sha256,
+                "baseline_symbols_json": canonical_json(list(baseline_symbols)),
+                "overlap_size": len(overlap_symbols), "overlap_sha256": overlap_hash,
                 "append_started_at": append_text,
             }
             record_hash = sha256_json(publication_record_material(values_by_name))
             set_store_quarantine(lock_descriptor, {
                 "state": "append_unresolved", "eligible_at": eligible_text,
                 "source_date": source_date, "version": version,
-                "record_sha256": record_hash,
+                "record_sha256": record_hash, "payload_sha256": payload_hash,
             })
             quarantine_set = True
+            if _test_crash_at == "after_quarantine":
+                raise _SimulatedPublicationCrash()
             cursor = con.execute(
                 """INSERT INTO signal_publications(
                     strategy_id,source_date,eligible_at,version,factor_names_json,
                     factor_set_sha256,payload_json,payload_sha256,source_db_path,
                     source_content_sha256,calendar_name,calendar_version,universe_size,
                     baseline_kind,baseline_date,baseline_size,baseline_sha256,
-                    append_started_at,record_sha256
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    baseline_symbols_json,overlap_size,overlap_sha256,append_started_at,record_sha256
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (*publication_record_material(values_by_name).values(), record_hash),
             )
             if cursor.lastrowid is None:
                 raise PublicationError("Publication append did not return an id")
             publication_id = cursor.lastrowid
+            if _test_crash_at == "after_insert":
+                raise _SimulatedPublicationCrash()
             commit_attempted = True
             con.commit()
+            if _test_crash_at == "after_commit":
+                raise _SimulatedPublicationCrash()
             committed_returned_at = utc_datetime(get_now(), label="clock")
             if committed_returned_at >= eligible:
                 con.execute("BEGIN IMMEDIATE")

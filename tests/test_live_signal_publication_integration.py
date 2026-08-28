@@ -15,6 +15,14 @@ from core.live_signal_publication import PublicationError, publish_b16_signal
 from core.live_strategy_control import LiveStrategyStore
 
 
+def _load(*args, **kwargs):
+    return load_b16_signal_batch(*args, test_mode=True, **kwargs)
+
+
+def _publish(*args, **kwargs):
+    return publish_b16_signal(*args, test_mode=True, **kwargs)
+
+
 class FakeClient:
     settings = SimpleNamespace(
         trading_enabled=False, auto_trading_enabled=False, trade_api_token=None,
@@ -68,27 +76,27 @@ def _active_store(tmp_path):
 def test_real_publication_loader_executor_planner_chain_is_pit_at_close(tmp_path):
     source, factors = _source(tmp_path)
     publications = tmp_path / "publications.db"
-    publish_b16_signal(
+    _publish(
         source, factors, publications,
         clock=lambda: datetime(2026, 8, 26, 21, tzinfo=timezone.utc), publish=True,
     )
     with sqlite3.connect(source) as con:
-        con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-27", "NEW"))
+        con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-27", "OLD"))
 
     # The publisher itself refuses today's mutable rows until the official close.
     with pytest.raises(PublicationError, match="future|completed"):
-        publish_b16_signal(
+        _publish(
             source, factors, publications,
             clock=lambda: datetime(2026, 8, 27, 19, 59, tzinfo=timezone.utc), publish=True,
         )
-    publish_b16_signal(
+    _publish(
         source, factors, publications,
         clock=lambda: datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc), publish=True,
     )
 
     executor = LiveAutoExecutor(
         cast(Any, FakeClient()), _active_store(tmp_path),
-        signal_loader=partial(load_b16_signal_batch, publications, factors),
+        signal_loader=partial(_load, publications, factors),
     )
     premarket = executor.shadow(now=datetime(2026, 8, 27, 12, tzinfo=timezone.utc))
     exact_close = executor.shadow(now=datetime(2026, 8, 27, 20, 0, 6, tzinfo=timezone.utc))
@@ -104,7 +112,7 @@ def test_executor_shadow_blocks_without_immutable_publication(tmp_path):
     missing = tmp_path / "missing-publications.db"
     executor = LiveAutoExecutor(
         cast(Any, FakeClient()), _active_store(tmp_path),
-        signal_loader=partial(load_b16_signal_batch, missing, factors),
+        signal_loader=partial(_load, missing, factors),
     )
     with pytest.raises(SignalAdapterError, match="publication"):
         executor.shadow(now=datetime(2026, 8, 27, 12, tzinfo=timezone.utc))

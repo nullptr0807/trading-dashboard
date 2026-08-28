@@ -9,7 +9,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.live_signal_adapter import SignalAdapterError, load_b16_signal_batch
-from core.live_signal_publication import PublicationError, publish_b16_signal
+from core.live_signal_publication import (
+    PublicationError,
+    _SimulatedPublicationCrash,
+    publish_b16_signal,
+    recover_publication_store,
+)
 
 
 def _source(tmp_path, *, factors=("f1", "f2"), rows=(), add_prior=True):
@@ -43,8 +48,12 @@ def _rows(source_date, values):
 
 def _publish(source, factors, store, at, **kwargs):
     return publish_b16_signal(
-        source, factors, store, clock=lambda: at, publish=True, **kwargs,
+        source, factors, store, clock=lambda: at, publish=True, test_mode=True, **kwargs,
     )
+
+
+def _load(store, factors, **kwargs):
+    return load_b16_signal_batch(store, factors, test_mode=True, **kwargs)
 
 
 def test_publication_is_dry_run_by_default_and_real_write_is_private(tmp_path):
@@ -79,10 +88,10 @@ def test_historical_as_of_uses_v1_until_v2_was_actually_published(tmp_path):
         con.execute("UPDATE factor_values SET value=0 WHERE ticker='AAA' AND date='2026-08-26'")
     _publish(source, factors, store, t2)
 
-    between = load_b16_signal_batch(
+    between = _load(
         store, factors, as_of=datetime(2026, 8, 27, 2, 0, 7, tzinfo=timezone.utc),
     )
-    after = load_b16_signal_batch(
+    after = _load(
         store, factors, as_of=datetime(2026, 8, 27, 4, 0, 7, tzinfo=timezone.utc),
     )
     assert between.buy_candidates == ("AAA",)
@@ -122,7 +131,7 @@ def test_payload_or_metadata_tampering_is_rejected_and_rows_are_immutable(tmp_pa
         con.execute("UPDATE signal_publications SET payload_sha256=?", ("0" * 64,))
 
     with pytest.raises(SignalAdapterError, match="integrity"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 def test_insert_or_replace_cannot_replace_existing_id_version_or_metadata(tmp_path):
@@ -161,7 +170,7 @@ def test_schema_validation_rejects_noop_trigger_and_canonical_schema_tampering(t
                     con.execute("UPDATE sqlite_master SET sql=replace(sql,'version > 0','version >= 0') WHERE type='table' AND name='signal_publications'")
                     con.execute("PRAGMA writable_schema=OFF")
         with pytest.raises(SignalAdapterError, match="schema integrity"):
-            load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+            _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 @pytest.mark.parametrize("field,replacement", [
@@ -181,7 +190,7 @@ def test_record_hash_rejects_version_or_eligibility_tampering(tmp_path, field, r
         con.execute(f"UPDATE signal_publications SET {field}=?", (replacement,))
         con.execute(trigger_sql)
     with pytest.raises(SignalAdapterError, match="integrity|eligibility"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 def test_eligibility_is_created_after_slow_snapshot_and_precommit_as_of_is_ineligible(tmp_path):
@@ -193,11 +202,13 @@ def test_eligibility_is_created_after_slow_snapshot_and_precommit_as_of_is_ineli
         datetime(2026, 8, 27, 1, 10, tzinfo=timezone.utc),      # after slow source validation
         datetime(2026, 8, 27, 1, 10, 1, tzinfo=timezone.utc),   # commit returned
     ])
-    result = publish_b16_signal(source, factors, store, clock=lambda: next(moments), publish=True)
+    result = publish_b16_signal(
+        source, factors, store, clock=lambda: next(moments), publish=True, test_mode=True,
+    )
     assert result.eligible_at == "2026-08-27T01:10:06.000000+00:00"
     with pytest.raises(SignalAdapterError, match="eligible"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 1, 10, 5, tzinfo=timezone.utc))
-    assert load_b16_signal_batch(
+        _load(store, factors, as_of=datetime(2026, 8, 27, 1, 10, 5, tzinfo=timezone.utc))
+    assert _load(
         store, factors, as_of=datetime(2026, 8, 27, 1, 10, 6, tzinfo=timezone.utc)
     ).publication_version == 1
 
@@ -213,9 +224,11 @@ def test_commit_finishing_after_eligibility_is_revoked_and_never_loadable(tmp_pa
         datetime(2026, 8, 27, 1, 10, 7, tzinfo=timezone.utc),
     ])
     with pytest.raises(PublicationError, match="eligibility"):
-        publish_b16_signal(source, factors, store, clock=lambda: next(moments), publish=True)
+        publish_b16_signal(
+            source, factors, store, clock=lambda: next(moments), publish=True, test_mode=True,
+        )
     with pytest.raises(SignalAdapterError, match="eligible"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 def test_unresolved_append_sidecar_from_crashed_publisher_fails_closed(tmp_path):
@@ -226,7 +239,7 @@ def test_unresolved_append_sidecar_from_crashed_publisher_fails_closed(tmp_path)
     lock = store.with_name(store.name + ".lock")
     lock.write_text('{"state":"append_unresolved"}')
     with pytest.raises(SignalAdapterError, match="quarantine"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 def test_first_snapshot_without_exact_universe_or_prior_session_fails_closed(tmp_path):
@@ -256,12 +269,12 @@ def test_loader_requires_publication_proof_and_current_factor_set(tmp_path):
     source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
     store = tmp_path / "publications.db"
     with pytest.raises(SignalAdapterError, match="publication"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, tzinfo=timezone.utc))
 
     _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
     factors.write_text(json.dumps({"B16": [{"name": "f2", "expression": "X0"}]}))
     with pytest.raises(SignalAdapterError, match="factor set"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
 
 
 @pytest.mark.parametrize("bad_value", [None, float("nan"), float("inf"), float("-inf")])
@@ -295,7 +308,7 @@ def test_publisher_rejects_partial_future_and_non_session_source(tmp_path):
 
 def test_loader_honors_eligibility_and_completed_session_cutoff(tmp_path):
     old = {"OLD": {"f1": 2.0}, "X": {"f1": 1.0}}
-    new = {"NEW": {"f1": 2.0}, "X": {"f1": 1.0}}
+    new = {"OLD": {"f1": 1.0}, "X": {"f1": 2.0}}
     source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", old))
     store = tmp_path / "publications.db"
     _publish(source, factors, store, datetime(2026, 8, 26, 21, tzinfo=timezone.utc))
@@ -303,10 +316,10 @@ def test_loader_honors_eligibility_and_completed_session_cutoff(tmp_path):
         con.executemany("INSERT INTO factor_values VALUES(?,?,?,?,?)", _rows("2026-08-27", new))
     _publish(source, factors, store, datetime(2026, 8, 27, 20, tzinfo=timezone.utc))
 
-    before_close = load_b16_signal_batch(
+    before_close = _load(
         store, factors, as_of=datetime(2026, 8, 27, 19, 59, tzinfo=timezone.utc),
     )
-    exact_close = load_b16_signal_batch(
+    exact_close = _load(
         store, factors, as_of=datetime(2026, 8, 27, 20, 0, 6, tzinfo=timezone.utc),
     )
     assert before_close.source_date == "2026-08-26"
@@ -317,7 +330,177 @@ def test_unknown_schema_version_fails_closed(tmp_path):
     store = tmp_path / "publications.db"
     with sqlite3.connect(store) as con:
         con.execute("PRAGMA user_version=99")
+    os.chmod(store, 0o600)
     factors = tmp_path / "factors.json"
     factors.write_text(json.dumps({"B16": [{"name": "f1", "expression": "X0"}]}))
     with pytest.raises(SignalAdapterError, match="schema"):
-        load_b16_signal_batch(store, factors, as_of=datetime(2026, 8, 27, tzinfo=timezone.utc))
+        _load(store, factors, as_of=datetime(2026, 8, 27, tzinfo=timezone.utc))
+
+
+
+def test_fallback_requires_immediately_previous_xnys_session(tmp_path):
+    current = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    rows = _rows("2026-08-20", current) + _rows("2026-08-26", current)
+    source, factors = _source(tmp_path, factors=("f1",), rows=rows, add_prior=False)
+    with pytest.raises(PublicationError, match="previous XNYS session"):
+        _publish(source, factors, tmp_path / "pub.db",
+                 datetime(2026, 8, 27, tzinfo=timezone.utc))
+
+
+def test_fallback_skips_weekend_and_holiday_to_immediate_session(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    rows = _rows("2026-07-02", values) + _rows("2026-07-06", values)
+    source, factors = _source(tmp_path, factors=("f1",), rows=rows, add_prior=False)
+    result = _publish(source, factors, tmp_path / "pub.db",
+                      datetime(2026, 7, 7, tzinfo=timezone.utc))
+    assert result.baseline_date == "2026-07-02"
+
+
+def test_same_size_disjoint_fallback_fails_overlap_but_small_change_passes(tmp_path):
+    prior = {f"S{i}": {"f1": float(i)} for i in range(10)}
+    disjoint = {f"X{i}": {"f1": float(i)} for i in range(10)}
+    disjoint_case = tmp_path / "disjoint"
+    disjoint_case.mkdir()
+    source, factors = _source(
+        disjoint_case, factors=("f1",),
+        rows=_rows("2026-08-25", prior) + _rows("2026-08-26", disjoint), add_prior=False,
+    )
+    with pytest.raises(PublicationError, match="overlap"):
+        _publish(source, factors, disjoint_case / "pub.db",
+                 datetime(2026, 8, 27, tzinfo=timezone.utc))
+
+    changed = {**{f"S{i}": {"f1": float(i)} for i in range(9)}, "NEW": {"f1": 10.0}}
+    case = tmp_path / "small-change"
+    case.mkdir()
+    os.chmod(case, 0o700)
+    source, factors = _source(
+        case, factors=("f1",),
+        rows=_rows("2026-08-25", prior) + _rows("2026-08-26", changed), add_prior=False,
+    )
+    result = _publish(source, factors, case / "pub.db",
+                      datetime(2026, 8, 27, tzinfo=timezone.utc))
+    assert result.persisted
+
+
+@pytest.mark.parametrize("crash_at,expected_retry_version", [
+    ("after_quarantine", 1),
+    ("after_insert", 1),
+    ("after_commit", 2),
+])
+def test_crash_quarantine_recovery_is_repeatable_and_allows_retry(
+    tmp_path, crash_at, expected_retry_version,
+):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    with pytest.raises(_SimulatedPublicationCrash):
+        _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+                 _test_crash_at=crash_at)
+    with pytest.raises(SignalAdapterError, match="quarantine"):
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+
+    recover_publication_store(store, test_mode=True)
+    recover_publication_store(store, test_mode=True)
+    retried = _publish(source, factors, store, datetime(2026, 8, 27, 3, tzinfo=timezone.utc))
+    assert retried.version == expected_retry_version
+    assert _load(store, factors,
+                 as_of=datetime(2026, 8, 27, 4, tzinfo=timezone.utc)).publication_version == expected_retry_version
+    with sqlite3.connect(store) as con:
+        revoked = con.execute("SELECT COUNT(*) FROM signal_publication_revocations").fetchone()[0]
+    assert revoked == (1 if crash_at == "after_commit" else 0)
+
+
+def test_revoked_late_commit_can_retry_identical_content_as_new_version(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    moments = iter([
+        datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 27, 1, 0, 7, tzinfo=timezone.utc),
+        datetime(2026, 8, 27, 1, 0, 7, tzinfo=timezone.utc),
+    ])
+    with pytest.raises(PublicationError, match="revoked"):
+        publish_b16_signal(source, factors, store, clock=lambda: next(moments),
+                           publish=True, test_mode=True)
+    retry = _publish(source, factors, store, datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+    assert retry.version == 2
+
+
+def test_live_api_rejects_noncanonical_paths_even_if_source_is_valid(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    with pytest.raises(PublicationError, match="canonical"):
+        publish_b16_signal(source, factors, tmp_path / "pub.db",
+                           clock=lambda: datetime(2026, 8, 27, tzinfo=timezone.utc), publish=True)
+    with pytest.raises(SignalAdapterError, match="canonical"):
+        load_b16_signal_batch(tmp_path / "pub.db", factors,
+                              as_of=datetime(2026, 8, 27, tzinfo=timezone.utc))
+
+
+def test_cli_custom_paths_are_dry_run_only(tmp_path):
+    import subprocess
+    import sys
+    command = [sys.executable, "scripts/publish_b16_live_signal.py", "--publish",
+               "--source-db", str(tmp_path / "alternate.db")]
+    result = subprocess.run(command, cwd=str(__import__('pathlib').Path(__file__).parents[1]),
+                            text=True, capture_output=True, check=False)
+    assert result.returncode == 2
+    assert "canonical" in result.stderr
+
+
+@pytest.mark.parametrize("target,mode", [("parent", 0o777), ("db", 0o666), ("lock", 0o666)])
+def test_permission_drift_fails_closed_immediately(tmp_path, target, mode):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    private = tmp_path / "private"
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = private / "pub.db"
+    _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+    path = {"parent": private, "db": store, "lock": store.with_name(store.name + ".lock")}[target]
+    os.chmod(path, mode)
+    with pytest.raises(SignalAdapterError, match="permission"):
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+
+
+def test_owner_drift_fails_closed(tmp_path, monkeypatch):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+    monkeypatch.setattr(os, "getuid", lambda: store.stat().st_uid + 1)
+    with pytest.raises(SignalAdapterError, match="owner"):
+        _load(store, factors, as_of=datetime(2026, 8, 27, 2, tzinfo=timezone.utc))
+
+
+@pytest.mark.parametrize("second_at", [
+    datetime(2026, 8, 27, 1, tzinfo=timezone.utc),
+    datetime(2026, 8, 27, 0, 59, 59, tzinfo=timezone.utc),
+])
+def test_new_version_rejects_equal_or_rolled_back_wall_clock(tmp_path, second_at):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+    with sqlite3.connect(source) as con:
+        con.execute("UPDATE factor_values SET value=-1 WHERE ticker='AAA' AND date='2026-08-26'")
+    with pytest.raises(PublicationError, match="monotonic"):
+        _publish(source, factors, store, second_at)
+    with sqlite3.connect(store) as con:
+        assert con.execute("SELECT COUNT(*) FROM signal_publications").fetchone()[0] == 1
+
+
+def test_concurrent_new_version_keeps_monotonic_time_and_idempotency(tmp_path):
+    values = {"AAA": {"f1": 2.0}, "BBB": {"f1": 1.0}}
+    source, factors = _source(tmp_path, factors=("f1",), rows=_rows("2026-08-26", values))
+    store = tmp_path / "pub.db"
+    _publish(source, factors, store, datetime(2026, 8, 27, 1, tzinfo=timezone.utc))
+    with sqlite3.connect(source) as con:
+        con.execute("UPDATE factor_values SET value=-1 WHERE ticker='AAA' AND date='2026-08-26'")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(
+            lambda _: _publish(source, factors, store,
+                               datetime(2026, 8, 27, 2, tzinfo=timezone.utc)), range(8)))
+    assert {result.version for result in results} == {2}
+    with sqlite3.connect(store) as con:
+        times = con.execute("SELECT append_started_at FROM signal_publications ORDER BY version").fetchall()
+    assert times[0][0] < times[1][0]

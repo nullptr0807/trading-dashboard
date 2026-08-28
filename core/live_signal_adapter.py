@@ -14,6 +14,7 @@ from core.live_signal_publication import (
     CALENDAR_NAME,
     DEFAULT_FACTORS_PATH,
     DEFAULT_PUBLICATION_DB_PATH,
+    DEFAULT_SOURCE_DB_PATH,
     EXPECTED_CALENDAR_VERSION,
     ELIGIBILITY_DELAY_SECONDS,
     FACTOR_GROUP,
@@ -24,10 +25,12 @@ from core.live_signal_publication import (
     parse_session,
     publication_lock,
     publication_record_material,
+    require_canonical_paths,
     require_store_not_quarantined,
     ranking_from_values,
     sha256_json,
     timestamp_text,
+    validate_store_permissions,
     validate_store_schema,
 )
 
@@ -97,6 +100,7 @@ def _validate_publication(
     as_of: datetime,
     minimum_latest_coverage: float,
     max_age_days: int,
+    test_mode: bool,
 ) -> tuple[dict[str, Any], list[list[str]]]:
     try:
         payload_text = str(row["payload_json"])
@@ -129,7 +133,7 @@ def _validate_publication(
             raise SignalAdapterError("B16 publication factor set does not match active factor set")
         if factor_hash != row["factor_set_sha256"]:
             raise _integrity_error()
-        if (payload.get("schema_version") != 2 or payload.get("strategy_id") != "B16"
+        if (payload.get("schema_version") != 3 or payload.get("strategy_id") != "B16"
                 or payload.get("source_date") != source_date
                 or tuple(payload.get("factor_names", ())) != factor_names
                 or payload.get("factor_set_sha256") != factor_hash):
@@ -151,6 +155,9 @@ def _validate_publication(
         })
         if (source_hash != row["source_content_sha256"]
                 or payload.get("source_content_sha256") != source_hash
+                or payload.get("source") != {
+                    "db_path": row["source_db_path"], "content_sha256": source_hash,
+                }
                 or payload.get("ranking") != ranking
                 or payload.get("universe_size") != len(matrix)
                 or int(row["universe_size"]) != len(matrix)):
@@ -159,18 +166,45 @@ def _validate_publication(
         if not isinstance(coverage, dict):
             raise _integrity_error()
         baseline_size = row["baseline_size"]
-        expected_coverage = len(matrix) / int(baseline_size)
+        baseline_symbols = tuple(json.loads(str(row["baseline_symbols_json"])))
+        if (not baseline_symbols or tuple(sorted(set(baseline_symbols))) != baseline_symbols
+                or len(baseline_symbols) != int(baseline_size)):
+            raise _integrity_error()
+        overlap_symbols = tuple(sorted(set(matrix).intersection(baseline_symbols)))
+        overlap_size = len(overlap_symbols)
+        overlap_hash = sha256_json({"symbols": overlap_symbols})
+        expected_coverage = overlap_size / int(baseline_size)
+        expected_current_overlap = overlap_size / len(matrix)
+        if row["baseline_kind"] == "universe_membership":
+            if row["baseline_date"] != source_date or not set(matrix).issubset(baseline_symbols):
+                raise _integrity_error("B16 exact-universe coverage proof is invalid")
+        elif row["baseline_kind"] == "prior_session":
+            import pandas as pd
+            expected_prior = calendar.previous_session(pd.Timestamp(source_date)).date().isoformat()
+            if row["baseline_date"] != expected_prior:
+                raise _integrity_error("B16 prior-session coverage proof is invalid")
+        else:
+            raise _integrity_error()
         if (coverage.get("baseline_kind") != row["baseline_kind"]
                 or coverage.get("baseline_date") != row["baseline_date"]
                 or coverage.get("baseline_size") != baseline_size
                 or coverage.get("baseline_sha256") != row["baseline_sha256"]
+                or coverage.get("baseline_symbols") != list(baseline_symbols)
+                or coverage.get("overlap_size") != row["overlap_size"]
+                or int(row["overlap_size"]) != overlap_size
+                or coverage.get("overlap_sha256") != row["overlap_sha256"]
+                or row["overlap_sha256"] != overlap_hash
+                or coverage.get("current_overlap") != expected_current_overlap
                 or coverage.get("by_factor") != {
                     factor: expected_coverage for factor in factor_names
                 }):
             raise _integrity_error()
-        if any(float(value) < minimum_latest_coverage
-               for value in coverage["by_factor"].values()):
+        if (expected_current_overlap < minimum_latest_coverage
+                or any(float(value) < minimum_latest_coverage
+                       for value in coverage["by_factor"].values())):
                 raise SignalAdapterError("B16 publication cross-section coverage is partial")
+        if not test_mode and Path(str(row["source_db_path"])).resolve() != DEFAULT_SOURCE_DB_PATH.resolve():
+            raise _integrity_error("B16 publication source provenance is not canonical")
         if sha256_json(publication_record_material(dict(row))) != row["record_sha256"]:
             raise _integrity_error()
         return payload, ranking
@@ -191,6 +225,7 @@ def load_b16_signal_batch(
     max_age_days: int = 4,
     minimum_latest_coverage: float = 0.90,
     sell_tail_size: int = 4,
+    test_mode: bool = False,
 ) -> SignalBatch:
     """Load the newest publication proven available and complete at ``as_of``.
 
@@ -205,6 +240,9 @@ def load_b16_signal_batch(
         raise SignalAdapterError("sell_tail_size must be positive")
     now = _as_utc(as_of)
     try:
+        if not test_mode:
+            require_canonical_paths(DEFAULT_SOURCE_DB_PATH, factors_path, db_path)
+        validate_store_permissions(db_path)
         expected_factors = active_factor_names(factors_path)
         calendar, cutoff_date = latest_completed_session(now)
     except PublicationError as exc:
@@ -229,7 +267,7 @@ def load_b16_signal_batch(
                     raise SignalAdapterError("No eligible B16 publication exists for as_of")
                 _, ranking_payload = _validate_publication(
                     row, expected_factors, calendar, cutoff_date, now,
-                    minimum_latest_coverage, max_age_days,
+                    minimum_latest_coverage, max_age_days, test_mode,
                 )
     except PublicationError as exc:
         raise SignalAdapterError(str(exc)) from exc
