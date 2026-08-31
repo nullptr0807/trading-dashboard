@@ -143,6 +143,50 @@ def test_stop_loss_sell_cannot_rebuy_same_symbol_in_same_plan():
     ]
 
 
+def test_target_buy_ignores_fee_inefficient_small_rebalance_but_keeps_material_gap():
+    common = dict(
+        signal_batch=batch(("WEN", "BBB")),
+        live_config=config(top_n=1, position_target_pct=.15, gross_target_pct=.15),
+        quotes=quotes(WEN=8.26), pending_strategy_orders=(),
+        opened_at={"WEN": "2026-08-01T00:00:00+00:00"},
+        cooldown_until={}, now=NOW,
+    )
+    tiny_gap = plan_live_orders(
+        live_state=state(
+            allocated_cash=1000, strategy_equity=10_000,
+            owned_market_value=178 * 8.26,
+        ),
+        owned_positions={"WEN": {"quantity": 178, "average_cost": 8.30}}, **common,
+    )
+    material_gap = plan_live_orders(
+        live_state=state(
+            allocated_cash=1000, strategy_equity=10_000,
+            owned_market_value=140 * 8.26,
+        ),
+        owned_positions={"WEN": {"quantity": 140, "average_cost": 8.30}}, **common,
+    )
+
+    assert tiny_gap.intents == ()
+    assert [(i.symbol, i.side, i.quantity, i.purpose) for i in material_gap.intents] == [
+        ("WEN", "BUY", 39, "TARGET_BUY"),
+    ]
+
+
+def test_small_stop_loss_sell_is_never_suppressed_by_buy_rebalance_band():
+    plan = plan_live_orders(
+        batch(("AAA", "BBB", "CCC", "STOP")),
+        config(top_n=1, position_target_pct=.15, gross_target_pct=.15),
+        state(allocated_cash=0, strategy_equity=10_000, owned_market_value=8),
+        {"STOP": {"quantity": 1, "average_cost": 10}}, quotes(STOP=8),
+        pending_strategy_orders=(), opened_at={"STOP": "2026-08-27T00:00:00+00:00"},
+        cooldown_until={}, now=NOW,
+    )
+
+    assert [(i.symbol, i.side, i.quantity, i.purpose) for i in plan.intents] == [
+        ("STOP", "SELL", 1, "STOP_LOSS"),
+    ]
+
+
 def test_planner_does_not_mutate_any_input():
     owned = {"DDD": {"quantity": 2, "average_cost": 10}}
     pending = [{"symbol": "DDD", "side": "SELL", "quantity": 1, "filled_quantity": 0}]

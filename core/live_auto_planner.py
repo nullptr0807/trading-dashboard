@@ -11,6 +11,10 @@ from typing import Any, Mapping, Sequence
 from core.live_signal_adapter import SignalBatch
 
 
+# Avoid fee-inefficient drift chasing; exits and stop-losses are never filtered.
+MIN_TARGET_BUY_REBALANCE_FRACTION = 0.15
+
+
 class LivePlanError(RuntimeError):
     """Raised when live-only planner inputs are unsafe or inconsistent."""
 
@@ -249,9 +253,11 @@ def plan_live_orders(
         quantity = min(desired, affordable)
         if quantity <= 0:
             continue
+        notional = quantity * ask
+        if notional < target_notional * MIN_TARGET_BUY_REBALANCE_FRACTION:
+            continue
         output_symbol = positions.get(canonical, (canonical, 0, 0.0))[0]
         intents.append(OrderIntent(output_symbol, "BUY", quantity, ask, "TARGET_BUY"))
-        notional = quantity * ask
         available_cash -= notional
         gross_remaining -= notional
 
