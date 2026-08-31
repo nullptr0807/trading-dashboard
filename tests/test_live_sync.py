@@ -81,6 +81,11 @@ def active_store(tmp_path):
     return store
 
 
+def assert_active_hold(store, reason):
+    holds = store.list_execution_holds(active_only=True)
+    assert any(h["reason_code"] == reason.upper() for h in holds), holds
+
+
 def bind_fake_order_to_real_preview(tmp_path, monkeypatch):
     """Use the real audit DB API while exercising reconcile's default proof."""
     audit_db = tmp_path / "audit.db"
@@ -147,6 +152,46 @@ def test_reconciliation_imports_only_module_tagged_moomoo_fills(tmp_path):
     assert store.owned_quantity("US.AAPL") == 2
 
 
+def test_successful_reconciliation_resolves_migrated_automatic_freeze_hold(tmp_path):
+    db = tmp_path / "legacy-auto-freeze.db"
+    original = LiveStrategyStore(db, tmp_path / "archives")
+    with original.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+            "freeze_reason='five_minute_reconciliation_failed' WHERE id=1"
+        )
+    migrated = LiveStrategyStore(db, tmp_path / "archives")
+    assert migrated.snapshot().lifecycle == "ACTIVE"
+    assert_active_hold(migrated, "FIVE_MINUTE_RECONCILIATION_FAILED")
+
+    result = reconcile(FakeClient(), migrated, ownership_proof=lambda *_: True)
+
+    assert result["ok"] is True
+    assert not any(
+        row["reason_code"] == "FIVE_MINUTE_RECONCILIATION_FAILED"
+        for row in migrated.list_execution_holds(active_only=True)
+    )
+
+
+def test_reconciliation_uses_valuation_quotes_not_execution_market_state(tmp_path):
+    observed = []
+
+    class ValuationClient(FakeClient):
+        def valuation_quotes(self, symbols):
+            observed.append(tuple(symbols))
+            return {symbol: {"last_price": 100.0} for symbol in symbols}
+
+        def quote(self, code):
+            raise AssertionError("reconciliation must not require execution market state")
+
+    store = active_store(tmp_path)
+    result = reconcile(ValuationClient(), store, ownership_proof=lambda *_: True)
+
+    assert result["ok"] is True
+    assert observed == [("US.AAPL",)]
+    assert store.owned_quantity("US.AAPL") == 2
+
+
 def test_shared_first_module_buy_is_not_misclassified_as_external(tmp_path):
     store = active_store(tmp_path)
     client = FakeClient()
@@ -210,7 +255,7 @@ def test_known_preview_cannot_authorize_modified_broker_order(tmp_path, monkeypa
     with pytest.raises(ControlRejected, match="differs"):
         reconcile(FakeClient(), store)
     assert store.owned_quantity("US.AAPL") == 0
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
 
 
 def test_reconciliation_fails_if_fee_truth_is_missing(tmp_path):
@@ -360,7 +405,7 @@ def test_deal_symbol_must_match_authorized_order(tmp_path):
     with pytest.raises(ControlRejected, match="deal symbol differs"):
         reconcile(client, store, ownership_proof=lambda *_: True)
     assert store.positions() == []
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
 
 
 def test_deal_side_conflict_latches_nonrecoverable_freeze(tmp_path):
@@ -374,7 +419,7 @@ def test_deal_side_conflict_latches_nonrecoverable_freeze(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["side"]
 
 
@@ -448,7 +493,7 @@ def _acked_intent_for_fake_order(store):
 def test_confirmed_fill_auto_recovers_transient_post_broker_freeze(tmp_path, monkeypatch):
     store = active_store(tmp_path)
     intent = _acked_intent_for_fake_order(store)
-    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    store.latch_auto_intent_hold(intent["intent_id"], "POST_BROKER_RECONCILIATION_FAILED")
     monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
 
     result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
@@ -462,14 +507,14 @@ def test_confirmed_fill_auto_recovers_transient_post_broker_freeze(tmp_path, mon
 def test_auto_recovery_waits_if_any_broker_preview_is_unresolved(tmp_path, monkeypatch):
     store = active_store(tmp_path)
     intent = _acked_intent_for_fake_order(store)
-    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    store.latch_auto_intent_hold(intent["intent_id"], "POST_BROKER_RECONCILIATION_FAILED")
     monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 1)
 
     result = reconcile(FakeClient(), store, ownership_proof=lambda *_: True)
 
     assert result["auto_recovered"] is False
     assert store.get_auto_order_intent(intent["intent_id"])["status"] == "FILLED"
-    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().lifecycle == "ACTIVE"
 
 
 def test_auto_recovery_never_releases_an_unrelated_freeze(tmp_path, monkeypatch):
@@ -497,8 +542,8 @@ def test_fill_batch_is_atomic_when_final_broker_quantity_mismatches(tmp_path):
 
     assert store.owned_quantity("US.AAPL") == 0
     assert store.snapshot().allocated_cash == pytest.approx(10_000)
-    assert store.snapshot().lifecycle == "FROZEN"
-    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert_active_hold(store, "reconciliation_quantity_mismatch")
     with store.connect() as con:
         assert con.execute("SELECT COUNT(*) FROM applied_fills").fetchone()[0] == 0
         row = con.execute(
@@ -547,7 +592,8 @@ def test_quantity_mismatch_keeps_write_lock_until_freeze_and_diagnostic_commit(
         with store.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             observed_lifecycle.append(con.execute(
-                "SELECT lifecycle FROM strategy_state WHERE id=1"
+                "SELECT COUNT(*) FROM execution_holds WHERE resolved_at IS NULL "
+                "AND reason_code='RECONCILIATION_QUANTITY_MISMATCH'"
             ).fetchone()[0])
         writer_finished.set()
 
@@ -568,9 +614,9 @@ def test_quantity_mismatch_keeps_write_lock_until_freeze_and_diagnostic_commit(
     assert thread is not None
     thread.join(timeout=2)
     assert not thread.is_alive()
-    assert observed_lifecycle == ["FROZEN"]
+    assert observed_lifecycle == [1]
     assert not any(statement.strip().upper() == "ROLLBACK" for statement in statements)
-    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+    assert_active_hold(store, "reconciliation_quantity_mismatch")
     assert store.recent_events(1)[0]["event_type"] == "reconciliation_quantity_mismatch"
 
 
@@ -595,7 +641,7 @@ def test_quantity_mismatch_preserves_historical_fills_and_diagnostic(tmp_path):
 def test_real_mismatch_replaces_recoverable_freeze_and_cannot_auto_unfreeze(tmp_path, monkeypatch):
     store = active_store(tmp_path)
     intent = _acked_intent_for_fake_order(store)
-    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    store.latch_auto_intent_hold(intent["intent_id"], "POST_BROKER_RECONCILIATION_FAILED")
     client = FakeClient()
     mismatch = client.snapshot()
     mismatch["positions"][0]["qty"] = 3
@@ -603,7 +649,7 @@ def test_real_mismatch_replaces_recoverable_freeze_and_cannot_auto_unfreeze(tmp_
 
     with pytest.raises(ControlRejected, match="differs from staged strategy quantity"):
         reconcile(client, store, ownership_proof=lambda *_: True)
-    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+    assert_active_hold(store, "reconciliation_quantity_mismatch")
 
     monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
     complete = FakeClient().snapshot()
@@ -613,7 +659,7 @@ def test_real_mismatch_replaces_recoverable_freeze_and_cannot_auto_unfreeze(tmp_
     assert result["auto_recovered"] is False
     current = store.get_auto_order_intent(intent["intent_id"])
     assert current is not None and current["status"] == "FILLED"
-    assert store.snapshot().freeze_reason == "reconciliation_quantity_mismatch"
+    assert_active_hold(store, "reconciliation_quantity_mismatch")
 
 
 def test_duplicate_identical_deals_are_idempotently_deduplicated(tmp_path):
@@ -658,7 +704,7 @@ def test_conflicting_numeric_aliases_are_rejected_without_mutation(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["quantity"]
 
 
@@ -674,7 +720,7 @@ def test_invalid_deal_numeric_alias_latches_nonrecoverable_conflict(tmp_path, ke
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
     assert store.recent_events(1)[0]["event_type"] == "reconciliation_snapshot_numeric_conflict"
 
 
@@ -691,8 +737,8 @@ def test_conflicting_duplicate_deal_is_rejected_without_mutation(tmp_path):
 
     assert store.positions() == []
     state = store.snapshot()
-    assert state.lifecycle == "FROZEN"
-    assert state.freeze_reason == "reconciliation_snapshot_deal_conflict"
+    assert state.lifecycle == "ACTIVE"
+    assert_active_hold(store, "reconciliation_snapshot_deal_conflict")
     event = store.recent_events(1)[0]
     assert event["event_type"] == "reconciliation_snapshot_deal_conflict"
     assert event["details"] == {
@@ -721,7 +767,9 @@ def test_snapshot_deal_conflict_keeps_write_lock_through_diagnostic_commit(tmp_p
         with store.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             observed.append(con.execute(
-                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
+                "SELECT scope_type,scope_key,reason_code FROM execution_holds "
+                "WHERE resolved_at IS NULL AND reason_code="
+                "'RECONCILIATION_SNAPSHOT_DEAL_CONFLICT'"
             ).fetchone())
         writer_finished.set()
 
@@ -743,7 +791,7 @@ def test_snapshot_deal_conflict_keeps_write_lock_through_diagnostic_commit(tmp_p
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert [tuple(row) for row in observed] == [
-        ("FROZEN", "reconciliation_snapshot_deal_conflict"),
+        ("SYMBOL", "US.AAPL", "RECONCILIATION_SNAPSHOT_DEAL_CONFLICT"),
     ]
 
 
@@ -751,7 +799,8 @@ def test_snapshot_deal_conflict_replaces_transient_freeze_and_clean_sync_cannot_
     tmp_path, monkeypatch,
 ):
     store = active_store(tmp_path)
-    store.freeze("auto_post_broker_reconciliation_failed", "auto_executor")
+    intent = _acked_intent_for_fake_order(store)
+    store.latch_auto_intent_hold(intent["intent_id"], "POST_BROKER_RECONCILIATION_FAILED")
     client = FakeClient()
     conflict = client.snapshot()
     conflict["deals"] = [conflict["deals"][0], dict(conflict["deals"][0], deal_price=101)]
@@ -759,13 +808,13 @@ def test_snapshot_deal_conflict_replaces_transient_freeze_and_clean_sync_cannot_
 
     with pytest.raises(ControlRejected, match="conflicting duplicate"):
         reconcile(client, store, ownership_proof=lambda *_: True)
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_deal_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_deal_conflict")
 
     monkeypatch.setattr(_module, "unresolved_preview_count", lambda: 0)
     client.snapshot = FakeClient().snapshot
     result = reconcile(client, store, ownership_proof=lambda *_: True)
     assert result["auto_recovered"] is False
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_deal_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_deal_conflict")
 
 
 @pytest.mark.parametrize("changed", [
@@ -791,7 +840,7 @@ def test_cross_sync_conflicting_deal_reference_freezes_without_rewriting_history
 
     assert store.fills(limit=10) == original_fills
     assert store.owned_quantity("US.AAPL") == 2
-    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    assert_active_hold(store, "reconciliation_fill_conflict")
     event = store.recent_events(1)[0]
     assert event["event_type"] == "reconciliation_fill_conflict"
     serialized = json.dumps(event, sort_keys=True)
@@ -871,7 +920,7 @@ def test_cross_sync_stable_deal_fee_conflict_is_latched(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.fills(limit=10) == original_fills
-    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    assert_active_hold(store, "reconciliation_fill_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
 
 
@@ -947,7 +996,7 @@ def test_deal_cannot_be_reassociated_to_a_different_order(tmp_path):
     with pytest.raises(ControlRejected, match="different order"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_fill_conflict"
+    assert_active_hold(store, "reconciliation_fill_conflict")
     assert store.execution_summary()["total_fees"] == pytest.approx(1.0)
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
         "order_ownership"
@@ -967,7 +1016,7 @@ def test_same_snapshot_deal_reference_cannot_belong_to_two_orders(tmp_path):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     assert store.positions() == []
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
         "order_ownership"
     ]
@@ -983,7 +1032,7 @@ def test_duplicate_order_reference_with_conflicting_economics_latches(tmp_path):
     with pytest.raises(ControlRejected, match="duplicate order"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
 
 
 def test_duplicate_order_fee_reference_with_conflicting_total_latches(tmp_path):
@@ -996,7 +1045,7 @@ def test_duplicate_order_fee_reference_with_conflicting_total_latches(tmp_path):
     with pytest.raises(ControlRejected, match="duplicate fee"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
 
 
@@ -1504,8 +1553,8 @@ def test_module_owned_invalid_economics_latch_permanent_freeze(tmp_path, mutatio
         reconcile(client, store, ownership_proof=lambda *_: True)
 
     state = store.snapshot()
-    assert state.lifecycle == "FROZEN"
-    assert state.freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert state.lifecycle == "ACTIVE"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
     event = store.recent_events(1)[0]
     assert event["event_type"] == "reconciliation_snapshot_numeric_conflict"
     assert set(event["details"]) == {"symbol", "conflicting_fields"}
@@ -1527,7 +1576,7 @@ def test_invalid_economics_replaces_only_recoverable_auto_freeze(tmp_path):
     with pytest.raises(ControlRejected, match="invalid"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
 
 
 @pytest.mark.parametrize("target,aliases", [
@@ -1546,7 +1595,7 @@ def test_module_fee_alias_conflict_latches_permanent_freeze(tmp_path, target, al
     with pytest.raises(ControlRejected, match="conflicting"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_numeric_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_numeric_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == ["fee"]
 
 
@@ -1712,9 +1761,10 @@ def test_real_default_proof_latches_bound_order_economic_corruption(
         reconcile(client, store)
 
     assert "ownership forgery" not in str(rejected.value)
-    assert store.snapshot().freeze_reason in {
-        "reconciliation_snapshot_numeric_conflict",
-        "reconciliation_snapshot_order_conflict",
+    reasons = {h["reason_code"] for h in store.list_execution_holds(active_only=True)}
+    assert reasons & {
+        "RECONCILIATION_SNAPSHOT_NUMERIC_CONFLICT",
+        "RECONCILIATION_SNAPSHOT_ORDER_CONFLICT",
     }
     event = store.recent_events(1)[0]
     assert field in event["details"]["conflicting_fields"]
@@ -1741,9 +1791,10 @@ def test_claimed_preview_economic_corruption_permanently_latches(
         reconcile(client, store)
 
     assert "ownership forgery" not in str(rejected.value)
-    assert store.snapshot().freeze_reason in {
-        "reconciliation_snapshot_numeric_conflict",
-        "reconciliation_snapshot_order_conflict",
+    reasons = {h["reason_code"] for h in store.list_execution_holds(active_only=True)}
+    assert reasons & {
+        "RECONCILIATION_SNAPSHOT_NUMERIC_CONFLICT",
+        "RECONCILIATION_SNAPSHOT_ORDER_CONFLICT",
     }
     assert not store.broker_sync_proof_matches("test-sync-fingerprint")
 
@@ -1764,7 +1815,7 @@ def test_real_default_proof_latches_bound_order_invalid_identity_even_without_de
     with pytest.raises(ControlRejected, match="symbol|side"):
         reconcile(client, store)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
     assert store.recent_events(1)[0]["details"]["conflicting_fields"] == [
         "symbol" if field == "code" else "side"
     ]
@@ -1788,8 +1839,8 @@ def test_proven_module_deal_invalid_identity_latches_and_blocks_sync_proof(
         reconcile(client, store)
 
     state = store.snapshot()
-    assert state.lifecycle == "FROZEN"
-    assert state.freeze_reason == "reconciliation_snapshot_order_conflict"
+    assert state.lifecycle == "ACTIVE"
+    assert_active_hold(store, "reconciliation_snapshot_order_conflict")
     event = store.recent_events(1)[0]
     assert expected_field in event["details"]["conflicting_fields"]
     assert not store.broker_sync_proof_matches("test-sync-fingerprint")
@@ -1823,7 +1874,7 @@ def test_dedicated_untrusted_position_snapshot_permanently_latches(
     with pytest.raises(ControlRejected, match="position"):
         reconcile(client, store)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_position_conflict")
     event = store.recent_events(1)[0]
     assert event["event_type"] == "reconciliation_snapshot_position_conflict"
     assert field in event["details"]["conflicting_fields"]
@@ -1851,7 +1902,7 @@ def test_duplicate_in_scope_position_rows_permanently_latch(tmp_path, mode):
     with pytest.raises(ControlRejected, match="duplicate"):
         reconcile(client, store, ownership_proof=lambda *_: True)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_position_conflict")
     assert not store.broker_sync_proof_matches("test-sync-fingerprint")
 
 
@@ -1893,7 +1944,7 @@ def test_shared_unrecognizable_position_symbol_permanently_latches(tmp_path, bad
     with pytest.raises(ControlRejected, match="symbol"):
         reconcile(client, store)
 
-    assert store.snapshot().freeze_reason == "reconciliation_snapshot_position_conflict"
+    assert_active_hold(store, "reconciliation_snapshot_position_conflict")
 
 
 def test_quantity_mismatch_invalidates_previously_successful_sync_proof(tmp_path):

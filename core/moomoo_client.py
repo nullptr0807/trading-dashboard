@@ -540,6 +540,49 @@ class MoomooClient:
             raise LiveTradeRejected("Invalid US symbol")
         return "US." + raw
 
+    def valuation_quotes(self, codes: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        """Return mark-to-market prices without treating market state as valuation data.
+
+        Execution paths must continue to use ``quotes``/``quote`` below, which
+        require market-state evidence.  Reconciliation only needs complete
+        finite price snapshots for existing strategy positions.
+        """
+        normalized = tuple(dict.fromkeys(self.normalize_code(code) for code in codes))
+        if not normalized:
+            return {}
+        if not self._port_open():
+            raise MoomooUnavailable("Moomoo OpenD is not connected")
+        with self._quote_context() as ctx:
+            rows = self._records(self._result(
+                ctx.get_market_snapshot(list(normalized)), "market snapshot",
+            ))
+        row_by_code = {str(row.get("code") or "").upper(): row for row in rows}
+        result: dict[str, dict[str, Any]] = {}
+        for code in normalized:
+            row = row_by_code.get(code)
+            if not row:
+                raise MoomooUnavailable(f"No Moomoo valuation quote for {code}")
+            raw_last_price = row.get("last_price")
+            if raw_last_price is None:
+                raise MoomooUnavailable("Moomoo returned invalid valuation price")
+            try:
+                last_price = float(raw_last_price)
+            except (TypeError, ValueError) as exc:
+                raise MoomooUnavailable("Moomoo returned invalid valuation price") from exc
+            if not math.isfinite(last_price) or last_price <= 0:
+                raise MoomooUnavailable("Moomoo returned invalid valuation price")
+            mark = {
+                "code": code,
+                "last_price": last_price,
+                "update_time": row.get("update_time"),
+                "sec_status": row.get("sec_status"),
+                "source": "Moomoo OpenD",
+            }
+            result[code] = mark
+            log_event(_moomoo_logger, "info", "moomoo_valuation_quote", symbol=code,
+                      last_price=last_price, update_time=mark["update_time"])
+        return result
+
     def quotes(self, codes: list[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
         normalized = tuple(dict.fromkeys(self.normalize_code(code) for code in codes))
         if not normalized:
@@ -907,7 +950,7 @@ class MoomooClient:
                 self._result(ctx.unlock_trade(password_md5=self.settings.password_md5), "trade unlock")
                 guard_fn = getattr(self.control, "final_dispatch_guard", None)
                 guard = cast(ContextManager[None], (
-                    guard_fn(payload["config_version"],
+                    guard_fn(payload["config_version"], symbol=payload["code"],
                              auto_intent_id=payload.get("auto_intent_id"),
                              preview_id=payload.get("preview_id"))
                     if callable(guard_fn) else nullcontext()

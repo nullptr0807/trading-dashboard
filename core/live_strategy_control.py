@@ -53,6 +53,8 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _DASHBOARD_FREEZE_CODES = frozenset({
     "manual_freeze", "operator_requested_freeze", "cleanup_requested",
 })
+_OPERATOR_ACTORS = frozenset({"dashboard", "operator", "manual_api", "operator_cleanup"})
+EXECUTION_HOLD_SCOPES = frozenset({"SYSTEM", "SYMBOL", "INTENT"})
 _INTERNAL_FREEZE_CODES = frozenset({
     "auto_broker_outcome_unknown",
     "auto_intent_broker_outcome_unknown",
@@ -79,6 +81,10 @@ _INTERNAL_FREEZE_CODES = frozenset({
     "sanitized_freeze_reason",
     "strategy_equity_at_or_below_7500",
     "strategy_exposure_above_10000",
+})
+_LEGACY_AUTOMATIC_FREEZE_CODES = _INTERNAL_FREEZE_CODES - frozenset({
+    "cleaned_no_valid_strategy", "cleanup_requested", "manual_freeze",
+    "not_provisioned", "operator_requested_freeze", "sanitized_freeze_reason",
 })
 _WATCHDOG_PROBLEM_CODES = frozenset({
     "ACCOUNT_ISOLATION_SYNC_PROOF_MISMATCH",
@@ -406,6 +412,22 @@ class LiveStrategyStore:
                 );
                 CREATE INDEX IF NOT EXISTS auto_order_intents_status
                     ON auto_order_intents(status,created_at);
+                CREATE TABLE IF NOT EXISTS execution_holds (
+                    hold_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_type TEXT NOT NULL CHECK(scope_type IN ('SYSTEM','SYMBOL','INTENT')),
+                    scope_key TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by TEXT,
+                    resolution_reason TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_execution_hold
+                    ON execution_holds(scope_type,scope_key,reason_code,source)
+                    WHERE resolved_at IS NULL;
+                CREATE INDEX IF NOT EXISTS execution_holds_active_scope
+                    ON execution_holds(resolved_at,scope_type,scope_key);
             """)
             columns = {row[1] for row in con.execute("PRAGMA table_info(strategy_state)")}
             if "required_sync_after" not in columns:
@@ -419,7 +441,17 @@ class LiveStrategyStore:
                 con.execute("ALTER TABLE applied_fills ADD COLUMN fee_is_stable INTEGER NOT NULL DEFAULT 0")
             if "order_hash" not in fill_columns:
                 con.execute("ALTER TABLE applied_fills ADD COLUMN order_hash TEXT")
-            con.execute("PRAGMA user_version=1")
+            intent_columns = {row[1] for row in con.execute("PRAGMA table_info(auto_order_intents)")}
+            if "intent_key" not in intent_columns:
+                con.execute("ALTER TABLE auto_order_intents ADD COLUMN intent_key TEXT")
+                con.execute("UPDATE auto_order_intents SET intent_key=intent_id WHERE intent_key IS NULL")
+            if "attempt_no" not in intent_columns:
+                con.execute("ALTER TABLE auto_order_intents ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1")
+            if "retry_of" not in intent_columns:
+                con.execute("ALTER TABLE auto_order_intents ADD COLUMN retry_of TEXT")
+            con.execute("CREATE INDEX IF NOT EXISTS auto_order_intents_key_attempt "
+                        "ON auto_order_intents(intent_key,attempt_no DESC)")
+            con.execute("PRAGMA user_version=2")
             exists = con.execute("SELECT 1 FROM strategy_state WHERE id=1").fetchone()
             if not exists:
                 now = utcnow()
@@ -436,7 +468,7 @@ class LiveStrategyStore:
                 self._event_tx(con, "system_initialized", "system", "warning",
                                "Live strategy initialized frozen", {})
             persisted = con.execute(
-                "SELECT freeze_reason FROM strategy_state WHERE id=1"
+                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
             ).fetchone()
             if persisted and persisted["freeze_reason"]:
                 safe_reason, changed = _safe_freeze_reason(persisted["freeze_reason"])
@@ -445,6 +477,18 @@ class LiveStrategyStore:
                         "UPDATE strategy_state SET freeze_reason=?,updated_at=? WHERE id=1",
                         (safe_reason, utcnow()),
                     )
+                if (persisted["lifecycle"] == "FROZEN"
+                        and safe_reason in _LEGACY_AUTOMATIC_FREEZE_CODES):
+                    now = utcnow()
+                    con.execute("INSERT OR IGNORE INTO execution_holds "
+                                "(scope_type,scope_key,reason_code,source,created_at) "
+                                "VALUES('SYSTEM','*',?,'moomoo_sync',?)",
+                                (safe_reason.upper(), now))
+                    con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+                                "freeze_reason=NULL,updated_at=? WHERE id=1", (now,))
+                    self._event_tx(con, "legacy_automatic_freeze_migrated", "migration", "warning",
+                                   "Legacy automatic freeze converted to an execution hold",
+                                   {"reason_code": safe_reason, "scope_type": "SYSTEM"})
 
     def _event_tx(self, con: sqlite3.Connection, event_type: str, source: str,
                   severity: str, message: str, details: dict[str, Any]) -> int:
@@ -465,20 +509,8 @@ class LiveStrategyStore:
     ) -> None:
         """Latch an immutable-fill conflict without persisting Broker identifiers."""
         now = utcnow()
-        current = con.execute(
-            "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
-        ).fetchone()
-        existing_reason = str(current["freeze_reason"] or "") if current else ""
-        preserve_existing = bool(
-            current and current["lifecycle"] == "FROZEN" and existing_reason
-            and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
-        )
-        reason = existing_reason if preserve_existing else "reconciliation_fill_conflict"
-        con.execute(
-            "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-            "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-            (reason, now, now),
-        )
+        self._create_execution_hold_tx(con, "SYMBOL", symbol,
+                                       "RECONCILIATION_FILL_CONFLICT", "moomoo_reconciler")
         con.execute("DELETE FROM broker_sync_proof")
         field_names = ("symbol", "side", "quantity", "price", "fee")
         conflicting_fields = [
@@ -510,19 +542,9 @@ class LiveStrategyStore:
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             now = utcnow()
-            current = con.execute(
-                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
-            ).fetchone()
-            existing_reason = str(current["freeze_reason"] or "") if current else ""
-            preserve_existing = bool(
-                current and current["lifecycle"] == "FROZEN" and existing_reason
-                and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
-            )
-            reason = existing_reason if preserve_existing else "reconciliation_snapshot_deal_conflict"
-            con.execute(
-                "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                (reason, now, now),
+            self._create_execution_hold_tx(
+                con, "SYMBOL" if safe_symbol else "SYSTEM", safe_symbol or "*",
+                "RECONCILIATION_SNAPSHOT_DEAL_CONFLICT", "moomoo_reconciler",
             )
             con.execute("DELETE FROM broker_sync_proof")
             self._event_tx(
@@ -554,19 +576,9 @@ class LiveStrategyStore:
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             now = utcnow()
-            current = con.execute(
-                "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
-            ).fetchone()
-            existing_reason = str(current["freeze_reason"] or "") if current else ""
-            preserve_existing = bool(
-                current and current["lifecycle"] == "FROZEN" and existing_reason
-                and not existing_reason.endswith("auto_post_broker_reconciliation_failed")
-            )
-            reason = existing_reason if preserve_existing else event_type
-            con.execute(
-                "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                (reason, now, now),
+            self._create_execution_hold_tx(
+                con, "SYMBOL" if safe_symbol else "SYSTEM", safe_symbol or "*",
+                event_type.upper(), "moomoo_reconciler",
             )
             con.execute("DELETE FROM broker_sync_proof")
             self._event_tx(
@@ -585,12 +597,8 @@ class LiveStrategyStore:
                     "fingerprint=excluded.fingerprint,changed_at=excluded.changed_at",
                     (generation, pending, now))
         con.execute("DELETE FROM broker_sync_proof")
-        state = con.execute("SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1").fetchone()
-        freeze_reason = (str(state["freeze_reason"]) if state and state["lifecycle"] == "FROZEN"
-                         and state["freeze_reason"] else "control_generation_changed_requires_sync")
-        con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                    "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                    (freeze_reason, now, now))
+        self._create_execution_hold_tx(con, "SYSTEM", "*",
+                                       "CONTROL_GENERATION_CHANGED_REQUIRES_SYNC", "control")
         self._event_tx(con, "control_generation_invalidated", "control", "critical",
                        "Control generation changed; broker sync proof invalidated",
                        {"generation": generation, "reason": reason})
@@ -600,6 +608,125 @@ class LiveStrategyStore:
               message: str, details: dict[str, Any] | None = None) -> int:
         with self.connect() as con:
             return self._event_tx(con, event_type, source, severity, message, details or {})
+
+    @staticmethod
+    def _hold_identity(scope_type: str, scope_key: str, reason_code: str,
+                       source: str) -> tuple[str, str, str, str]:
+        scope = str(scope_type).strip().upper()
+        key = str(scope_key or "").strip().upper() if scope == "SYMBOL" else str(scope_key or "").strip()
+        reason = str(reason_code or "").strip().upper()
+        owner = str(source or "").strip()
+        if scope not in EXECUTION_HOLD_SCOPES:
+            raise ControlRejected("Invalid execution hold scope")
+        if scope == "SYSTEM":
+            key = "*"
+        if not key or not _INTENT_ERROR_CODE.fullmatch(reason) or not owner or len(owner) > 80:
+            raise ControlRejected("Invalid execution hold identity")
+        return scope, key, reason, owner
+
+    def _create_execution_hold_tx(self, con: sqlite3.Connection, scope_type: str,
+                                  scope_key: str, reason_code: str, source: str) -> dict[str, Any]:
+        scope, key, reason, owner = self._hold_identity(scope_type, scope_key, reason_code, source)
+        now = utcnow()
+        cur = con.execute("INSERT OR IGNORE INTO execution_holds "
+                          "(scope_type,scope_key,reason_code,source,created_at) VALUES(?,?,?,?,?)",
+                          (scope, key, reason, owner, now))
+        row = con.execute("SELECT * FROM execution_holds WHERE scope_type=? AND scope_key=? "
+                          "AND reason_code=? AND source=? AND resolved_at IS NULL",
+                          (scope, key, reason, owner)).fetchone()
+        if cur.rowcount:
+            self._event_tx(con, "execution_hold_active", owner, "critical",
+                           "Execution hold is active",
+                           {"scope_type": scope, "scope_key": key, "reason_code": reason})
+        return dict(row)
+
+    def create_execution_hold(self, scope_type: str, scope_key: str, reason_code: str,
+                              source: str) -> dict[str, Any]:
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            return self._create_execution_hold_tx(con, scope_type, scope_key, reason_code, source)
+
+    def latch_auto_intent_hold(self, intent_id: str, reason_code: str, *,
+                               mark_unknown: bool = False) -> dict[str, Any]:
+        """Atomically fail closed an automatic intent and invalidate sync proof."""
+        reason = str(reason_code or "").strip().upper()
+        if not _INTENT_ERROR_CODE.fullmatch(reason):
+            raise ControlRejected("Invalid automatic intent hold reason")
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT * FROM auto_order_intents WHERE intent_id=?",
+                              (str(intent_id),)).fetchone()
+            if not row:
+                raise ControlRejected("Auto intent not found")
+            current = str(row["status"])
+            if mark_unknown and current != "UNKNOWN":
+                if "UNKNOWN" not in self._AUTO_TRANSITIONS[current]:
+                    raise ControlRejected(f"Illegal auto intent transition {current}->UNKNOWN")
+                con.execute("UPDATE auto_order_intents SET status='UNKNOWN',error_code=?,updated_at=? "
+                            "WHERE intent_id=?", (reason, utcnow(), str(intent_id)))
+            self._create_execution_hold_tx(con, "INTENT", str(intent_id), reason, "auto_executor")
+            con.execute("DELETE FROM broker_sync_proof")
+            self._event_tx(con, "auto_intent_execution_held", "auto_executor", "critical",
+                           "Automatic intent requires reconciliation proof",
+                           {"intent_id_hash": str(intent_id), "reason_code": reason})
+            updated = con.execute("SELECT * FROM auto_order_intents WHERE intent_id=?",
+                                  (str(intent_id),)).fetchone()
+            return self._auto_intent_dict(updated)
+
+    def resolve_execution_holds(self, *, scope_type: str, scope_key: str,
+                                reason_code: str, source: str,
+                                resolved_by: str, resolution_reason: str) -> int:
+        scope, key, reason, owner = self._hold_identity(scope_type, scope_key, reason_code, source)
+        if not str(resolved_by or "").strip() or not str(resolution_reason or "").strip():
+            raise ControlRejected("Execution hold resolution requires actor and reason")
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            now = utcnow()
+            cur = con.execute("UPDATE execution_holds SET resolved_at=?,resolved_by=?,resolution_reason=? "
+                              "WHERE scope_type=? AND scope_key=? AND reason_code=? AND source=? "
+                              "AND resolved_at IS NULL",
+                              (now, str(resolved_by), str(resolution_reason), scope, key, reason, owner))
+            count = int(cur.rowcount)
+            if count:
+                self._event_tx(con, "execution_hold_resolved", str(resolved_by), "info",
+                               "Matching execution hold was resolved",
+                               {"scope_type": scope, "scope_key": key, "reason_code": reason,
+                                "source": owner})
+            return count
+
+    def list_execution_holds(self, *, active_only: bool = False, limit: int = 1000) -> list[dict[str, Any]]:
+        query = "SELECT * FROM execution_holds"
+        if active_only:
+            query += " WHERE resolved_at IS NULL"
+        query += " ORDER BY hold_id DESC LIMIT ?"
+        with self.connect() as con:
+            rows = con.execute(query, (max(1, min(int(limit), 5000)),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def applicable_execution_holds(self, *, symbol: str | None = None,
+                                   intent_id: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["(scope_type='SYSTEM' AND scope_key='*')"]
+        params: list[str] = []
+        if symbol:
+            clauses.append("(scope_type='SYMBOL' AND scope_key=?)")
+            params.append(str(symbol).strip().upper())
+        if intent_id:
+            clauses.append("(scope_type='INTENT' AND scope_key=?)")
+            params.append(str(intent_id).strip())
+        with self.connect() as con:
+            rows = con.execute("SELECT * FROM execution_holds WHERE resolved_at IS NULL AND (" +
+                               " OR ".join(clauses) + ") ORDER BY hold_id", tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def execution_status(self) -> dict[str, Any]:
+        holds = self.list_execution_holds(active_only=True)
+        state = self.snapshot()
+        unresolved = [row for row in self.list_auto_order_intents(limit=1000)
+                      if row["status"] in AUTO_INTENT_UNRESOLVED]
+        executable = state.lifecycle == "ACTIVE" and not holds and not unresolved
+        return {"status": "READY" if executable else "HELD",
+                "executable": executable, "active_holds": holds,
+                "unresolved_intent_count": len(unresolved)}
 
     def snapshot(self) -> RiskSnapshot:
         with self.connect() as con:
@@ -688,17 +815,16 @@ class LiveStrategyStore:
                          str(changed_by or "dashboard"), reason))
             con.execute("UPDATE strategy_state SET config_version=?,strategy_id=?,updated_at=? WHERE id=1",
                         (version, candidate["strategy_id"], now))
-            con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                        "freeze_reason='config_changed_requires_review',updated_at=?,"
-                        "required_sync_after=? WHERE id=1", (now, now))
             self._invalidate_runtime_tx(con, "strategy_config_changed")
             self._event_tx(con, "config_reloaded", "dashboard", "warning",
-                           "Strategy parameters hot-reloaded; trading frozen for review",
+                           "Strategy parameters hot-reloaded; execution held for review",
                            {"version": version, "changed_fields": sorted(patch), "reason": reason})
         return self.config()
 
     def freeze(self, reason: str, source: str = "dashboard", severity: str = "critical",
                *, preserve_existing: bool = False) -> RiskSnapshot:
+        if str(source) not in _OPERATOR_ACTORS:
+            raise ControlRejected("FROZEN is an operator-only lifecycle control")
         raw_reason = str(reason or "").strip() or "manual_freeze"
         reason, reason_was_sanitized = _safe_freeze_reason(raw_reason, source)
         now = utcnow()
@@ -728,6 +854,8 @@ class LiveStrategyStore:
         return self.snapshot()
 
     def unfreeze(self, reason: str, actor: str = "dashboard") -> RiskSnapshot:
+        if str(actor) not in _OPERATOR_ACTORS:
+            raise ControlRejected("FROZEN is an operator-only lifecycle control")
         reason = str(reason or "").strip()
         if not reason:
             raise ControlRejected("An unfreeze reason is required")
@@ -1101,31 +1229,42 @@ class LiveStrategyStore:
         }
         canonical_key = json.dumps(key_payload, sort_keys=True, separators=(",", ":"))
         canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        intent_id = hashlib.sha256(canonical_key.encode()).hexdigest()
+        intent_key = hashlib.sha256(canonical_key.encode()).hexdigest()
+        intent_id = intent_key
         payload_hash = hashlib.sha256(canonical_payload.encode()).hexdigest()
         conflict = False
         result: dict[str, Any] | None = None
+        attempt_no = 1
+        retry_of: str | None = None
 
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             existing = con.execute(
-                "SELECT * FROM auto_order_intents WHERE intent_id=?", (intent_id,)
+                "SELECT * FROM auto_order_intents WHERE intent_key=? OR "
+                "(intent_key IS NULL AND intent_id=?) ORDER BY attempt_no DESC LIMIT 1",
+                (intent_key, intent_key),
             ).fetchone()
+            if (existing and str(existing["status"]) == "FAILED"
+                    and str(existing["error_code"] or "") == "PRE_BROKER_REJECTED"):
+                attempt_no = int(existing["attempt_no"] or 1) + 1
+                retry_of = str(existing["intent_id"])
+                intent_id = hashlib.sha256(f"{intent_key}:attempt:{attempt_no}".encode()).hexdigest()
+                existing = None
             if existing:
                 if hmac.compare_digest(str(existing["payload_hash"]), payload_hash):
                     result = self._auto_intent_dict(existing)
                 else:
-                    now = utcnow()
-                    con.execute(
-                        "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                        "freeze_reason='auto_intent_payload_conflict',updated_at=?,"
-                        "required_sync_after=? WHERE id=1", (now, now)
+                    self._create_execution_hold_tx(
+                        con, "INTENT", str(existing["intent_id"]),
+                        "AUTO_INTENT_PAYLOAD_CONFLICT", "auto_executor",
                     )
+                    con.execute("DELETE FROM broker_sync_proof")
                     self._event_tx(
                         con, "auto_intent_payload_conflict", "auto_executor", "critical",
                         "Deterministic auto intent key received a conflicting payload",
-                        {"intent_id_hash": intent_id},
+                        {"intent_id_hash": str(existing["intent_id"])},
                     )
+                    con.commit()
                     conflict = True
             else:
                 state = con.execute("SELECT * FROM strategy_state WHERE id=1").fetchone()
@@ -1137,7 +1276,17 @@ class LiveStrategyStore:
                 if int(state["config_version"]) != config_version or str(state["strategy_id"]) != strategy_id:
                     raise ControlRejected("Auto intent does not match active strategy configuration")
                 if float(state["strategy_equity"]) <= float(state["loss_floor"]):
+                    self._create_execution_hold_tx(
+                        con, "SYSTEM", "*", "STRATEGY_EQUITY_AT_OR_BELOW_7500", "risk_engine"
+                    )
+                    con.commit()
                     raise ControlRejected("Strategy equity reached the immutable USD 7,500 loss floor")
+                if con.execute(
+                    "SELECT 1 FROM execution_holds WHERE resolved_at IS NULL AND "
+                    "((scope_type='SYSTEM' AND scope_key='*') OR "
+                    "(scope_type='SYMBOL' AND scope_key=?)) LIMIT 1", (symbol,)
+                ).fetchone():
+                    raise ControlRejected("An execution hold blocks this automatic intent")
                 if con.execute(
                     "SELECT 1 FROM auto_order_intents "
                     "WHERE status NOT IN ('FILLED','CANCELLED','FAILED') LIMIT 1"
@@ -1188,17 +1337,18 @@ class LiveStrategyStore:
                     (intent_id,payload_hash,strategy_id,config_version,signal_batch_id,
                      signal_source_date,factor_set_hash,symbol,side,purpose,target_qty,
                      order_qty,limit_price,status,preview_id,reserved_notional,
-                     reserved_sell_qty,created_at,updated_at,error_code)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',NULL,?,?,?,?,NULL)""",
+                     reserved_sell_qty,created_at,updated_at,error_code,intent_key,attempt_no,retry_of)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED',NULL,?,?,?,?,NULL,?,?,?)""",
                     (intent_id, payload_hash, strategy_id, config_version, signal_batch_id,
                      signal_source_date, factor_set_hash, symbol, side, purpose, target_qty,
-                     order_qty, limit_price, reserved_notional, reserved_sell_qty, now, now),
+                     order_qty, limit_price, reserved_notional, reserved_sell_qty, now, now,
+                     intent_key, attempt_no, retry_of),
                 )
                 result = self._auto_intent_dict(con.execute(
                     "SELECT * FROM auto_order_intents WHERE intent_id=?", (intent_id,)
                 ).fetchone())
         if conflict:
-            raise ControlRejected("Deterministic auto intent payload conflict; trading frozen")
+            raise ControlRejected("Deterministic auto intent payload conflict; execution held")
         if result is None:
             raise ControlRejected("Auto intent creation failed")
         return result
@@ -1360,14 +1510,10 @@ class LiveStrategyStore:
             con.execute("UPDATE control_runtime SET generation=?,fingerprint=?,changed_at=? WHERE id=1",
                         (generation, fingerprint, now))
             con.execute("DELETE FROM broker_sync_proof")
-            state = con.execute("SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1").fetchone()
-            freeze_reason = (str(state["freeze_reason"]) if state and state["lifecycle"] == "FROZEN"
-                             and state["freeze_reason"] else "runtime_identity_changed_requires_sync")
-            con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                        "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                        (freeze_reason, now, now))
+            self._create_execution_hold_tx(con, "SYSTEM", "*",
+                                           "RUNTIME_IDENTITY_CHANGED_REQUIRES_SYNC", "runtime")
             self._event_tx(con, "control_generation_changed", "runtime", "critical",
-                           "Account isolation runtime identity changed; trading frozen",
+                           "Account isolation runtime identity changed; execution held",
                            {"generation": generation})
             return generation
 
@@ -1388,6 +1534,13 @@ class LiveStrategyStore:
                         "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,"
                         "synced_at=excluded.synced_at,control_generation=excluded.control_generation",
                         (fingerprint, synced_at, int(runtime["generation"])))
+            now = utcnow()
+            for reason, source in (("CONTROL_GENERATION_CHANGED_REQUIRES_SYNC", "control"),
+                                   ("RUNTIME_IDENTITY_CHANGED_REQUIRES_SYNC", "runtime")):
+                con.execute("UPDATE execution_holds SET resolved_at=?,resolved_by='moomoo_reconciler',"
+                            "resolution_reason='matching broker sync proof recorded' "
+                            "WHERE scope_type='SYSTEM' AND scope_key='*' AND reason_code=? "
+                            "AND source=? AND resolved_at IS NULL", (now, reason, source))
 
     def broker_sync_proof_matches(self, fingerprint: str) -> bool:
         with self.connect() as con:
@@ -1402,10 +1555,13 @@ class LiveStrategyStore:
                     and str(proof["synced_at"]) == str(state["last_sync_at"]))
 
     @contextmanager
-    def final_dispatch_guard(self, config_version: int, *,
+    def final_dispatch_guard(self, config_version: int, *, symbol: str,
                              auto_intent_id: str | None = None,
                              preview_id: str | None = None):
         """Hold the strategy DB write lock across the final Broker mutation."""
+        dispatch_symbol = str(symbol or "").strip().upper()
+        if not dispatch_symbol:
+            raise ControlRejected("Final dispatch requires an explicit symbol")
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             state = con.execute(
@@ -1416,13 +1572,30 @@ class LiveStrategyStore:
                 raise ControlRejected("Strategy lifecycle or configuration changed at dispatch")
             if auto_intent_id is not None:
                 intent = con.execute(
-                    "SELECT config_version,status,preview_id FROM auto_order_intents WHERE intent_id=?",
+                    "SELECT config_version,status,preview_id,symbol FROM auto_order_intents WHERE intent_id=?",
                     (str(auto_intent_id),),
                 ).fetchone()
                 if (not intent or int(intent["config_version"]) != int(config_version)
                         or intent["status"] != "DISPATCHING"
-                        or str(intent["preview_id"] or "") != str(preview_id or "")):
+                        or str(intent["preview_id"] or "") != str(preview_id or "")
+                        or str(intent["symbol"]).strip().upper() != dispatch_symbol):
                     raise ControlRejected("Automatic intent changed at dispatch")
+            hold = con.execute(
+                "SELECT reason_code FROM execution_holds WHERE resolved_at IS NULL AND "
+                "((scope_type='SYSTEM' AND scope_key='*') OR "
+                "(scope_type='SYMBOL' AND scope_key=?) OR "
+                "(scope_type='INTENT' AND scope_key=?)) LIMIT 1",
+                (dispatch_symbol or "", str(auto_intent_id or "")),
+            ).fetchone()
+            if hold:
+                raise ControlRejected("Execution hold blocks final dispatch: " + str(hold["reason_code"]))
+            unresolved = con.execute(
+                "SELECT intent_id FROM auto_order_intents WHERE "
+                "status NOT IN ('FILLED','CANCELLED','FAILED') AND intent_id<>? LIMIT 1",
+                (str(auto_intent_id or ""),),
+            ).fetchone()
+            if unresolved:
+                raise ControlRejected("An unresolved auto intent globally blocks final dispatch")
             yield
 
     def pretrade_guard(self, side: str, symbol: str, quantity: float,
@@ -1431,8 +1604,11 @@ class LiveStrategyStore:
         state = self.snapshot()
         if state.lifecycle != "ACTIVE":
             raise ControlRejected(f"Trading system is {state.lifecycle}: {state.freeze_reason or 'not armed'}")
+        holds = self.applicable_execution_holds(symbol=symbol)
+        if holds:
+            raise ControlRejected("Execution is held: " + str(holds[0]["reason_code"]))
         if state.strategy_equity <= state.loss_floor:
-            self.freeze("strategy_equity_at_or_below_7500", "risk_engine")
+            self.create_execution_hold("SYSTEM", "*", "STRATEGY_EQUITY_AT_OR_BELOW_7500", "risk_engine")
             raise ControlRejected("Strategy equity reached the immutable USD 7,500 loss floor")
         notional = _finite(quantity, "quantity") * _finite(limit_price, "limit_price")
         if side.upper() == "BUY":
@@ -1667,23 +1843,9 @@ class LiveStrategyStore:
                     # BEGIN IMMEDIATE lock while atomically latching both state and
                     # the secret-free diagnostic; there is no ACTIVE writer window.
                     now = utcnow()
-                    current = con.execute(
-                        "SELECT lifecycle,freeze_reason FROM strategy_state WHERE id=1"
-                    ).fetchone()
-                    existing_reason = str(current["freeze_reason"] or "") if current else ""
-                    recoverable_transient = existing_reason.endswith(
-                        "auto_post_broker_reconciliation_failed"
-                    )
-                    preserve_existing = bool(
-                        current and current["lifecycle"] == "FROZEN"
-                        and existing_reason and not recoverable_transient
-                    )
-                    reason = (existing_reason if preserve_existing
-                              else "reconciliation_quantity_mismatch")
-                    con.execute(
-                        "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                        "freeze_reason=?,updated_at=?,required_sync_after=? WHERE id=1",
-                        (reason, now, now),
+                    self._create_execution_hold_tx(
+                        con, "SYMBOL", symbol, "RECONCILIATION_QUANTITY_MISMATCH",
+                        "moomoo_reconciler",
                     )
                     con.execute("DELETE FROM broker_sync_proof")
                     self._event_tx(
@@ -1849,7 +2011,7 @@ class LiveStrategyStore:
             elif market_value + reserved_buy_notional > EXPOSURE_CAP + 1e-6:
                 breach = "strategy_exposure_above_10000"
             if breach:
-                lifecycle, reason = "FROZEN", breach
+                self._create_execution_hold_tx(con, "SYSTEM", "*", breach.upper(), "risk_engine")
 
             now = utcnow()
             for position in positions.values():
@@ -1941,6 +2103,15 @@ class LiveStrategyStore:
                         "ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,"
                         "synced_at=excluded.synced_at,control_generation=excluded.control_generation",
                         (sync_fingerprint, now, int(runtime["generation"])))
+            for hold_reason, hold_source in (
+                ("CONTROL_GENERATION_CHANGED_REQUIRES_SYNC", "control"),
+                ("RUNTIME_IDENTITY_CHANGED_REQUIRES_SYNC", "runtime"),
+                ("FIVE_MINUTE_RECONCILIATION_FAILED", "moomoo_sync"),
+            ):
+                con.execute("UPDATE execution_holds SET resolved_at=?,resolved_by='moomoo_reconciler',"
+                            "resolution_reason='successful complete reconciliation' "
+                            "WHERE scope_type='SYSTEM' AND scope_key='*' AND reason_code=? "
+                            "AND source=? AND resolved_at IS NULL", (now, hold_reason, hold_source))
             self._event_tx(con, "account_sync", "moomoo_reconciler", "info",
                            "Five-minute strategy reconciliation completed",
                            {"equity": equity, "market_value": market_value})
@@ -1963,9 +2134,10 @@ class LiveStrategyStore:
                 now = utcnow()
                 self._event_tx(con, "price_missing", "reconciler", "critical",
                                "Owned-position prices missing", {"symbols": missing})
-                con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
-                            "freeze_reason='owned_price_missing',updated_at=?,required_sync_after=? "
-                            "WHERE id=1", (now, now))
+                for symbol in missing:
+                    self._create_execution_hold_tx(con, "SYMBOL", symbol,
+                                                   "OWNED_PRICE_MISSING", "reconciler")
+                con.commit()
                 raise ControlRejected("Every strategy-owned position requires a fresh Moomoo price")
             market_value = unrealized = realized = 0.0
             for row in positions:
@@ -1992,8 +2164,7 @@ class LiveStrategyStore:
             elif market_value + float(state["reserved_buy_notional"]) > EXPOSURE_CAP + 1e-6:
                 breach = "strategy_exposure_above_10000"
             if breach:
-                lifecycle, reason = "FROZEN", breach
-                required_sync_after = now
+                self._create_execution_hold_tx(con, "SYSTEM", "*", breach.upper(), "risk_engine")
                 self._event_tx(con, "risk_limit_breach", "risk_engine", "critical",
                                "Immutable strategy risk limit breached", {"reason": breach, "equity": equity,
                                                                          "market_value": market_value})
@@ -2053,7 +2224,7 @@ class LiveStrategyStore:
                 broker_orders_clear: bool) -> Path:
         if confirmation != "FREEZE ARCHIVE AND CLEAN STRATEGY":
             raise ControlRejected("Exact cleanup confirmation is required")
-        self.freeze("cleanup_requested", actor)
+        self.freeze("cleanup_requested", "operator_cleanup")
         state = self.snapshot()
         if self.positions() or state.reserved_buy_notional > 1e-9:
             raise ControlRejected("Cleanup requires zero strategy-owned positions and zero active BUY reservation")
@@ -2101,11 +2272,15 @@ class LiveStrategyStore:
     def health(self) -> dict[str, Any]:
         state = self.snapshot()
         problems = []
+        execution = self.execution_status()
         if state.lifecycle != "ACTIVE":
-            problems.append(f"lifecycle:{state.lifecycle}")
+            problems.append(f"manual_freeze:{state.lifecycle}")
+        if execution["active_holds"]:
+            problems.append("automatic_execution_holds")
         if state.strategy_equity <= state.loss_floor:
             problems.append("loss_floor")
         if state.owned_market_value + state.reserved_buy_notional > state.exposure_cap + 1e-6:
             problems.append("exposure_cap")
         return {"healthy": not problems, "problems": problems, "state": state.__dict__,
+                "execution_status": execution,
                 "config": self.config() if state.strategy_id else None}

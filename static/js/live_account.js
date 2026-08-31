@@ -86,9 +86,10 @@ function laMarketMeta(state) {
   return {tone:'unknown',label:laT('市场状态未知','Market unknown'),detail:value};
 }
 
-function laHealthMeta(status, state) {
+function laHealthMeta(status, state, executionStatus) {
   if(!status.opend_connected)return {tone:'danger',label:laT('连接异常','Disconnected'),detail:'OpenD'};
-  if(state.lifecycle!=='ACTIVE')return {tone:'danger',label:laT('系统冻结','System frozen'),detail:state.freeze_reason||'FROZEN'};
+  if(state.lifecycle!=='ACTIVE')return {tone:'danger',label:laT('人工冻结','Manual freeze'),detail:state.freeze_reason||'FROZEN'};
+  if(executionStatus&&executionStatus.status==='HELD')return {tone:'warn',label:laT('执行暂停','Execution held'),detail:`${(executionStatus.active_holds||[]).length} HOLD`};
   if(!status.sync_proof_current||!status.control_sync_fresh)return {tone:'warn',label:laT('等待对账','Sync required'),detail:'STALE'};
   return {tone:'live',label:laT('健康正常','Healthy'),detail:'ALL CHECKS'};
 }
@@ -96,7 +97,7 @@ function laHealthMeta(status, state) {
 function laHero(control, status) {
   const state=control.state||{}, perf=control.performance_summary||{};
   const market=laMarketMeta(control.market_status&&control.market_status.state);
-  const health=laHealthMeta(status,state);
+  const health=laHealthMeta(status,state,control.execution_status);
   const execution=status.auto_trading_enabled
     ? {tone:'live',label:laT('自动交易中','Auto trading'),detail:'AUTO'}
     : status.trading_enabled
@@ -148,7 +149,7 @@ function laPolicyCard(policy, control) {
     [laT('卖空/融资', 'Short / margin'), laT('禁止', 'Blocked')],
     [laT('订单/成交历史', 'Order / deal history'), `${policy.activity_lookback_days}d`],
   ];
-  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">EXECUTION POLICY</span><h2>${laT('真实交易参数', 'Live trading policy')}</h2></div><span class="la-source">v${control.config&&control.config.version||'—'} · Moomoo + server guardrails</span></div><div class="la-policy-grid">${rows.map(r=>`<div><small>${laEsc(r[0])}</small><b>${laEsc(r[1])}</b></div>`).join('')}</div><form id="la-config-form" class="la-order-form la-policy-editor">${fields.map(([k,label,type,step])=>`<label>${laEsc(label)}<input data-la-param="${k}" type="${type}" step="${step}" value="${laEsc(c[k])}"></label>`).join('')}<label>${laT('变更原因','Change reason')}<input id="la-config-reason" required maxlength="500"></label><button class="la-btn" type="submit">${laT('保存并Reload（需控制令牌）','Save & reload — control token required')}</button></form><p class="la-note">${laT('编辑后会由服务端校验；保存和Reload必须使用上方控制令牌，并会触发安全冻结与新一轮对账。', 'Changes are validated server-side. Saving requires the control token above and triggers a safety freeze plus fresh reconciliation.')}</p></section>`;
+  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">EXECUTION POLICY</span><h2>${laT('真实交易参数', 'Live trading policy')}</h2></div><span class="la-source">v${control.config&&control.config.version||'—'} · Moomoo + server guardrails</span></div><div class="la-policy-grid">${rows.map(r=>`<div><small>${laEsc(r[0])}</small><b>${laEsc(r[1])}</b></div>`).join('')}</div><form id="la-config-form" class="la-order-form la-policy-editor">${fields.map(([k,label,type,step])=>`<label>${laEsc(label)}<input data-la-param="${k}" type="${type}" step="${step}" value="${laEsc(c[k])}"></label>`).join('')}<label>${laT('变更原因','Change reason')}<input id="la-config-reason" required maxlength="500"></label><button class="la-btn" type="submit">${laT('保存并Reload（需控制令牌）','Save & reload — control token required')}</button></form><p class="la-note">${laT('编辑后会由服务端校验；保存和Reload必须使用上方控制令牌，并会触发最小范围执行暂停与新一轮对账。', 'Changes are validated server-side. Saving requires the control token above and triggers a scoped execution hold plus fresh reconciliation.')}</p></section>`;
 }
 
 function laSetup(status) {
@@ -175,11 +176,12 @@ function laSetup(status) {
 }
 
 function laControlPanel(control) {
-  const s=control.state||{}, summary=control.execution_summary||{}, frozen=s.lifecycle!=='ACTIVE';
+  const s=control.state||{}, summary=control.execution_summary||{}, frozen=s.lifecycle!=='ACTIVE', execution=control.execution_status||{}, held=execution.status==='HELD';
+  const holdText=(execution.active_holds||[]).map(h=>`${h.scope_type}:${h.scope_key} ${h.reason_code}`).join(' · ');
   const ret=(Number(s.strategy_equity||10000)/10000-1)*100;
-  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">$10K STRATEGY SUB-LEDGER</span><h2>${laT('独立策略资金与交易总开关','Independent capital & master switch')}</h2></div><span class="la-risk-badge ${frozen?'':'ok'}">${laEsc(s.lifecycle||'UNKNOWN')}</span></div>
+  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">$10K STRATEGY SUB-LEDGER</span><h2>${laT('独立策略资金与交易总开关','Independent capital & master switch')}</h2></div><span class="la-risk-badge ${(frozen||held)?'':'ok'}">${laEsc(s.lifecycle||'UNKNOWN')} · ${laEsc(execution.status||'HELD')}</span></div>
   <div class="la-metrics"><div class="la-metric hero"><small>${laT('策略权益','Strategy equity')}</small><b>${laMoney(s.strategy_equity)}</b><span class="${laClass(ret)}">${laPct(ret)}</span></div><div class="la-metric"><small>${laT('策略现金','Strategy cash')}</small><b>${laMoney(s.allocated_cash)}</b></div><div class="la-metric"><small>${laT('策略持仓市值','Strategy market value')}</small><b>${laMoney(s.owned_market_value)}</b></div><div class="la-metric"><small>${laT('总成交笔数','Total fills')}</small><b>${Number(summary.total_trades||0).toLocaleString()}</b><span>BUY ${Number(summary.buy_trades||0)} · SELL ${Number(summary.sell_trades||0)}</span></div><div class="la-metric"><small>${laT('累计交易费用','Total trading fees')}</small><b>${laMoney(summary.total_fees)}</b></div><div class="la-metric"><small>${laT('累计成交金额','Total traded notional')}</small><b>${laMoney(summary.total_notional)}</b></div><div class="la-metric"><small>${laT('不可变仓位上限','Immutable exposure cap')}</small><b>$10,000.00</b></div><div class="la-metric"><small>${laT('不可变停机线','Immutable loss floor')}</small><b>$7,500.00</b></div><div class="la-metric"><small>${laT('最后对账','Last reconciliation')}</small><b>${laEsc(laTime(s.last_sync_at))}</b></div></div>
-  <div class="la-order-warning">${frozen?laT(`系统已冻结：${s.freeze_reason||'未启用'}`,`System frozen: ${s.freeze_reason||'not armed'}`):laT('系统ACTIVE；所有订单仍需通过$10k、持仓归属和盘中门禁。','System ACTIVE; every order still passes capital, ownership and RTH gates.')}</div>
+  <div class="la-order-warning">${frozen?laT(`人工总开关已冻结：${s.freeze_reason||'未启用'}`,`Manual master switch frozen: ${s.freeze_reason||'not armed'}`):held?laT(`生命周期 ACTIVE；执行状态 HELD：${holdText||'未决订单'}`,`Lifecycle ACTIVE; execution HELD: ${holdText||'unresolved intent'}`):laT('生命周期 ACTIVE；执行状态 READY；所有订单仍需通过门禁。','Lifecycle ACTIVE; execution READY; every order still passes all gates.')}</div>
   <div class="la-order-form"><label>${laT('控制令牌（仅页面内存）','Control token — page memory only')}<input id="la-control-token" type="password" autocomplete="off"></label><label>${laT('操作原因','Action reason')}<input id="la-control-reason" maxlength="500" autocomplete="off"></label><button class="la-btn danger" id="la-freeze">FREEZE</button><button class="la-btn" id="la-unfreeze">UNFREEZE</button><button class="la-link danger" id="la-cleanup">${laT('冻结、归档并清理策略','Freeze, archive & clean')}</button></div></section>`;
 }
 

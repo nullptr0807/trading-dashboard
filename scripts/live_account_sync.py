@@ -12,7 +12,7 @@ import re
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -29,32 +29,16 @@ from core.moomoo_client import MoomooClient
 TERMINAL = {"FILLED_ALL", "CANCELLED_ALL", "CANCELLED_PART", "FAILED", "DISABLED", "DELETED"}
 logger = get_live_logger("live.moomoo.sync", "moomoo-sync.jsonl")
 
-_RECOVERABLE_AUTO_FREEZE = "auto_post_broker_reconciliation_failed"
-_WATCHDOG_FREEZE_PREFIX = "health_watchdog:SYSTEM_FROZEN:"
-
-
-def _base_freeze_reason(reason: str | None) -> str:
-    value = str(reason or "")
-    while value.startswith(_WATCHDOG_FREEZE_PREFIX):
-        value = value[len(_WATCHDOG_FREEZE_PREFIX):]
-    return value
-
-
 def _recover_intents_and_transient_freeze(
     store: LiveStrategyStore,
     snapshot: dict[str, Any],
     *,
     account_isolation_mode: str,
 ) -> bool:
-    """Recover proven intents; release only the narrow transient auto freeze."""
+    """Recover proven intents and resolve only their matching transient hold."""
     from core.live_auto_executor import recover_auto_intents
 
     blocker = recover_auto_intents(store, snapshot, reconciliation_complete=True)
-    state = store.snapshot()
-    if state.lifecycle != "FROZEN":
-        return False
-    if _base_freeze_reason(state.freeze_reason) != _RECOVERABLE_AUTO_FREEZE:
-        return False
     if blocker is not None or store.auto_intent_reservations()["reserved_buy_notional"] > 1e-9:
         return False
     if account_isolation_mode not in {"dedicated", "shared_restricted"}:
@@ -68,11 +52,8 @@ def _recover_intents_and_transient_freeze(
     ]
     if active_module_orders:
         return False
-    store.unfreeze(
-        "Automatic recovery after Broker order and strategy ledger fully reconciled",
-        "moomoo_reconciler",
-    )
-    return True
+    status = store.execution_status()
+    return store.snapshot().lifecycle == "ACTIVE" and bool(status["executable"])
 
 
 def fee_number(row: dict[str, Any], key: str, *, source: str) -> float:
@@ -633,7 +614,17 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
         raise ControlRejected(
             "Dedicated strategy account contains external holdings; strong isolation proof failed"
         )
-    prices = {symbol: client.quote(symbol)["last_price"] for symbol in prospective_symbols}
+    valuation_symbols = tuple(sorted(prospective_symbols))
+    valuation_quotes_fn = getattr(client, "valuation_quotes", None)
+    if callable(valuation_quotes_fn):
+        valuation_rows = cast(dict[str, dict[str, Any]], valuation_quotes_fn(valuation_symbols))
+        prices = {
+            symbol: float(valuation_rows[symbol]["last_price"])
+            for symbol in valuation_symbols
+        }
+    else:
+        # Test doubles and older adapters retain the narrow single-symbol API.
+        prices = {symbol: client.quote(symbol)["last_price"] for symbol in valuation_symbols}
     pending_buy = sum(
         max(0.0, order_number(row, "qty") - order_number(row, "dealt_qty"))
         * order_number(row, "price")
@@ -669,23 +660,14 @@ def reconcile(client: Any, store: LiveStrategyStore, ownership_proof=None) -> di
             {"count": len(external)},
         )
     state = store.snapshot()
-    cancellation = None
-    settings = getattr(client, "settings", None)
-    if (state.lifecycle == "FROZEN" and settings
-            and settings.trade_api_token and settings.password_md5):
-        try:
-            cancellation = client.cancel_all_module_orders(settings.trade_api_token)
-        except Exception as exc:
-            cancellation = {"error": type(exc).__name__}
-            store.event("risk_freeze_cancel_failed", "moomoo_reconciler", "critical",
-                        "Risk freeze could not confirm cancellation of module orders", {})
+    execution_status = store.execution_status()
     result = {"ok": True, "applied_fills": applied, "owned_positions": len(owned),
               "external_positions": len(external), "shared_read_only": shared_read_only,
               "account_isolation_mode": account_isolation_mode,
               "auto_recovered": auto_recovered,
               "equity": state.strategy_equity, "market_value": state.owned_market_value,
               "lifecycle": state.lifecycle, "freeze_reason": state.freeze_reason,
-              "cancellation": cancellation}
+              "execution_status": execution_status}
     log_event(logger, "info", "moomoo_reconciliation_complete", **result)
     return result
 
@@ -706,23 +688,23 @@ def main() -> int:
     except Exception as exc:
         error_code = _failure_code(exc)
         try:
-            state = store.freeze(
-                "five_minute_reconciliation_failed", "moomoo_sync", preserve_existing=True,
+            store.create_execution_hold(
+                "SYSTEM", "*", "FIVE_MINUTE_RECONCILIATION_FAILED", "moomoo_sync",
             )
             store.event(
                 "sync_failed", "moomoo_sync", "critical",
                 "Moomoo five-minute reconciliation failed",
                 {"error_code": error_code},
             )
-            lifecycle = state.lifecycle
+            lifecycle = store.snapshot().lifecycle
         except Exception:
             lifecycle = "UNKNOWN"
         log_event(
             logger, "critical", "moomoo_reconciliation_failed",
             error_code=error_code, lifecycle=lifecycle,
         )
-        print(json.dumps({"ok": False, "alert": "LIVE_SYSTEM_FROZEN",
-                          "reason": "five_minute_reconciliation_failed",
+        print(json.dumps({"ok": False, "alert": "LIVE_EXECUTION_HELD",
+                          "reason": "FIVE_MINUTE_RECONCILIATION_FAILED",
                           "error_code": error_code}, sort_keys=True))
         return 2
 

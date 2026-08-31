@@ -148,6 +148,16 @@ def recover_auto_intents(
     reconciliation_complete: bool = False,
 ) -> dict[str, Any] | None:
     """Recover proven intents; only a complete reconciliation may make them terminal."""
+    def resolve_recovered(intent_id: str) -> None:
+        for reason in ("BROKER_ORDER_PROOF_MISMATCH", "BROKER_ORDER_NOT_PROVEN",
+                       "BROKER_OUTCOME_UNKNOWN", "POST_BROKER_RECONCILIATION_FAILED",
+                       "UNCLASSIFIED_DISPATCH_FAILURE"):
+            store.resolve_execution_holds(
+                scope_type="INTENT", scope_key=intent_id, reason_code=reason,
+                source="auto_executor", resolved_by="moomoo_reconciler",
+                resolution_reason="complete reconciliation proved terminal outcome",
+            )
+
     blocker = None
     for intent in reversed(store.list_auto_order_intents(limit=1000)):
         status = str(intent["status"])
@@ -160,15 +170,19 @@ def recover_auto_intents(
         try:
             order = _order_for_intent(snapshot, intent) if preview_id else None
         except ControlRejected:
-            if status != "UNKNOWN":
-                store.mark_auto_intent_unknown(intent["intent_id"], "BROKER_ORDER_PROOF_MISMATCH")
-            store.freeze("auto_intent_broker_proof_mismatch", "auto_executor")
+            store.latch_auto_intent_hold(
+                intent["intent_id"], "BROKER_ORDER_PROOF_MISMATCH",
+                mark_unknown=status != "UNKNOWN",
+            )
             return store.get_auto_order_intent(intent["intent_id"])
         if not order:
             if status in {"DISPATCHING", "UNKNOWN"}:
                 if status != "UNKNOWN":
-                    store.mark_auto_intent_unknown(intent["intent_id"], "BROKER_ORDER_NOT_PROVEN")
-                store.freeze("auto_intent_broker_outcome_unknown", "auto_executor")
+                    store.latch_auto_intent_hold(
+                        intent["intent_id"], "BROKER_ORDER_NOT_PROVEN", mark_unknown=True,
+                    )
+                else:
+                    store.latch_auto_intent_hold(intent["intent_id"], "BROKER_ORDER_NOT_PROVEN")
                 return store.get_auto_order_intent(intent["intent_id"])
             blocker = intent
             continue
@@ -181,14 +195,17 @@ def recover_auto_intents(
         if order_status == "FILLED_ALL" or (ordered > 0 and dealt >= ordered - 1e-9):
             if status != "FILLED":
                 store.mark_auto_intent_filled(intent["intent_id"])
+            resolve_recovered(intent["intent_id"])
             continue
         if order_status in {"CANCELLED_ALL", "CANCELLED_PART"}:
             store.mark_auto_intent_cancelled(
                 intent["intent_id"], "PARTIAL_CANCEL" if dealt > 0 else "BROKER_CANCELLED",
             )
+            resolve_recovered(intent["intent_id"])
             continue
         if order_status in {"FAILED", "DISABLED", "DELETED"}:
             store.mark_auto_intent_failed(intent["intent_id"], "BROKER_REJECTED")
+            resolve_recovered(intent["intent_id"])
             continue
         if dealt > 0 and status != "PARTIAL":
             store.mark_auto_intent_partial(intent["intent_id"])
@@ -344,8 +361,9 @@ class LiveAutoExecutor:
                 "intent_status": final["status"] if final else "FILLED",
             }
         except BrokerOutcomeUnknown:
-            self.store.mark_auto_intent_unknown(intent_row["intent_id"], "BROKER_OUTCOME_UNKNOWN")
-            self.store.freeze("auto_broker_outcome_unknown", "auto_executor")
+            self.store.latch_auto_intent_hold(
+                intent_row["intent_id"], "BROKER_OUTCOME_UNKNOWN", mark_unknown=True,
+            )
             raise
         except MoomooUnavailable:
             current_intent = self.store.get_auto_order_intent(intent_row["intent_id"])
@@ -368,18 +386,21 @@ class LiveAutoExecutor:
                     self.store.mark_auto_intent_unknown(
                         intent_row["intent_id"], "POST_BROKER_LOCAL_FAILURE",
                     )
-                self.store.freeze(
-                    "auto_post_broker_reconciliation_failed", "auto_executor",
-                    preserve_existing=True,
+                self.store.latch_auto_intent_hold(
+                    intent_row["intent_id"], "POST_BROKER_RECONCILIATION_FAILED",
                 )
             elif current_intent and current_intent["status"] in {"RESERVED", "DISPATCHING"}:
                 self.store.mark_auto_intent_failed(intent_row["intent_id"], "PRE_BROKER_REJECTED")
             raise
         except Exception:
             current_intent = self.store.get_auto_order_intent(intent_row["intent_id"])
-            if current_intent and current_intent["status"] == "DISPATCHING":
-                self.store.mark_auto_intent_unknown(
-                    intent_row["intent_id"], "UNCLASSIFIED_DISPATCH_FAILURE",
+            if current_intent and current_intent["status"] == "RESERVED":
+                self.store.mark_auto_intent_failed(
+                    intent_row["intent_id"], "PRE_BROKER_REJECTED",
                 )
-            self.store.freeze("auto_unclassified_dispatch_failure", "auto_executor")
+            elif current_intent and current_intent["status"] == "DISPATCHING":
+                self.store.latch_auto_intent_hold(
+                    intent_row["intent_id"], "UNCLASSIFIED_DISPATCH_FAILURE",
+                    mark_unknown=True,
+                )
             raise

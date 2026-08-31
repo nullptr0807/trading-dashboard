@@ -144,6 +144,8 @@ async def live_control(x_moomoo_read_token: str = Header(default=""),
     try:
         return {
             "state": asdict(await asyncio.to_thread(store.snapshot)),
+            "execution_status": await asyncio.to_thread(store.execution_status),
+            "execution_holds": await asyncio.to_thread(store.list_execution_holds),
             "config": await asyncio.to_thread(store.config),
             "owned_positions": await asyncio.to_thread(store.positions),
             "equity": await asyncio.to_thread(store.equity_history),
@@ -177,6 +179,8 @@ async def _live_strategy_payload(event_limit: int = 100,
     ]
     payload = {
         "state": asdict(await asyncio.to_thread(store.snapshot)),
+        "execution_status": await asyncio.to_thread(store.execution_status),
+        "execution_holds": await asyncio.to_thread(store.list_execution_holds),
         "config": await asyncio.to_thread(store.config),
         "owned_positions": await asyncio.to_thread(store.positions),
         "symbol_performance": await asyncio.to_thread(store.symbol_performance),

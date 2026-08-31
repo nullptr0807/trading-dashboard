@@ -240,6 +240,19 @@ def test_batch_quotes_use_one_context_and_require_every_symbol():
         c.quotes(("AAPL", "MSFT"))
 
 
+def test_valuation_quotes_do_not_require_market_state():
+    c = client()
+    c._sdk.quote.get_market_state = lambda _codes: (-1, "temporary market-state failure")
+
+    marks = c.valuation_quotes(("AAPL", "MSFT"))
+
+    assert set(marks) == {"US.AAPL", "US.MSFT"}
+    assert marks["US.AAPL"]["last_price"] == 100.0
+    assert "market_state" not in marks["US.AAPL"]
+    with pytest.raises(MoomooUnavailable, match="market state failed"):
+        c.quotes(("AAPL", "MSFT"))
+
+
 def test_browser_snapshot_uses_five_minute_server_cache():
     c = client()
     first = c.snapshot_cached(300)
@@ -716,6 +729,70 @@ def test_auto_place_dispatches_only_after_exact_preview_binding(tmp_path):
     assert result["accepted"] is True
     assert c._sdk.trade.place_calls == 1
     assert result["order"]["remark"].endswith(preview["preview_id"])
+
+
+@pytest.mark.parametrize(("scope_type", "scope_key"), [
+    ("SYSTEM", "*"),
+    ("SYMBOL", "US.AAPL"),
+])
+def test_final_dispatch_guard_blocks_manual_hold_created_during_unlock(
+        tmp_path, scope_type, scope_key):
+    control = LiveStrategyStore(tmp_path / "manual-strategy.db", tmp_path / "archives")
+    with control.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+            "freeze_reason=NULL,last_sync_at='2026-08-26T14:00:00+00:00' WHERE id=1"
+        )
+    c = client(control_store=control, trading_enabled=True,
+               account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+               shared_account_risk_accepted=True)
+    control.record_broker_sync_proof(
+        c.current_sync_fingerprint(), "2026-08-26T14:00:00+00:00"
+    )
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100)
+
+    def create_hold_during_unlock(**kwargs):
+        control.create_execution_hold(
+            scope_type, scope_key, "QUOTE_STALE", "race_test"
+        )
+        return 0, "ok"
+
+    c._sdk.trade.unlock_trade = create_hold_during_unlock
+
+    with pytest.raises(LiveTradeRejected, match="Execution hold blocks final dispatch"):
+        c.place_order(preview["preview_token"], "t")
+    assert c._sdk.trade.place_calls == 0
+
+
+def test_final_dispatch_guard_blocks_manual_order_when_intent_appears_during_unlock(tmp_path):
+    control = LiveStrategyStore(tmp_path / "manual-intent-race.db", tmp_path / "archives")
+    with control.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
+            "freeze_reason=NULL,last_sync_at='2026-08-26T14:00:00+00:00' WHERE id=1"
+        )
+    c = client(control_store=control, trading_enabled=True,
+               account_mode="SHARED_RESTRICTED", dedicated_account_confirmed=False,
+               shared_account_risk_accepted=True)
+    control.record_broker_sync_proof(
+        c.current_sync_fingerprint(), "2026-08-26T14:00:00+00:00"
+    )
+    preview = c.preview_order(code="AAPL", side="BUY", qty=1, limit_price=100)
+
+    def create_unresolved_intent_during_unlock(**kwargs):
+        control.create_auto_order_intent(
+            strategy_id="B16", config_version=1, signal_batch_id="b" * 64,
+            signal_source_date="2026-08-26", factor_set_hash="f" * 64,
+            symbol="US.MSFT", side="BUY", purpose="TARGET_BUY", target_qty=1,
+            order_qty=1, limit_price=100,
+        )
+        return 0, "ok"
+
+    c._sdk.trade.unlock_trade = create_unresolved_intent_during_unlock
+
+    with pytest.raises(LiveTradeRejected, match="unresolved auto intent globally blocks"):
+        c.place_order(preview["preview_token"], "t")
+    assert c._sdk.trade.place_calls == 0
 
 
 def test_final_dispatch_guard_blocks_config_change_during_unlock(tmp_path):

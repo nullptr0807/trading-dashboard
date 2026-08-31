@@ -126,6 +126,7 @@ def collect_strategy(start: datetime, end: datetime) -> dict[str, Any]:
                     or str(row["status"]) not in TERMINAL_INTENTS):
                 row["preview_id"] = ref(row.get("preview_id"))
                 intents.append(row)
+        holds = rows(con, "SELECT * FROM execution_holds ORDER BY created_at,hold_id")
         quick_check = con.execute("PRAGMA quick_check").fetchone()[0]
     for row in [*fills, *all_fills]:
         row["fill_hash"] = ref(row.get("fill_hash"))
@@ -180,6 +181,7 @@ def collect_strategy(start: datetime, end: datetime) -> dict[str, Any]:
         "equity_samples_during_window": equity,
         "events_during_window": events,
         "auto_intents_touched_or_unresolved": intents,
+        "execution_holds_history": holds,
     })
 
 

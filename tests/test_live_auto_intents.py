@@ -83,16 +83,41 @@ def test_creation_requires_active_matching_config_and_configured_limits(tmp_path
         s.create_auto_order_intent(**intent_kwargs(order_qty=1.5))
 
 
-def test_deterministic_key_conflicting_payload_freezes_and_rejects(tmp_path):
+def test_deterministic_key_conflicting_payload_holds_and_rejects(tmp_path):
     s = store(tmp_path)
     original = s.create_auto_order_intent(**intent_kwargs(order_qty=2, limit_price=100))
 
     with pytest.raises(ControlRejected, match="payload conflict"):
         s.create_auto_order_intent(**intent_kwargs(order_qty=2, limit_price=101))
 
-    assert s.snapshot().lifecycle == "FROZEN"
-    assert s.snapshot().freeze_reason == "auto_intent_payload_conflict"
+    assert s.snapshot().lifecycle == "ACTIVE"
+    holds = s.list_execution_holds(active_only=True)
+    assert [(h["scope_type"], h["scope_key"], h["reason_code"]) for h in holds] == [
+        ("INTENT", original["intent_id"], "AUTO_INTENT_PAYLOAD_CONFLICT")
+    ]
     assert s.get_auto_order_intent(original["intent_id"])["status"] == "RESERVED"
+
+
+def test_pre_broker_rejection_can_retry_changed_quote_with_new_attempt_identity(tmp_path):
+    s = store(tmp_path)
+    first = s.create_auto_order_intent(**intent_kwargs(limit_price=100))
+    s.mark_auto_intent_failed(first["intent_id"], "PRE_BROKER_REJECTED")
+
+    retry = s.create_auto_order_intent(**intent_kwargs(limit_price=101))
+
+    assert retry["intent_key"] == first["intent_key"]
+    assert retry["intent_id"] != first["intent_id"]
+    assert retry["attempt_no"] == 2
+    assert retry["retry_of"] == first["intent_id"]
+    assert s.list_execution_holds(active_only=True) == []
+
+
+def test_only_proven_pre_broker_failure_is_retryable(tmp_path):
+    s = store(tmp_path)
+    first = s.create_auto_order_intent(**intent_kwargs(limit_price=100))
+    s.mark_auto_intent_failed(first["intent_id"], "BROKER_REJECTED")
+    with pytest.raises(ControlRejected, match="payload conflict"):
+        s.create_auto_order_intent(**intent_kwargs(limit_price=101))
 
 
 def test_partial_cancel_remainder_uses_new_at_most_once_slice(tmp_path):

@@ -73,7 +73,8 @@ def diagnose(mutate: bool = True) -> dict:
         problems.append("EXPOSURE_CAP_BREACH")
     if unknown_mutations():
         problems.append("BROKER_OUTCOME_REQUIRES_RECONCILIATION")
-    problems.extend(auto_intent_health_problems(store.list_auto_order_intents(limit=1000), now))
+    intents = store.list_auto_order_intents(limit=1000)
+    problems.extend(auto_intent_health_problems(intents, now))
     if state.lifecycle == "ACTIVE":
         synced = parse_time(state.last_sync_at)
         if not synced or (now - synced).total_seconds() > 7 * 60:
@@ -96,11 +97,22 @@ def diagnose(mutate: bool = True) -> dict:
                     break
         except Exception:
             problems.append("MOOMOO_UNAVAILABLE_WHILE_ACTIVE")
-    elif state.lifecycle == "FROZEN" and state.freeze_reason not in {"not_provisioned", "manual_freeze"}:
-        problems.append("SYSTEM_FROZEN:" + str(state.freeze_reason))
+    if mutate:
+        active_codes = {code.replace(":", "_") for code in problems}
+        for hold in store.list_execution_holds(active_only=True):
+            if hold["source"] == "health_watchdog" and hold["reason_code"] not in active_codes:
+                store.resolve_execution_holds(
+                    scope_type=hold["scope_type"], scope_key=hold["scope_key"],
+                    reason_code=hold["reason_code"], source=hold["source"],
+                    resolved_by="health_watchdog", resolution_reason="diagnostic recovered",
+                )
+    execution = store.execution_status()
     result = {
         "checked_at": now.isoformat(), "healthy": not problems,
         "problems": sorted(set(problems)),
+        "manual_freeze": {"active": state.lifecycle == "FROZEN",
+                          "reason": state.freeze_reason if state.lifecycle == "FROZEN" else None},
+        "execution_status": execution,
         "state": {"lifecycle": state.lifecycle, "freeze_reason": state.freeze_reason,
                   "strategy_equity": state.strategy_equity,
                   "owned_market_value": state.owned_market_value,
@@ -109,19 +121,20 @@ def diagnose(mutate: bool = True) -> dict:
         "opend_configured": bool(settings.account_id),
     }
     if problems and mutate:
-        store.freeze("health_watchdog:" + ",".join(sorted(set(problems))), "health_watchdog")
-        cancellation = {"attempted": False}
-        if settings.trade_api_token and settings.password_md5:
-            try:
-                cancellation = MoomooClient(control_store=store).cancel_all_module_orders(settings.trade_api_token)
-                cancellation["attempted"] = True
-            except Exception as exc:
-                cancellation = {"attempted": True, "error": type(exc).__name__}
-                store.event("watchdog_cancel_failed", "health_watchdog", "critical",
-                            "Watchdog could not confirm cancellation of module orders", {})
-        result["cancellation"] = cancellation
-        log_event(logger, "critical", "health_watchdog_freeze", problems=problems,
-                  cancellation=cancellation)
+        intent_problem_codes = set(auto_intent_health_problems(intents, now))
+        for intent in intents:
+            for code in auto_intent_health_problems([intent], now):
+                intent_id = str(intent.get("intent_id") or "")
+                if intent_id:
+                    store.create_execution_hold(
+                        "INTENT", intent_id, code.replace(":", "_"), "health_watchdog"
+                    )
+        for problem in sorted(set(problems) - intent_problem_codes):
+            store.create_execution_hold(
+                "SYSTEM", "*", problem.replace(":", "_"), "health_watchdog"
+            )
+        result["execution_status"] = store.execution_status()
+        log_event(logger, "critical", "health_watchdog_holds", problems=problems)
     elif mutate:
         log_event(logger, "info", "health_watchdog_ok", lifecycle=state.lifecycle)
     return redact(result)

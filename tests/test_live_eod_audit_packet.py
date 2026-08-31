@@ -22,6 +22,7 @@ _spec.loader.exec_module(eod)
 def test_strategy_evidence_contains_complete_reconstructable_fee_ledgers(tmp_path, monkeypatch):
     db = tmp_path / "strategy.db"
     store = LiveStrategyStore(db, tmp_path / "archives")
+    store.create_execution_hold("SYMBOL", "US.AAPL", "QUOTE_STALE", "eod_test")
     order_hash = "a" * 64
     with store.connect() as con:
         con.execute(

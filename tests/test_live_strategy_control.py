@@ -30,6 +30,12 @@ def make_active(s: LiveStrategyStore):
                     "freeze_reason=NULL,last_sync_at=? WHERE id=1", (utcnow(),))
 
 
+def assert_active_hold(s: LiveStrategyStore, reason: str, *, scope="SYSTEM", key="*"):
+    holds = s.list_execution_holds(active_only=True)
+    assert any(h["reason_code"] == reason and h["scope_type"] == scope
+               and h["scope_key"] == key for h in holds), holds
+
+
 def test_immutable_capital_boundaries_are_database_constraints(tmp_path):
     s = store(tmp_path)
     state = s.snapshot()
@@ -81,7 +87,8 @@ def test_config_change_immediately_rotates_generation_and_deletes_proof(tmp_path
     s.update_config({"stop_cooldown_hours": 48}, current["version"], "test", "generation test")
     assert s.current_control_generation() == generation + 1
     assert not s.broker_sync_proof_matches(fingerprint)
-    assert s.snapshot().lifecycle == "FROZEN"
+    assert s.snapshot().lifecycle == "FROZEN"  # original operator state is untouched
+    assert_active_hold(s, "CONTROL_GENERATION_CHANGED_REQUIRES_SYNC")
 
 
 def test_only_module_confirmed_fills_create_sellable_ownership(tmp_path):
@@ -191,23 +198,23 @@ def test_buy_exposure_can_never_exceed_ten_thousand(tmp_path):
         s.pretrade_guard("BUY", "US.MSFT", 10.01, 100)
 
 
-def test_market_appreciation_over_cap_latches_freeze(tmp_path):
+def test_market_appreciation_over_cap_latches_system_hold(tmp_path):
     s = store(tmp_path)
     make_active(s)
     s.apply_fill("f1", "US.AAPL", "BUY", 90, 100)
     state = s.mark_to_market({"US.AAPL": 112})
-    assert state.frozen
-    assert state.freeze_reason == "strategy_exposure_above_10000"
+    assert state.lifecycle == "ACTIVE"
+    assert_active_hold(s, "STRATEGY_EXPOSURE_ABOVE_10000")
 
 
-def test_equity_at_7500_latches_loss_floor_freeze(tmp_path):
+def test_equity_at_7500_latches_loss_floor_hold(tmp_path):
     s = store(tmp_path)
     make_active(s)
     s.apply_fill("f1", "US.AAPL", "BUY", 100, 100)
     state = s.mark_to_market({"US.AAPL": 75})
     assert state.strategy_equity == 7500
-    assert state.frozen
-    assert state.freeze_reason == "strategy_equity_at_or_below_7500"
+    assert state.lifecycle == "ACTIVE"
+    assert_active_hold(s, "STRATEGY_EQUITY_AT_OR_BELOW_7500")
     with pytest.raises(ControlRejected, match="Loss-floor"):
         s.unfreeze("unsafe reset")
 
@@ -221,10 +228,8 @@ def test_hot_config_is_versioned_and_hard_limits_are_not_editable(tmp_path):
                               "tester", "shadow candidate")
     assert updated["version"] == current["version"] + 1
     assert updated["values"]["stop_cooldown_hours"] == 48
-    assert s.snapshot().lifecycle == "FROZEN"
-    assert s.snapshot().freeze_reason == "config_changed_requires_review"
-    with pytest.raises(ControlRejected, match="post-freeze"):
-        s.unfreeze("must not reuse pre-change sync")
+    assert s.snapshot().lifecycle == "ACTIVE"
+    assert_active_hold(s, "CONTROL_GENERATION_CHANGED_REQUIRES_SYNC")
     with pytest.raises(ControlRejected, match="reload"):
         s.update_config({"top_n": 4}, current["version"], "tester", "stale")
     with pytest.raises(ControlRejected, match="Unknown"):
@@ -398,26 +403,19 @@ def test_existing_unsafe_freeze_reason_is_sanitized_when_store_reopens(tmp_path)
         )
 
 
-def test_freeze_reason_is_semantic_allowlist_and_watchdog_namespace_is_owned(tmp_path):
+def test_automation_cannot_write_manual_lifecycle_and_operator_can(tmp_path):
     s = store(tmp_path)
-    assert s.freeze("private_operator_note", "internal").freeze_reason == "sanitized_freeze_reason"
-    assert s.freeze("secrettokenvalue", "internal").freeze_reason == "sanitized_freeze_reason"
-    assert s.freeze("health_watchdog:NATURALSECRET", "auto_executor").freeze_reason == (
-        "sanitized_freeze_reason"
-    )
-    assert s.freeze("health_watchdog:AUTO_INTENT_STALE:ACKED", "health_watchdog").freeze_reason == (
-        "health_watchdog:AUTO_INTENT_STALE:ACKED"
-    )
-    assert s.freeze("health_watchdog:AUTO_INTENT_STALE:NATURALSECRET", "health_watchdog").freeze_reason == (
-        "sanitized_freeze_reason"
-    )
-    assert s.freeze("arbitrary_snake_case_secret", "internal").freeze_reason == (
-        "sanitized_freeze_reason"
-    )
+    make_active(s)
+    for actor in ("internal", "auto_executor", "health_watchdog", "moomoo_reconciler"):
+        with pytest.raises(ControlRejected, match="operator-only"):
+            s.freeze("manual_freeze", actor)
+        with pytest.raises(ControlRejected, match="operator-only"):
+            s.unfreeze("automation may not release", actor)
+    state = s.freeze("private operator note", "dashboard")
+    assert state.lifecycle == "FROZEN"
+    assert state.freeze_reason == "operator_requested_freeze"
     serialized = json.dumps(s.recent_events(50), sort_keys=True)
-    assert "private_operator_note" not in serialized
-    assert "secrettokenvalue" not in serialized
-    assert "NATURALSECRET" not in serialized
+    assert "private operator note" not in serialized
 
 
 def test_concurrent_first_open_serializes_schema_migration(tmp_path):
@@ -449,7 +447,7 @@ def test_concurrent_first_open_serializes_schema_migration(tmp_path):
     with sqlite3.connect(path) as con:
         assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert con.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 2
         columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
         assert {"fee_is_stable", "order_hash"} <= columns
         state_columns = {row[1] for row in con.execute("PRAGMA table_info(strategy_state)")}
@@ -493,7 +491,7 @@ def test_concurrent_process_first_open_is_retry_safe(tmp_path, legacy):
     assert return_codes == [0] * 8
     with sqlite3.connect(path) as con:
         assert con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 2
         columns = {row[1] for row in con.execute("PRAGMA table_info(applied_fills)")}
         assert {"fee_is_stable", "order_hash"} <= columns
         assert con.execute("SELECT COUNT(*) FROM strategy_state").fetchone()[0] == 1
@@ -515,3 +513,91 @@ def test_wal_initialization_fails_closed_after_bounded_lock_timeout(tmp_path, mo
 
     with pytest.raises(sqlite3.OperationalError, match="Timed out enabling WAL journal mode"):
         LiveStrategyStore(tmp_path / "locked.db", tmp_path / "archives")
+
+
+def test_execution_hold_scope_and_exact_recovery(tmp_path):
+    s = store(tmp_path)
+    make_active(s)
+    system = s.create_execution_hold("SYSTEM", "ignored", "SYNC_STALE", "test_system")
+    symbol = s.create_execution_hold("SYMBOL", "us.aapl", "QUOTE_STALE", "test_quote")
+    intent = s.create_execution_hold("INTENT", "intent-1", "OUTCOME_UNKNOWN", "test_executor")
+
+    assert system["scope_key"] == "*"
+    assert {h["reason_code"] for h in s.applicable_execution_holds(symbol="US.MSFT")} == {"SYNC_STALE"}
+    assert {h["reason_code"] for h in s.applicable_execution_holds(symbol="US.AAPL")} == {
+        "SYNC_STALE", "QUOTE_STALE",
+    }
+    assert {h["reason_code"] for h in s.applicable_execution_holds(intent_id="intent-1")} == {
+        "SYNC_STALE", "OUTCOME_UNKNOWN",
+    }
+    assert s.resolve_execution_holds(
+        scope_type="SYMBOL", scope_key="US.AAPL", reason_code="QUOTE_STALE",
+        source="test_quote", resolved_by="test_recovery", resolution_reason="fresh quote",
+    ) == 1
+    assert s.resolve_execution_holds(
+        scope_type="SYMBOL", scope_key="US.AAPL", reason_code="QUOTE_STALE",
+        source="test_quote", resolved_by="test_recovery", resolution_reason="fresh quote",
+    ) == 0
+    assert {h["reason_code"] for h in s.list_execution_holds(active_only=True)} == {
+        "SYNC_STALE", "OUTCOME_UNKNOWN",
+    }
+
+
+def test_concurrent_legacy_automatic_freeze_migration_is_idempotent(tmp_path):
+    db = tmp_path / "legacy-auto-concurrent.db"
+    original = LiveStrategyStore(db, tmp_path / "archives")
+    with original.connect() as con:
+        con.execute(
+            "UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+            "freeze_reason='five_minute_reconciliation_failed' WHERE id=1"
+        )
+    barrier = threading.Barrier(8)
+    failures = []
+
+    def reopen():
+        try:
+            barrier.wait()
+            LiveStrategyStore(db, tmp_path / "archives").snapshot()
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=reopen) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert failures == []
+    migrated = LiveStrategyStore(db, tmp_path / "archives")
+    assert migrated.snapshot().lifecycle == "ACTIVE"
+    holds = migrated.list_execution_holds(active_only=True)
+    assert [(row["reason_code"], row["source"]) for row in holds] == [
+        ("FIVE_MINUTE_RECONCILIATION_FAILED", "moomoo_sync")
+    ]
+    assert sum(
+        row["event_type"] == "legacy_automatic_freeze_migrated"
+        for row in migrated.recent_events(100)
+    ) == 1
+
+
+def test_legacy_automatic_freeze_migrates_but_manual_freeze_is_preserved(tmp_path):
+    auto_db = tmp_path / "legacy-auto.db"
+    auto = LiveStrategyStore(auto_db, tmp_path / "auto-archives")
+    with auto.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                    "freeze_reason='five_minute_reconciliation_failed' WHERE id=1")
+    migrated = LiveStrategyStore(auto_db, tmp_path / "auto-archives")
+    assert migrated.snapshot().lifecycle == "ACTIVE"
+    assert_active_hold(migrated, "FIVE_MINUTE_RECONCILIATION_FAILED")
+    assert migrated.list_execution_holds(active_only=True)[0]["source"] == "moomoo_sync"
+
+    manual_db = tmp_path / "legacy-manual.db"
+    manual = LiveStrategyStore(manual_db, tmp_path / "manual-archives")
+    with manual.connect() as con:
+        con.execute("UPDATE strategy_state SET lifecycle='FROZEN',freeze_latched=1,"
+                    "freeze_reason='manual_freeze' WHERE id=1")
+    preserved = LiveStrategyStore(manual_db, tmp_path / "manual-archives")
+    assert preserved.snapshot().lifecycle == "FROZEN"
+    assert preserved.snapshot().freeze_reason == "manual_freeze"
+    assert preserved.list_execution_holds(active_only=True) == []

@@ -38,6 +38,9 @@ def test_control_read_requires_separate_read_token(tmp_path, monkeypatch):
     assert body["hard_limits"] == {"initial_capital": 10_000, "exposure_cap": 10_000,
                                    "loss_floor": 7_500, "regular_hours_only": True}
     assert body["state"]["lifecycle"] == "FROZEN"
+    assert body["execution_status"]["status"] == "HELD"
+    assert body["execution_status"]["active_holds"] == []
+    assert body["execution_holds"] == []
 
 
 def test_public_strategy_view_has_no_broker_account_data(tmp_path, monkeypatch):

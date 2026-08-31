@@ -120,7 +120,7 @@ def test_dispatch_fill_response_stays_acked_until_reconciler_observes_fill(tmp_p
         )
 
 
-def test_broker_unknown_freezes_and_never_makes_intent_retryable(tmp_path, monkeypatch):
+def test_broker_unknown_holds_intent_and_never_makes_it_retryable(tmp_path, monkeypatch):
     ex, _, store = executor(tmp_path)
     monkeypatch.setattr(
         module, "dispatch_signed_preview",
@@ -130,7 +130,8 @@ def test_broker_unknown_freezes_and_never_makes_intent_retryable(tmp_path, monke
         ex.execute_one(now=NOW)
     intent = store.list_auto_order_intents()[0]
     assert intent["status"] == "UNKNOWN"
-    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.applicable_execution_holds(intent_id=intent["intent_id"])[0]["reason_code"] == "BROKER_OUTCOME_UNKNOWN"
 
 
 def test_post_broker_reconciliation_failure_freezes_without_failed_retry(tmp_path, monkeypatch):
@@ -153,7 +154,8 @@ def test_post_broker_reconciliation_failure_freezes_without_failed_retry(tmp_pat
     intent = store.list_auto_order_intents()[0]
     assert intent["status"] == "ACKED"
     assert intent["reserved_sell_qty"] == 1
-    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.applicable_execution_holds(intent_id=intent["intent_id"])[0]["reason_code"] == "POST_BROKER_RECONCILIATION_FAILED"
 
 
 @pytest.mark.parametrize("latched_reason", [
@@ -169,7 +171,9 @@ def test_post_broker_reconciliation_latch_is_never_overwritten(
         nonlocal count
         count += 1
         if count == 2:
-            reconcile_store.freeze(latched_reason, "moomoo_reconciler")
+            reconcile_store.create_execution_hold(
+                "SYMBOL", "US.DRAM", latched_reason.upper(), "moomoo_reconciler"
+            )
             raise ControlRejected("Broker reconciliation conflict")
         return {"ok": True}
 
@@ -184,7 +188,9 @@ def test_post_broker_reconciliation_latch_is_never_overwritten(
     with pytest.raises(ControlRejected, match="reconciliation conflict"):
         ex.execute_one(now=NOW)
 
-    assert store.snapshot().freeze_reason == latched_reason
+    reasons = {h["reason_code"] for h in store.list_execution_holds(active_only=True)}
+    assert latched_reason.upper() in reasons
+    assert "POST_BROKER_RECONCILIATION_FAILED" in reasons
 
 
 def test_transient_post_broker_api_failure_defers_without_global_freeze(tmp_path, monkeypatch):
@@ -226,7 +232,8 @@ def test_recovery_missing_dispatched_broker_order_becomes_unknown_and_frozen(tmp
     blocker = recover_auto_intents(store, {"orders": []})
     assert blocker is not None
     assert blocker["status"] == "UNKNOWN"
-    assert store.snapshot().freeze_reason == "auto_intent_broker_outcome_unknown"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.applicable_execution_holds(intent_id=intent["intent_id"])[0]["reason_code"] == "BROKER_ORDER_NOT_PROVEN"
 
 
 def test_stale_reserved_config_is_cancelled_before_dispatch(tmp_path, monkeypatch):
@@ -238,6 +245,11 @@ def test_stale_reserved_config_is_cancelled_before_dispatch(tmp_path, monkeypatc
         order_qty=1, limit_price=99,
     )
     store.update_config({"top_n": 5}, 1, "test", "new live config")
+    store.resolve_execution_holds(
+        scope_type="SYSTEM", scope_key="*",
+        reason_code="CONTROL_GENERATION_CHANGED_REQUIRES_SYNC", source="control",
+        resolved_by="test_reconciler", resolution_reason="fresh test sync",
+    )
     with store.connect() as con:
         con.execute("UPDATE strategy_state SET lifecycle='ACTIVE',freeze_latched=0,"
                     "freeze_reason=NULL,last_sync_at=? WHERE id=1", (NOW.isoformat(),))
@@ -291,4 +303,5 @@ def test_mismatched_broker_order_never_releases_local_reservation(tmp_path):
     }]})
     assert blocker is not None and blocker["status"] == "UNKNOWN"
     assert blocker["reserved_sell_qty"] == 1
-    assert store.snapshot().lifecycle == "FROZEN"
+    assert store.snapshot().lifecycle == "ACTIVE"
+    assert store.applicable_execution_holds(intent_id=intent["intent_id"])[0]["reason_code"] == "BROKER_ORDER_PROOF_MISMATCH"
