@@ -267,6 +267,44 @@ class LiveAutoExecutor:
             "broker_mutation": False,
         }
 
+    def execute_serial(self, *, now: datetime | None = None,
+                       max_actions: int = 20) -> dict[str, Any]:
+        """Execute proven actions serially, replanning after every reconciled fill.
+
+        A Broker acknowledgement is never enough to continue. The next action is
+        attempted only when the post-order reconciliation has made the prior
+        intent terminal as FILLED. Any other result stops this window.
+        """
+        limit = int(max_actions)
+        if limit < 1 or limit > 20:
+            raise AutoExecutionError("Serial action limit must be between 1 and 20")
+        fixed_now = now.astimezone(timezone.utc) if now is not None else None
+        actions: list[dict[str, Any]] = []
+        while len(actions) < limit:
+            # Production calls use a fresh clock value on every action so a
+            # serial window cannot coast past the RTH boundary on stale time.
+            result = self.execute_one(now=fixed_now)
+            if result.get("status") != "broker_accepted":
+                if not actions:
+                    return result
+                return {
+                    "mode": "execute", "status": "completed" if result.get("status") == "no_action"
+                    else "stopped_before_next_action",
+                    "action_count": len(actions), "actions": actions,
+                    "stop_reason": result.get("status"),
+                }
+            actions.append(result)
+            if result.get("intent_status") != "FILLED":
+                return {
+                    "mode": "execute", "status": "stopped_on_nonfilled_intent",
+                    "action_count": len(actions), "actions": actions,
+                    "stop_reason": result.get("intent_status") or "UNKNOWN",
+                }
+        return {
+            "mode": "execute", "status": "max_actions_reached",
+            "action_count": len(actions), "actions": actions,
+        }
+
     def execute_one(self, *, now: datetime | None = None) -> dict[str, Any]:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         if not self.client.settings.trading_enabled or not self.client.settings.auto_trading_enabled:
@@ -351,6 +389,10 @@ class LiveAutoExecutor:
             self.reconcile_fn(self.client, self.store)
             order = result.get("order") or {}
             final = self.store.get_auto_order_intent(intent_row["intent_id"])
+            if final is None:
+                raise ControlRejected(
+                    "Automatic intent state disappeared after Broker acceptance"
+                )
             order_id = str(order.get("order_id") or "")
             return {
                 "mode": "execute", "status": "broker_accepted",
@@ -358,7 +400,7 @@ class LiveAutoExecutor:
                 "limit_price": chosen.limit_price,
                 "intent_id_hash": hashlib.sha256(str(intent_row["intent_id"]).encode()).hexdigest(),
                 "order_ref_hash": hashlib.sha256(order_id.encode()).hexdigest() if order_id else None,
-                "intent_status": final["status"] if final else "FILLED",
+                "intent_status": final["status"],
             }
         except BrokerOutcomeUnknown:
             self.store.latch_auto_intent_hold(
@@ -382,13 +424,23 @@ class LiveAutoExecutor:
         except (LiveTradeRejected, ControlRejected):
             current_intent = self.store.get_auto_order_intent(intent_row["intent_id"])
             if broker_accepted:
-                if current_intent and current_intent["status"] == "DISPATCHING":
-                    self.store.mark_auto_intent_unknown(
-                        intent_row["intent_id"], "POST_BROKER_LOCAL_FAILURE",
+                if current_intent is None:
+                    self.store.create_execution_hold(
+                        "SYSTEM", "*", "AUTO_INTENT_STATE_MISSING", "auto_executor",
                     )
-                self.store.latch_auto_intent_hold(
-                    intent_row["intent_id"], "POST_BROKER_RECONCILIATION_FAILED",
-                )
+                    self.store.event(
+                        "auto_intent_state_missing", "auto_executor", "critical",
+                        "Automatic intent state missing after Broker acceptance",
+                        {"symbol": chosen.symbol, "side": chosen.side},
+                    )
+                else:
+                    if current_intent["status"] == "DISPATCHING":
+                        self.store.mark_auto_intent_unknown(
+                            intent_row["intent_id"], "POST_BROKER_LOCAL_FAILURE",
+                        )
+                    self.store.latch_auto_intent_hold(
+                        intent_row["intent_id"], "POST_BROKER_RECONCILIATION_FAILED",
+                    )
             elif current_intent and current_intent["status"] in {"RESERVED", "DISPATCHING"}:
                 self.store.mark_auto_intent_failed(intent_row["intent_id"], "PRE_BROKER_REJECTED")
             raise

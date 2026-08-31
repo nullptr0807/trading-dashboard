@@ -120,6 +120,221 @@ def test_dispatch_fill_response_stays_acked_until_reconciler_observes_fill(tmp_p
         )
 
 
+def test_execute_serial_replans_after_each_proven_fill_and_respects_hard_cap(
+        tmp_path, monkeypatch):
+    reconcile_calls = 0
+
+    def reconcile(_client, reconcile_store):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        for intent in reconcile_store.list_auto_order_intents(limit=100):
+            if intent["status"] != "ACKED":
+                continue
+            reconcile_store.apply_fill(
+                "fill-" + str(intent["intent_id"]), intent["symbol"], intent["side"],
+                intent["order_qty"], intent["limit_price"],
+            )
+            reconcile_store.mark_auto_intent_filled(intent["intent_id"])
+        return {"ok": True}
+
+    ex, _, store = executor(tmp_path, reconcile)
+    order_count = 0
+
+    def dispatch(*args, **kwargs):
+        nonlocal order_count
+        order_count += 1
+        return {"accepted": True, "order": {
+            "order_id": f"serial-{order_count}", "order_status": "FILLED_ALL",
+        }}
+
+    monkeypatch.setattr(module, "dispatch_signed_preview", dispatch)
+
+    result = ex.execute_serial(now=NOW, max_actions=2)
+
+    assert result["status"] == "max_actions_reached"
+    assert result["action_count"] == 2
+    assert [row["intent_status"] for row in result["actions"]] == ["FILLED", "FILLED"]
+    assert order_count == 2
+    assert reconcile_calls == 4
+    assert "serial-1" not in repr(result) and "serial-2" not in repr(result)
+    assert store.list_auto_order_intents()[0]["status"] == "FILLED"
+    assert store.list_auto_order_intents()[1]["status"] == "FILLED"
+
+
+def test_execute_serial_stops_before_second_dispatch_if_hold_appears_after_fill(
+        tmp_path, monkeypatch):
+    reconcile_calls = 0
+
+    def reconcile(_client, reconcile_store):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        for intent in reconcile_store.list_auto_order_intents(limit=100):
+            if intent["status"] == "ACKED":
+                reconcile_store.apply_fill(
+                    "held-fill-" + str(intent["intent_id"]), intent["symbol"],
+                    intent["side"], intent["order_qty"], intent["limit_price"],
+                )
+                reconcile_store.mark_auto_intent_filled(intent["intent_id"])
+                reconcile_store.create_execution_hold(
+                    "SYSTEM", "*", "POST_FILL_SAFETY_HOLD", "test_reconciler"
+                )
+        return {"ok": True}
+
+    ex, _, _ = executor(tmp_path, reconcile)
+    dispatch_calls = 0
+
+    def dispatch(*args, **kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        return {"accepted": True, "order": {
+            "order_id": "one-before-hold", "order_status": "FILLED_ALL",
+        }}
+
+    monkeypatch.setattr(module, "dispatch_signed_preview", dispatch)
+
+    with pytest.raises(ControlRejected, match="hold blocks"):
+        ex.execute_serial(now=NOW, max_actions=5)
+
+    assert dispatch_calls == 1
+
+
+def test_execute_serial_propagates_second_action_rth_close(tmp_path, monkeypatch):
+    ex, _, _ = executor(tmp_path)
+    calls = 0
+
+    def crosses_close(*, now=None):
+        nonlocal calls
+        calls += 1
+        assert now is None
+        if calls == 1:
+            return {"mode": "execute", "status": "broker_accepted", "intent_status": "FILLED"}
+        raise AutoExecutionError("Live auto execution is restricted to US RTH")
+
+    monkeypatch.setattr(ex, "execute_one", crosses_close)
+
+    with pytest.raises(AutoExecutionError, match="RTH"):
+        ex.execute_serial(max_actions=5)
+    assert calls == 2
+
+
+def test_execute_serial_hard_cap_stops_exactly_before_twenty_first_action(
+        tmp_path, monkeypatch):
+    ex, _, _ = executor(tmp_path)
+    calls = 0
+
+    def filled(*, now=None):
+        nonlocal calls
+        calls += 1
+        return {"mode": "execute", "status": "broker_accepted", "intent_status": "FILLED"}
+
+    monkeypatch.setattr(ex, "execute_one", filled)
+    result = ex.execute_serial(now=NOW)
+
+    assert result["status"] == "max_actions_reached"
+    assert result["action_count"] == 20
+    assert calls == 20
+
+
+def test_execute_serial_fails_closed_if_intent_disappears_after_broker_acceptance(
+        tmp_path, monkeypatch):
+    reconcile_calls = 0
+
+    def reconcile(_client, reconcile_store):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 2:
+            with reconcile_store.connect() as con:
+                con.execute("DELETE FROM auto_order_intents")
+        return {"ok": True}
+
+    ex, _, store = executor(tmp_path, reconcile)
+    dispatch_calls = 0
+
+    def dispatch(*args, **kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        return {"accepted": True, "order": {
+            "order_id": "accepted-before-loss", "order_status": "FILLED_ALL",
+        }}
+
+    monkeypatch.setattr(module, "dispatch_signed_preview", dispatch)
+
+    with pytest.raises(ControlRejected, match="intent state disappeared"):
+        ex.execute_serial(now=NOW, max_actions=5)
+
+    assert dispatch_calls == 1
+    assert store.list_auto_order_intents() == []
+    assert any(
+        hold["reason_code"] == "AUTO_INTENT_STATE_MISSING"
+        and hold["scope_type"] == "SYSTEM"
+        for hold in store.list_execution_holds(active_only=True)
+    )
+
+
+def test_execute_serial_stops_when_first_order_is_not_terminal(tmp_path, monkeypatch):
+    ex, _, store = executor(tmp_path)
+    monkeypatch.setattr(
+        module, "dispatch_signed_preview",
+        lambda *args, **kwargs: {"accepted": True, "order": {
+            "order_id": "still-open", "order_status": "SUBMITTED",
+        }},
+    )
+
+    result = ex.execute_serial(now=NOW, max_actions=5)
+
+    assert result["status"] == "stopped_on_nonfilled_intent"
+    assert result["action_count"] == 1
+    assert result["actions"][0]["intent_status"] == "ACKED"
+    assert len(store.list_auto_order_intents()) == 1
+
+
+@pytest.mark.parametrize("intent_status", [
+    "ACKED", "PARTIAL", "CANCELLED", "FAILED", "UNKNOWN",
+])
+def test_execute_serial_never_continues_after_nonfilled_status(
+        tmp_path, monkeypatch, intent_status):
+    ex, _, _ = executor(tmp_path)
+    calls = 0
+
+    def nonfilled(*, now=None):
+        nonlocal calls
+        calls += 1
+        return {
+            "mode": "execute", "status": "broker_accepted",
+            "intent_status": intent_status,
+        }
+
+    monkeypatch.setattr(ex, "execute_one", nonfilled)
+    result = ex.execute_serial(now=NOW, max_actions=5)
+
+    assert result["status"] == "stopped_on_nonfilled_intent"
+    assert result["action_count"] == 1
+    assert result["stop_reason"] == intent_status
+    assert calls == 1
+
+
+@pytest.mark.parametrize("limit", [0, 21])
+def test_execute_serial_rejects_unsafe_action_limits(tmp_path, limit):
+    ex, _, _ = executor(tmp_path)
+    with pytest.raises(AutoExecutionError, match="between 1 and 20"):
+        ex.execute_serial(now=NOW, max_actions=limit)
+
+
+def test_execute_serial_uses_fresh_clock_for_production_calls(tmp_path, monkeypatch):
+    ex, _, _ = executor(tmp_path)
+    observed = []
+
+    def no_action(*, now=None):
+        observed.append(now)
+        return {"mode": "execute", "status": "no_action"}
+
+    monkeypatch.setattr(ex, "execute_one", no_action)
+    result = ex.execute_serial()
+
+    assert result["status"] == "no_action"
+    assert observed == [None]
+
+
 def test_broker_unknown_holds_intent_and_never_makes_it_retryable(tmp_path, monkeypatch):
     ex, _, store = executor(tmp_path)
     monkeypatch.setattr(

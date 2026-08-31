@@ -47,3 +47,7 @@ def test_auto_wrapper_uses_new_york_window_and_never_passes_token_in_argv():
         assert window in shell
     assert "MOOMOO_TRADE_API_TOKEN" not in shell
     assert 'python scripts/live_auto_cycle.py "$MODE" --quiet' in shell
+    cycle = (root / "scripts/live_auto_cycle.py").read_text()
+    assert "executor.execute_serial() if args.execute" in cycle
+    assert "broker_outcome_unknown_held" in cycle
+    assert "broker_outcome_unknown_frozen" not in cycle

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One fail-closed B16 live-auto cycle. Default mode is shadow."""
+"""Fail-closed B16 live-auto cycle. Default mode is shadow."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +23,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="B16 independent live-subledger auto cycle")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--shadow", action="store_true", help="plan only; this is the default")
-    mode.add_argument("--execute", action="store_true", help="allow one guarded live order")
+    mode.add_argument("--execute", action="store_true",
+                      help="allow bounded serial guarded live orders")
     parser.add_argument("--quiet", action="store_true", help="stay silent for safe no-op ticks")
     args = parser.parse_args()
     store = LiveStrategyStore(read_only=not args.execute)
@@ -32,7 +33,7 @@ def main() -> int:
     try:
         with auto_cycle_lock():
             with redirect_stdout(io.StringIO()):
-                result = executor.execute_one() if args.execute else executor.shadow()
+                result = executor.execute_serial() if args.execute else executor.shadow()
     except BlockingIOError:
         return 0
     except AutoExecutionError:
@@ -41,7 +42,7 @@ def main() -> int:
                               "status": "safety_gate_closed"}, sort_keys=True))
         return 0
     except BrokerOutcomeUnknown:
-        print(json.dumps({"mode": "execute", "status": "broker_outcome_unknown_frozen"},
+        print(json.dumps({"mode": "execute", "status": "broker_outcome_unknown_held"},
                          sort_keys=True))
         return 2
     except (LiveTradeRejected, MoomooUnavailable, RuntimeError):
