@@ -222,7 +222,7 @@ def test_overview_equity_chart_has_continuous_mouse_time_zoom():
     assert 'event.preventDefault()' in js
     assert "container.addEventListener('dblclick'" in js
     assert "handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true }" in js
-    assert 'trade.js?v=26' in html
+    assert 'trade.js?v=27' in html
 
 
 def test_live_account_uses_sse_incremental_updates_and_cache_bust():

@@ -178,17 +178,23 @@ def _status_sync(market: str, db_path: str | Path = DB_PATH) -> dict:
         freshness_sla = _market_freshness_sla(market)
         quote_stale = _age_seconds(health.get('success_at')) > freshness_sla
         quote_unhealthy = health['status'] not in {'ok', 'healthy'}
-        if phase == 'closed' and not quote_stale:
-            # A sparse pre/post-market tick is useful evidence, but it must not
-            # keep the whole system red after the quote session has ended.
+        if phase in {'extended', 'closed'} and not quote_stale:
+            # Sparse pre/post-market prints are expected: many held symbols do
+            # not trade in the extended session. Preserve the recorded state as
+            # diagnostic evidence, but do not present missing prints as a whole-
+            # system incident. The updater heartbeat must still be fresh, and
+            # RTH remains strict.
             health['recorded_status'] = health['status']
-            health['status'] = 'closed'
+            health['status'] = phase
             quote_unhealthy = False
+        valuation_unhealthy = phase == 'rth' and (
+            valuation['complete_accounts'] < valuation['active_accounts']
+            or _age_seconds(valuation.get('oldest_complete_at')) > freshness_sla
+        )
         degraded = (
             quote_unhealthy
             or quote_stale
-            or valuation['complete_accounts'] < valuation['active_accounts']
-            or _age_seconds(valuation.get('oldest_complete_at')) > freshness_sla
+            or valuation_unhealthy
             or risk['state'] not in {'ARMED', 'DISARMED'}
             or _age_seconds(risk.get('last_check_at')) > freshness_sla
         )

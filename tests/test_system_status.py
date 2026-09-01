@@ -152,3 +152,62 @@ def test_closed_market_does_not_replay_extended_quote_warning_as_system_failure(
     assert result['quote_health']['status'] == 'closed'
     assert result['quote_health']['recorded_status'] == 'degraded'
     assert result['non_tradeable_accounts'][0]['account_id'] == 'F14'
+
+
+def test_extended_market_sparse_prints_do_not_degrade_whole_system(tmp_path, monkeypatch):
+    import api.system_status as status_api
+
+    now = datetime.now(timezone.utc).isoformat()
+    db = tmp_path / 'extended-market.db'
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE account_meta(account_id TEXT,market TEXT,status TEXT,retire_reason TEXT);"
+        "CREATE TABLE accounts(name TEXT,market TEXT,timestamp TEXT);"
+        "CREATE TABLE operational_health(component TEXT,market TEXT,status TEXT,success_at TEXT,"
+        "source_timestamp TEXT,details TEXT);"
+        "CREATE TABLE risk_regime(market TEXT,state TEXT,last_drawdown REAL,last_check_at TEXT);"
+    )
+    con.executemany(
+        "INSERT INTO account_meta VALUES(?,?,?,NULL)",
+        [('A01', 'US', 'active'), ('A02', 'US', 'active')],
+    )
+    # Only one account received a complete mark because the other symbol did
+    # not print pre-market. That is expected, not a system incident.
+    con.execute("INSERT INTO accounts VALUES('A01','US',?)", (now,))
+    con.execute(
+        "INSERT INTO operational_health VALUES('update_prices','US','degraded',?,?,?)",
+        (now, now, json.dumps({'valid': 1, 'expected': 2, 'blocked': 1})),
+    )
+    con.execute("INSERT INTO risk_regime VALUES('US','DISARMED',.01,?)", (now,))
+    con.commit(); con.close()
+
+    monkeypatch.setattr(status_api, '_market_phase', lambda market: 'extended')
+    result = status_api._status_sync('US', db)
+    assert result['status'] == 'healthy'
+    assert result['market_phase'] == 'extended'
+    assert result['quote_health']['status'] == 'extended'
+    assert result['quote_health']['recorded_status'] == 'degraded'
+    assert result['valuation']['complete_accounts'] == 1
+
+
+def test_extended_market_stale_updater_still_degrades(tmp_path, monkeypatch):
+    import api.system_status as status_api
+
+    db = tmp_path / 'extended-stale.db'
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE account_meta(account_id TEXT,market TEXT,status TEXT,retire_reason TEXT);"
+        "CREATE TABLE accounts(name TEXT,market TEXT,timestamp TEXT);"
+        "CREATE TABLE operational_health(component TEXT,market TEXT,status TEXT,success_at TEXT,"
+        "source_timestamp TEXT,details TEXT);"
+        "CREATE TABLE risk_regime(market TEXT,state TEXT,last_drawdown REAL,last_check_at TEXT);"
+    )
+    con.execute("INSERT INTO account_meta VALUES('A01','US','active',NULL)")
+    con.execute("INSERT INTO operational_health VALUES('update_prices','US','degraded',"
+                "'2020-01-01T00:00:00+00:00',NULL,'{}')")
+    con.execute("INSERT INTO risk_regime VALUES('US','DISARMED',.01,?)",
+                (datetime.now(timezone.utc).isoformat(),))
+    con.commit(); con.close()
+
+    monkeypatch.setattr(status_api, '_market_phase', lambda market: 'extended')
+    assert status_api._status_sync('US', db)['status'] == 'degraded'

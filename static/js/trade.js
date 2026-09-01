@@ -42,24 +42,31 @@ async function loadSystemStatus(routeToken) {
   const v = s.valuation || {};
   const r = s.risk || {};
   const bad = (s.status || 'degraded') !== 'healthy';
+  const isExtended = s.market_phase === 'extended';
   const pct = r.drawdown == null ? '—' : `${(Number(r.drawdown) * 100).toFixed(2)}%`;
   const coverage = `${v.complete_accounts || 0}/${v.active_accounts || 0}`;
   const inactive = (s.non_tradeable_accounts || []).map(x => x.account_id).join(', ');
-  // A normal closed session is not actionable information. Keep the backend
-  // phase/freshness checks, but only surface quote state when it needs attention.
-  const quoteStatus = q.status === 'closed'
+  // Sparse extended-session prints are expected and are not actionable. The
+  // backend still requires a fresh updater heartbeat and RTH quote coverage.
+  const quoteStatus = ['closed', 'extended'].includes(q.status)
     ? ''
     : `<span>${t('system_quote')}: ${_escStatus(q.status || 'unknown')}</span>`;
+  const sessionStatus = isExtended
+    ? `<span>${t('system_extended_session')}</span>`
+    : `<span>${t('system_valuation')}: ${coverage}</span>`;
+  const valuationDetail = isExtended
+    ? t('system_extended_valuation')
+    : `${t('system_oldest_valuation')}: ${_escStatus(v.oldest_complete_at || '—')}`;
   host.className = `system-status-banner ${bad ? 'system-status-degraded' : 'system-status-healthy'}`;
   host.innerHTML = `
     <div class="system-status-head">
       <b>${bad ? t('system_degraded') : t('system_healthy')}</b>
       ${quoteStatus}
-      <span>${t('system_valuation')}: ${coverage}</span>
+      ${sessionStatus}
       <span>${t('system_risk')}: ${_escStatus(r.state || 'UNKNOWN')} · DD ${pct}</span>
     </div>
     <div class="system-status-detail">
-      ${t('system_oldest_valuation')}: ${_escStatus(v.oldest_complete_at || '—')}
+      ${valuationDetail}
       ${inactive ? ` · ${t('system_nontradeable')}: ${_escStatus(inactive)}` : ''}
     </div>`;
 }
