@@ -58,12 +58,16 @@ async function loadSystemStatus(routeToken) {
   const pct = r.drawdown == null ? '—' : `${(Number(r.drawdown) * 100).toFixed(2)}%`;
   const coverage = `${v.complete_accounts || 0}/${v.active_accounts || 0}`;
   const inactive = (s.non_tradeable_accounts || []).map(x => x.account_id).join(', ');
-  const quoteStatus = q.status === 'closed' ? t('system_quote_closed') : _escStatus(q.status || 'unknown');
+  // A normal closed session is not actionable information. Keep the backend
+  // phase/freshness checks, but only surface quote state when it needs attention.
+  const quoteStatus = q.status === 'closed'
+    ? ''
+    : `<span>${t('system_quote')}: ${_escStatus(q.status || 'unknown')}</span>`;
   host.className = `system-status-banner ${bad ? 'system-status-degraded' : 'system-status-healthy'}`;
   host.innerHTML = `
     <div class="system-status-head">
       <b>${bad ? t('system_degraded') : t('system_healthy')}</b>
-      <span>${t('system_quote')}: ${quoteStatus}</span>
+      ${quoteStatus}
       <span>${t('system_valuation')}: ${coverage}</span>
       <span>${t('system_risk')}: ${_escStatus(r.state || 'UNKNOWN')} · DD ${pct}</span>
     </div>
@@ -125,10 +129,6 @@ function renderHero(s) {
         </div>
       </div>
     </div>
-    <div class="section">
-      <div class="section-title">${t('dist_hist_title')}</div>
-      <div class="glass-card" id="pnl-histogram" style="padding:20px;"></div>
-    </div>
     <div class="section chart-section">
       <div class="section-title">${t('equity_curve')}</div>
       <div class="glass-card chart-container" id="equity-chart-container">
@@ -165,7 +165,6 @@ function renderHero(s) {
     </div>
   `;
   app.innerHTML = heroHtml;
-  renderPnlHistogram(d);
   if (typeof startEventsStream === 'function') startEventsStream();
 }
 
@@ -300,9 +299,8 @@ function renderPnlHistogram(dist) {
     const rows = all.map(a => {
       const cls = a.pnl_pct >= 0 ? 'color:#4ade80;' : 'color:#f87171;';
       const sign = a.pnl_pct >= 0 ? '+' : '';
-      const strat = a.strategy_name ? ` <span style="opacity:0.6;">${_esc(a.strategy_name)}</span>` : '';
       return `<div style="display:flex;justify-content:space-between;gap:12px;">
-        <span><b>${a.account_id}</b>${strat}</span>
+        <span><b>${a.account_id}</b></span>
         <span style="${cls}font-variant-numeric:tabular-nums;">${sign}${a.pnl_pct.toFixed(2)}%</span>
       </div>`;
     }).join('');
@@ -350,6 +348,39 @@ function renderHeroFallback() {
   if (typeof startEventsStream === 'function') startEventsStream();
 }
 
+function installEquityTimeZoom(chart, container) {
+  const scale = chart.timeScale();
+  let fullRange = null;
+  const rememberFullRange = () => {
+    const range = scale.getVisibleLogicalRange();
+    if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
+      fullRange = { from: range.from, to: range.to };
+    }
+  };
+  requestAnimationFrame(rememberFullRange);
+
+  container.addEventListener('wheel', event => {
+    const range = scale.getVisibleLogicalRange();
+    if (!range || !Number.isFinite(range.from) || !Number.isFinite(range.to)) return;
+    event.preventDefault();
+    const span = Math.max(0.5, range.to - range.from);
+    const fullSpan = fullRange ? Math.max(0.5, fullRange.to - fullRange.from) : span;
+    const nextSpan = Math.min(fullSpan, Math.max(0.5, span * (event.deltaY < 0 ? 0.78 : 1.28)));
+    const rect = container.getBoundingClientRect();
+    const anchor = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(1, rect.width)));
+    const anchorLogical = range.from + span * anchor;
+    scale.setVisibleLogicalRange({
+      from: anchorLogical - nextSpan * anchor,
+      to: anchorLogical + nextSpan * (1 - anchor),
+    });
+  }, { passive: false });
+
+  container.addEventListener('dblclick', () => {
+    scale.fitContent();
+    requestAnimationFrame(rememberFullRange);
+  });
+}
+
 function renderEquityCurves(data) {
   const container = document.getElementById('equity-chart');
   if (!container || !window.LightweightCharts) return;
@@ -361,9 +392,9 @@ function renderEquityCurves(data) {
     grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
     crosshair: { mode: 0, vertLine: { color: 'rgba(0,0,0,0.15)', width: 1 }, horzLine: { color: 'rgba(0,0,0,0.15)', width: 1 } },
     rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
-    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 10 },
-    handleScroll: true,
-    handleScale: true,
+    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false, rightOffset: 6, barSpacing: 10, minBarSpacing: 0.5 },
+    handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+    handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true },
   });
 
   const seriesMap = {};
@@ -444,6 +475,7 @@ function renderEquityCurves(data) {
   });
 
   chart.timeScale().fitContent();
+  installEquityTimeZoom(chart, container);
 
   // Persistent legend for benchmarks (top-right overlay) — market-aware.
   const benchLegend = document.createElement('div');
@@ -613,13 +645,13 @@ function tombstoneHtml(a) {
   const born = (a.created_at || '').slice(0, 10) || '—';
   const died = (a.retired_at || '').slice(0, 10) || '—';
   const reason = _esc(a.retire_reason || t('retired_tooltip') || '');
-  const strat = a.strategy_name ? _esc(tStrategy(a.strategy_name, id)) : '';
+
   return `
     <div class="tombstone fade-in" data-id="${id}" title="${reason}">
       <div class="tombstone-cross">✝</div>
       <div class="tombstone-rip">R.I.P.</div>
       <div class="tombstone-id">${_esc(id)}</div>
-      <div class="tombstone-strat">${strat}</div>
+
       <div class="tombstone-dates">${born} — ${died}</div>
       <div class="tombstone-return ${pnlCls}">${sign}${formatPercent(pnlPct)}</div>
       <div class="tombstone-epitaph">${_esc((a.retire_reason || '').slice(0, 60) || (t('retired_tooltip') || ''))}</div>
@@ -678,7 +710,7 @@ function renderTombstoneModal(body, accountId, accData, factors) {
       <div class="tomb-modal-cross">✝</div>
       <div class="tomb-modal-title">
         <div class="tomb-modal-rip">${t('tomb_rip') || 'In Loving Memory of'}</div>
-        <h2 class="tomb-modal-id">${_esc(accountId)} <span class="tomb-modal-strat">${_esc(tStrategy(meta.strategy_name || '', accountId))}</span></h2>
+        <h2 class="tomb-modal-id">${_esc(accountId)}</h2>
         <div class="tomb-modal-dates">${born} ✦ ${died} <span class="tomb-modal-days">(${lifeDays} ${t('tomb_days') || 'days'})</span></div>
       </div>
       <div class="tomb-modal-return ${retCls}">
@@ -690,7 +722,7 @@ function renderTombstoneModal(body, accountId, accData, factors) {
     <div class="tomb-modal-eulogy">
       <div class="tomb-section-title">${t('tomb_eulogy') || '📜 Eulogy'}</div>
       <div class="tomb-eulogy-grid">
-        <div><span class="tomb-k">${t('tomb_strategy') || 'Strategy'}:</span> <span>${_esc(meta.strategy_name || '—')}</span></div>
+
         <div><span class="tomb-k">${t('tomb_group') || 'Group'}:</span> <span>${meta.group || '—'}</span></div>
         <div><span class="tomb-k">${t('tomb_factors') || 'Factors'}:</span> <span>${meta.factors || '—'}</span></div>
         <div><span class="tomb-k">${t('tomb_initial') || 'Initial cash'}:</span> <span>${formatCurrency(initialCash)}</span></div>

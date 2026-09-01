@@ -1793,7 +1793,7 @@ body::after {
 .sym-acct-table { display: flex; flex-direction: column; }
 .sym-arow {
   display: grid;
-  grid-template-columns: 1.1fr 1.6fr 0.7fr 1fr 1fr 1fr 0.8fr 1.2fr;
+  grid-template-columns: 1.1fr 0.7fr 1fr 1fr 1fr 0.8fr 1.2fr;
   gap: 10px; align-items: center; padding: 10px 6px;
   border-bottom: 1px solid rgba(0,0,0,0.05); font-size: 13px;
   font-variant-numeric: tabular-nums;

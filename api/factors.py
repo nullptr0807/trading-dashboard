@@ -391,6 +391,18 @@ async def get_factors(account_id: str, lang: str = 'zh', market: str = Query('US
     if not meta:
         return {'error': 'Account not found'}
 
+    if meta.get('status') == 'retired':
+        return {
+            'account_id': account_id,
+            'group': meta.get('group', ''),
+            'status': 'retired',
+            'factors': [],
+            'gp_info': '',
+            'gp_params': [],
+            'composite': {},
+            'note': 'retired_account_model_assets_removed',
+        }
+
     group = meta.get('group', '')
     factors_str = meta.get('factors', '')
     strategy_name = meta.get('strategy_name', '')

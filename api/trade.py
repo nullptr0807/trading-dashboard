@@ -2,6 +2,7 @@ from fastapi import APIRouter, Query, HTTPException
 from core.db import fetch_all, fetch_one, DB_PATH
 from core.benchmarks import rebased_curve, benchmarks_for
 import os, json, sqlite3, asyncio, time, re, base64
+from datetime import datetime, timezone
 from functools import lru_cache
 
 router = APIRouter(prefix='/api/trade', tags=['trade'])
@@ -36,6 +37,43 @@ ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX = 50
 ACCOUNT_TRADES_MAX = 200
 ACCOUNT_TRADE_PAGE_MAX = 500
 ACCOUNT_TRADE_MARKERS_MAX = 1200
+
+
+def _annualized_return_pct(initial_cash, equity, created_at, as_of):
+    """Return inception-to-latest-mark CAGR as a percentage."""
+    try:
+        initial = float(initial_cash)
+        final = float(equity)
+        start = datetime.fromisoformat(str(created_at).replace('Z', '+00:00'))
+        end = datetime.fromisoformat(str(as_of).replace('Z', '+00:00'))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        years = (end.astimezone(timezone.utc) - start.astimezone(timezone.utc)).total_seconds() / (365.25 * 86400)
+        if initial <= 0 or final < 0 or years <= 0:
+            return None
+        if final == 0:
+            return -100.0
+        return ((final / initial) ** (1 / years) - 1) * 100
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _account_age_days(created_at, retired_at=None, now=None):
+    """Elapsed whole calendar-equivalent days; freeze retired lifetimes."""
+    try:
+        start = datetime.fromisoformat(str(created_at).replace('Z', '+00:00'))
+        end_value = retired_at or now or datetime.now(timezone.utc)
+        end = end_value if isinstance(end_value, datetime) else datetime.fromisoformat(str(end_value).replace('Z', '+00:00'))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        seconds = (end.astimezone(timezone.utc) - start.astimezone(timezone.utc)).total_seconds()
+        return max(0, int(seconds // 86400))
+    except (TypeError, ValueError):
+        return None
 
 CN_UNIVERSE_FILE = os.path.expanduser('~/quant-trading/data/cn_universe.json')
 
@@ -273,7 +311,6 @@ async def summary(market: str = Query('US')):
         'loss_count': sum(1 for p in pcts if p < 0),
         'flat_count': sum(1 for p in pcts if p == 0),
         'win_rate': round(sum(1 for p in pcts if p > 0) / len(pcts) * 100, 1) if pcts else 0.0,
-        'accounts': per_account,
     }
 
     group_rows = {
@@ -454,6 +491,7 @@ async def accounts(market: str = Query('US')):
         pnl = r['equity'] - initial
         acc_id = r['name']
         sharpe = compute_sharpe(eq_by_acc.get(acc_id, []))
+        annualized = _annualized_return_pct(initial, r['equity'], r.get('created_at'), r.get('timestamp'))
         result.append({
             'account_id': acc_id,
             'group': r.get('group', ''),
@@ -462,6 +500,8 @@ async def accounts(market: str = Query('US')):
             'equity': round(r['equity'], 2),
             'pnl': round(pnl, 2),
             'pnl_pct': round(pnl / initial * 100, 2),
+            'annualized_return_pct': round(annualized, 2) if annualized is not None else None,
+            'account_age_days': _account_age_days(r.get('created_at'), r.get('retired_at')),
             'factors': r.get('factors', ''),
             'status': r.get('status', 'active'),
             'runtime_status': r.get('runtime_status', 'ready'),

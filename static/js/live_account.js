@@ -217,9 +217,9 @@ function laRenderChart(control) {
   if(_laChart){try{_laChart.remove();}catch{} _laChart=null;}
   el.textContent='';
   _laChart=LightweightCharts.createChart(el,{width:el.clientWidth,height:260,layout:{background:{color:'#111827'},textColor:'#9fb0c7'},grid:{vertLines:{color:'#223049'},horzLines:{color:'#223049'}},rightPriceScale:{borderColor:'#34445e'},timeScale:{borderColor:'#34445e',timeVisible:true}});
-  if(history.length){const series=_laChart.addAreaSeries({lineColor:'#33e3a2',topColor:'rgba(51,227,162,.35)',bottomColor:'rgba(51,227,162,.02)',lineWidth:2,title:laT('实盘$10k子账本','Live $10k sub-ledger')});const byDay={};history.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});series.setData(Object.entries(byDay).map(([time,value])=>({time,value})));}
+  if(history.length){const series=_laChart.addLineSeries({color:'#00f5a0',lineWidth:4,lineStyle:0,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:true,title:laT('真实账户','LIVE')});const byDay={};history.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});series.setData(Object.entries(byDay).map(([time,value])=>({time,value})));}
   const grouped={};(control.paper_series||[]).forEach(x=>(grouped[x.series_id]??=[]).push(x));
-  const colors=['#6aa9ff','#f4b860','#c792ea','#ff6b8a'];Object.entries(grouped).forEach(([id,rows],i)=>{const line=_laChart.addLineSeries({color:colors[i%colors.length],lineWidth:2,lineStyle:2,title:`PAPER · ${rows[0].label}`});const byDay={};rows.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});line.setData(Object.entries(byDay).map(([time,value])=>({time,value})));});
+  const colors=['rgba(106,169,255,.58)','rgba(244,184,96,.58)','rgba(199,146,234,.58)','rgba(255,107,138,.58)'];Object.entries(grouped).forEach(([id,rows],i)=>{const line=_laChart.addLineSeries({color:colors[i%colors.length],lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,title:`PAPER · ${rows[0].label}`});const byDay={};rows.forEach(x=>{byDay[String(x.ts).slice(0,10)]=Number(x.equity)});line.setData(Object.entries(byDay).map(([time,value])=>({time,value})));});
   _laChart.timeScale().fitContent();_laChartResizeObserver=new ResizeObserver(()=>{if(_laChart){_laChart.applyOptions({width:el.clientWidth});_laChart.timeScale().fitContent();}});_laChartResizeObserver.observe(el);
 }
 
@@ -247,16 +247,14 @@ function laApplySnapshot(root,control){
   const app=document.getElementById('app'),st=root.status,p=root.policy,view=laCaptureView(app);
   const set=(id,html)=>{const el=document.getElementById(id);if(el)el.innerHTML=html;};
   set('la-live-hero',laHero(control,st));
-  set('la-livebar-wrap',laLiveBar(st));
-  set('la-shared-warning',laSharedWarning(st));
+
   set('la-control-wrap',laControlPanel(control));
   set('la-performance-wrap',`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section>`);
   set('la-positions-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section>`);
   set('la-fills-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section>`);
-  set('la-setup-wrap',laSetup(st));
   set('la-policy-wrap',laPolicyCard(p,control));
   set('la-events-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section>`);
-  set('la-raw-wrap',`<section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section>`);
+
   if(Object.prototype.hasOwnProperty.call(control,'equity')||Object.prototype.hasOwnProperty.call(control,'paper_series')){
     const signature=laChartDataSignature(control);
     if(signature!==_laChartSignature){_laChartSignature=signature;laRenderChart(control);}
@@ -294,17 +292,14 @@ async function renderLiveAccountPage(token, options={}) {
     const st=root.status,p=root.policy;
     if(options.background&&document.getElementById('la-live-hero')){laApplySnapshot(root,control);return;}
     app.innerHTML=`<div class="la-shell"><div id="la-live-hero">${laHero(control,st)}</div>
-      <div id="la-livebar-wrap">${laLiveBar(st)}</div>
-      <div id="la-shared-warning">${laSharedWarning(st)}</div>
       <div id="la-control-wrap">${laControlPanel(control)}</div>
       <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>
       <div id="la-performance-wrap"><section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section></div>
       <div id="la-positions-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section></div>
       <div id="la-fills-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section></div>
-      <div id="la-setup-wrap">${laSetup(st)}</div>
       <div id="la-policy-wrap">${laPolicyCard(p,control)}</div>
       <div id="la-events-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section></div>
-      <div id="la-raw-wrap"><section class="la-panel"><details><summary>${laT('数据来源和运行状态','Data provenance and runtime state')}</summary><pre class="la-raw">${laEsc(JSON.stringify({source:control.data_scope,state:control.state},null,2))}</pre></details></section></div>
+
     </div>`;
     _laChartSignature=laChartDataSignature(control);laRenderChart(control);laBindControls(control);laBindRefresh();laStartStream();
   } catch(e){if(!options.background)app.innerHTML=`<div class="la-shell"><div class="la-fatal"><h2>${laT('策略账户模块不可用','Strategy account module unavailable')}</h2><p>${laEsc(e.message)}</p></div></div>`;}

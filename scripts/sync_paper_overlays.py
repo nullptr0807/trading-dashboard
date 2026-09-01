@@ -16,6 +16,7 @@ from core.live_strategy_control import LiveStrategyStore
 
 PAPER_DB = Path("/home/gexin/quant-trading/data/trading.db")
 REFERENCE_ACCOUNTS = {
+    "PB16": "Paper PB16 · live B16 control (from 2026-08-27)",
     "A02": "Paper A02 · recent IC reference",
     "A09": "Paper A09 · secondary IC reference",
 }
@@ -71,14 +72,16 @@ def import_parameter_curve(store: LiveStrategyStore, path: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--parameter-curve", type=Path, action="append", default=[])
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     store = LiveStrategyStore()
     count = sync_accounts(store)
     for path in args.parameter_curve:
         count += import_parameter_curve(store, path)
-    store.event("paper_overlay_sync", "paper_sync", "info",
-                "Paper comparison curves updated", {"points": count})
-    print(json.dumps({"ok": True, "points": count, "accounts": sorted(REFERENCE_ACCOUNTS)}))
+    if not args.quiet:
+        store.event("paper_overlay_sync", "paper_sync", "info",
+                    "Paper comparison curves updated", {"points": count})
+        print(json.dumps({"ok": True, "points": count, "accounts": sorted(REFERENCE_ACCOUNTS)}))
     return 0
 
 

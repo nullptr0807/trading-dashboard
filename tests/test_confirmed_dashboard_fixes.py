@@ -199,7 +199,30 @@ def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     assert 'grid-template-columns: minmax(0, 1fr) auto auto' in css
     assert 'overflow-x: auto' in css
     assert 'max-width: 100%' in css
-    assert 'style.css?v=50' in html
+    assert 'style.css?v=51' in html
+
+
+def test_account_surfaces_display_ids_without_account_names():
+    visible_surfaces = [
+        'static/js/components.js', 'static/js/trade.js', 'static/js/backtest.js',
+        'static/js/symbols.js', 'static/js/factor_lab.js',
+    ]
+    for relative in visible_surfaces:
+        text = (ROOT / relative).read_text()
+        assert 'tStrategy(' not in text, relative
+    assert '${esc(x.label || x.account_id)}' not in (ROOT / 'static/js/factor_lab.js').read_text()
+
+
+def test_overview_equity_chart_has_continuous_mouse_time_zoom():
+    js = (ROOT / 'static/js/trade.js').read_text()
+    html = (ROOT / 'static/index.html').read_text()
+    assert 'function installEquityTimeZoom(chart, container)' in js
+    assert "container.addEventListener('wheel'" in js
+    assert 'scale.setVisibleLogicalRange' in js
+    assert 'event.preventDefault()' in js
+    assert "container.addEventListener('dblclick'" in js
+    assert "handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true }" in js
+    assert 'trade.js?v=24' in html
 
 
 def test_live_account_uses_sse_incremental_updates_and_cache_bust():
@@ -215,7 +238,28 @@ def test_live_account_uses_sse_incremental_updates_and_cache_bust():
     assert "if(document.hidden)laStopStream()" in js
     assert "window.addEventListener('hashchange'" in js
     assert 'laCaptureView(app)' in js and 'laRestoreView(app,view)' in js
-    assert 'live_account.js?v=15' in html
+    assert 'live_account.js?v=17' in html
+
+
+def test_return_histogram_and_opend_connection_panel_are_removed():
+    trade_js = (ROOT / 'static/js/trade.js').read_text()
+    live_js = (ROOT / 'static/js/live_account.js').read_text()
+    assert 'id="pnl-histogram"' not in trade_js
+    assert 'renderPnlHistogram(d)' not in trade_js
+    assert 'id="la-setup-wrap"' not in live_js
+    assert "set('la-setup-wrap'" not in live_js
+
+
+def test_live_page_uses_top_status_only_and_highlights_real_equity():
+    live_js = (ROOT / 'static/js/live_account.js').read_text()
+    assert 'id="la-livebar-wrap"' not in live_js
+    assert 'id="la-shared-warning"' not in live_js
+    assert 'id="la-raw-wrap"' not in live_js
+    assert "set('la-livebar-wrap'" not in live_js
+    assert "set('la-shared-warning'" not in live_js
+    assert "set('la-raw-wrap'" not in live_js
+    assert "addLineSeries({color:'#00f5a0',lineWidth:4,lineStyle:0" in live_js
+    assert "lineStyle:2,priceLineVisible:false,lastValueVisible:false,title:`PAPER" in live_js
 
 
 def test_strategy_text_is_html_escaped_in_card(tmp_path):
@@ -226,7 +270,7 @@ def test_strategy_text_is_html_escaped_in_card(tmp_path):
         "let html='';global.document={createElement:()=>({dataset:{},style:{},set className(v){},set innerHTML(v){html=v},get innerHTML(){return html},querySelector:()=>({addEventListener:()=>{}})})};"
         f"vm.runInThisContext(fs.readFileSync({json.dumps(str(ROOT / 'static/js/components.js'))},'utf8'));"
         "createCard({account_id:'A1',strategy_name:'<img src=x onerror=alert(1)>',equity:1,pnl:0,pnl_pct:0});"
-        "if(html.includes('<img'))process.exit(1);if(!html.includes('&lt;img'))process.exit(2);"
+        "if(html.includes('<img')||html.includes('&lt;img')||html.includes('strategy_name'))process.exit(1);"
     )
     import subprocess
     result = subprocess.run(['node', str(script)], capture_output=True, text=True)

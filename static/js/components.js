@@ -15,7 +15,11 @@ function createCard(account) {
   const pnlAbs = account.pnl || 0;
   const tradeCount = account.trade_count ?? 0;
   const sharpe = account.sharpe_ratio ?? 0;
+  const annualized = Number.isFinite(account.annualized_return_pct) ? account.annualized_return_pct : null;
+  const ageDays = Number.isInteger(account.account_age_days) ? account.account_age_days : null;
   const sharpeClass = sharpe >= 0 ? 'positive' : 'negative';
+  const annualizedClass = annualized == null ? '' : (annualized >= 0 ? 'positive' : 'negative');
+  const annualizedSign = annualized != null && annualized >= 0 ? '+' : '';
   const pnlClass = pnlPct >= 0 ? 'positive' : 'negative';
   const pnlSign = pnlPct >= 0 ? '+' : '';
   const row = document.createElement('div');
@@ -23,9 +27,7 @@ function createCard(account) {
   if (isRetired) row.style.opacity = '0.55';
   row.dataset.id = id;
   row.dataset.status = account.status || 'active';
-  const rawName = account.strategy_name || account.strategy || '';
-  // Strip verbose Chinese nicknames from B group; show a neutral tag instead
-  const displayName = _esc(isB ? t('gp_evolved_factor') : tStrategy(rawName, id));
+
   const retiredPill = isRetired
     ? `<span class="retired-pill" title="${_esc(account.retire_reason || t('retired_tooltip') || '')}">${_esc(t('retired_badge') || 'RETIRED')}${account.retired_at ? ' · ' + _esc(account.retired_at.slice(0,10)) : ''}</span>`
     : '';
@@ -36,7 +38,7 @@ function createCard(account) {
     <div class="row-main">
       <div class="row-left">
         <span class="account-badge ${badgeClass}">${id}</span>
-        <span class="row-strategy">${displayName}</span>
+
         ${retiredPill}
         ${runtimePill}
       </div>
@@ -52,6 +54,14 @@ function createCard(account) {
         <div class="row-metric">
           <div class="row-metric-label">${t('card_return')}</div>
           <div class="row-metric-value ${pnlClass}">${pnlSign}${formatPercent(pnlPct)}</div>
+        </div>
+        <div class="row-metric">
+          <div class="row-metric-label">${t('card_annualized_return')}</div>
+          <div class="row-metric-value ${annualizedClass}">${annualized == null ? '—' : annualizedSign + formatPercent(annualized)}</div>
+        </div>
+        <div class="row-metric row-metric-age">
+          <div class="row-metric-label">${t('card_age_days')}</div>
+          <div class="row-metric-value">${ageDays == null ? '—' : ageDays + t('days_suffix')}</div>
         </div>
         <div class="row-metric row-metric-sub">
           <div class="row-metric-label">${t('card_trades')}</div>
@@ -184,7 +194,7 @@ function renderGpBlock(container, factors, compositeId, composite, accountId, gp
   container.innerHTML = `
     ${statusHtml}
     <div class="factor-item">
-      <div class="factor-name" style="color:#b388ff;">${accountId} · ${t('gp_evolved_factor')}</div>
+      <div class="factor-name" style="color:#b388ff;">${accountId}</div>
       <pre class="factor-gp">${_esc(gpInfo || t('factor_no_gp_params'))}</pre>
       ${paramsHtml}
     </div>
@@ -950,7 +960,7 @@ async function openAccountDrawer(accountId) {
       <div class="drawer-header">
         <div class="drawer-title">
           <span class="account-badge ${accountId.startsWith('A') ? 'badge-a' : 'badge-b'}">${accountId}</span>
-          <span id="drawer-strategy" style="font-size:15px;color:var(--text-secondary);"></span>
+
         </div>
         <button class="drawer-close" aria-label="close">×</button>
       </div>
@@ -990,7 +1000,7 @@ async function openAccountDrawer(accountId) {
       api(`/trade/account/${accountId}`),
       api(`/factors/${accountId}`)
     ]);
-    overlay.querySelector('#drawer-strategy').textContent = tStrategy(factors.strategy_name || accData.strategy_name || '', accountId);
+
     const accEquity = (accData.equity_curve && accData.equity_curve.length) ? (accData.equity_curve[accData.equity_curve.length-1].equity) : (accData.state?.equity);
     overlay.querySelector('#drawer-positions').innerHTML = createPositionsTable(accData.positions, accEquity);
     overlay.querySelector('#drawer-trades').innerHTML = createTradesTable((accData.trades || []).slice().reverse().slice(0, 50));

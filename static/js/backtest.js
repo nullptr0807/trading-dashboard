@@ -47,7 +47,7 @@ async function renderBacktestPage() {
             <div style="overflow-x:auto;">
               <table class="data-table" id="bt-comparison-table">
                 <thead><tr>
-                  <th>${t('th_account')}</th><th>${t('th_strategy')}</th><th>${t('th_total_return')}</th><th>${t('th_max_dd')}</th>
+                  <th>${t('th_account')}</th><th>${t('th_total_return')}</th><th>${t('th_max_dd')}</th>
                   <th>Sharpe</th><th>Sortino</th><th>${t('th_win_rate')}</th><th>${t('th_profit_factor')}</th><th>${t('th_total_trades')}</th>
                 </tr></thead>
                 <tbody id="bt-comparison-body"></tbody>
@@ -241,7 +241,7 @@ function renderAccountSelector(accounts) {
       const disabledAttr = isQlib ? 'disabled' : '';
       html += `<label class="${cls}">
         <input type="checkbox" value="${aid}" data-group="${group}" class="bt-account-cb" ${disabledAttr}>
-        <span>${_esc(aid)} — ${_esc(tStrategy(a.strategy_name || '', aid))}${retiredBadge}${qlibBadge}</span>
+        <span>${_esc(aid)}${retiredBadge}${qlibBadge}</span>
       </label>`;
     });
     html += `</div></div>`;
@@ -388,7 +388,7 @@ function renderBacktestResults(data) {
     const retCls = (st.total_return || 0) >= 0 ? 'positive' : 'negative';
     return `<tr class="bt-acct-row" data-idx="${i}" style="cursor:pointer;">
       <td>${a.account_id} <span style="color:var(--text-secondary);font-size:10px;">▸</span></td>
-      <td>${_esc(tStrategy(a.strategy_name || '', a.account_id))}</td>
+
       <td class="${retCls}">${formatPercent(st.total_return)}</td>
       <td class="negative">${formatPercent(st.max_drawdown)}</td>
       <td>${(st.sharpe_ratio || 0).toFixed(2)}</td>
@@ -526,11 +526,7 @@ function openAccountDetail(acct) {
     <div class="bt-modal-panel glass-card">
       <div class="bt-modal-header">
         <div>
-          <div style="font-size:16px;font-weight:600;">${acct.account_id}
-            <span style="color:var(--text-secondary);font-weight:400;font-size:12px;margin-left:8px;">
-              ${_esc(tStrategy(acct.strategy_name || '', acct.account_id))}
-            </span>
-          </div>
+          <div style="font-size:16px;font-weight:600;">${acct.account_id}</div>
           <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">
             ${t('bt_initial')} ${(typeof currencySymbol === 'function' ? currencySymbol() : '$')}${initCap.toLocaleString()} · ${t('bt_trades_count', {n: trades.length})} ·
             <span class="${retCls}">${t('bt_total_return')} ${formatPercent(st.total_return)}</span> ·

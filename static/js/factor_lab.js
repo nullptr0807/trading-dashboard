@@ -635,7 +635,7 @@
         <div class="fl-family-title">${esc(t('fl_running_account_composites'))}</div>
         <div class="fl-account-grid">
           ${accountRows.map((x) => { const i = _state.accountComposites.indexOf(x); return `<button class="fl-account-chip ${x.runnable === false ? 'fl-account-chip-view' : ''}" data-account-composite="${i}">
-            <b>${esc(x.label || x.account_id)}</b>
+            <b>${esc(x.account_id)}</b>
             <span>${esc(x.factors || '')}</span>
             <em>${esc(x.runnable === false ? t('fl_view_formula') : t('fl_load_into_lab'))}</em>
           </button>`; }).join('')}
