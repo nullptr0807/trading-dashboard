@@ -89,12 +89,12 @@ function renderQlibStatusBanner(s) {
   const cov = s.coverage || {};
   const models = cov.models || {};
   const nWith = s.models_with_checkpoints || 0;
-  const nTotal = s.models_total || 10;
+  const nTotal = s.models_total ?? Object.keys(models).length;
   const totalMb = ((cov.total_bytes || 0) / 1048576).toFixed(2);
   const earliest = s.earliest_full_replay_date || '—';
 
   // Per-model coverage table (compact)
-  const modelOrder = ['Q01','Q02','Q03','Q04','Q05','Q06','Q07','Q08','Q09','Q10'];
+  const modelOrder = (s.active_manifest || s.model_manifest || Object.keys(models)).map(item => typeof item === 'string' ? item : item.account_id || item.model_id).filter(Boolean);
   const covRowsHtml = modelOrder.map(mid => {
     const m = models[mid];
     if (!m) return `<tr><td>${mid}</td><td colspan="3" class="qst-empty">—</td></tr>`;
@@ -234,7 +234,7 @@ function renderAccountSelector(accounts) {
       const retiredBadge = isRetired
         ? ` <span class="retired-pill" title="${a.retire_reason || ''}">${t('retired_badge') || 'RETIRED'}${a.retired_at ? ' · ' + (a.retired_at.slice(0,10)) : ''}</span>`
         : '';
-      const qlibBadge = isQlib
+      const qlibBadge = isQlib && !isRetired
         ? ` <span class="qlib-block-pill" title="${(t('bt_qlib_block_tooltip') || 'Qlib 模型回测暂未支持，详见上方说明').replace(/"/g,'&quot;')}">${t('bt_qlib_blocked_badge') || 'CHECKPOINT 累积中'}</span>`
         : '';
       const cls = `bt-checkbox${isRetired ? ' bt-account-retired' : ''}${isQlib ? ' bt-account-qlib-blocked' : ''}`;

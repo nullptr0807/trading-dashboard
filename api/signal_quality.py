@@ -153,12 +153,14 @@ def _signal_spec(account_id: str, meta: dict) -> dict:
     return {'supported': False, 'reason': f'账户组 {group or "?"} 暂不支持 IC 计算。', 'group': base_group}
 
 
-def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, window: int) -> dict[str, Any]:
+def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, window: int,
+                                 _shared: dict[str, Any] | None = None) -> dict[str, Any]:
     import sqlite3
 
-    con = sqlite3.connect(str(DB_PATH))
+    con = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
     con.row_factory = sqlite3.Row
     try:
+        con.execute('PRAGMA query_only = ON')
         meta = con.execute(
             'SELECT * FROM account_meta WHERE account_id = ? AND market = ?',
             (account_id, market),
@@ -188,7 +190,7 @@ def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, win
             )
             params = [factor_group]
 
-        fv = pd.read_sql_query(q, con, params=params)
+        fv = _shared.get('factor_values').copy() if _shared and 'factor_values' in _shared else pd.read_sql_query(q, con, params=params)
         if fv.empty:
             return _empty(
                 account_id, market, horizon, window,
@@ -211,6 +213,8 @@ def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, win
         fv = fv[is_cn_ticker if market == 'CN' else ~is_cn_ticker].copy()
         if fv.empty:
             return _empty(account_id, market, horizon, window, f'factor_values 中没有 {market} 市场 ticker。', code='no_market_rows', source=spec)
+        if _shared is not None and 'factor_values' not in _shared:
+            _shared['factor_values'] = fv.copy()
 
         # Composite signal per date × ticker:
         # - each factor: cross-sectional percentile rank per date
@@ -226,16 +230,44 @@ def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, win
         if not tickers:
             return _empty(account_id, market, horizon, window, '无可用 ticker。', code='no_tickers', source=spec)
         placeholders = ','.join(['?'] * len(tickers))
-        prices = pd.read_sql_query(
-            f'SELECT ticker, datetime, close FROM prices '
-            f'WHERE interval = ? AND ticker IN ({placeholders}) ORDER BY ticker, datetime',
-            con,
-            params=['1d', *tickers],
-        )
+        price_bounds = con.execute(
+            f'SELECT MIN(datetime), MAX(datetime) FROM prices '
+            f'WHERE interval = ? AND ticker IN ({placeholders})',
+            ['1d', *tickers],
+        ).fetchone()
+        price_start, price_end = price_bounds if price_bounds else (None, None)
+        if _shared and 'prices' in _shared:
+            prices = _shared['prices'].copy()
+        else:
+            factor_start = str(fv['date'].min())
+            prices = pd.read_sql_query(
+                f'SELECT ticker, datetime, close FROM prices '
+                f'WHERE interval = ? AND ticker IN ({placeholders}) '
+                f'AND datetime >= ? ORDER BY ticker, datetime',
+                con,
+                params=['1d', *tickers, factor_start],
+            )
+            if _shared is not None:
+                _shared['prices'] = prices.copy()
         if prices.empty:
             return _empty(account_id, market, horizon, window, '找不到对应 1d close 价格。', code='no_prices', source=spec)
         prices['date'] = pd.to_datetime(prices['datetime']).dt.strftime('%Y-%m-%d')
         close = prices.pivot_table(index='date', columns='ticker', values='close', aggfunc='last').sort_index()
+        if _shared is not None:
+            _shared['prepared'] = {
+                'fv': fv,
+                'comp': comp,
+                'close': close,
+                'signal': comp.pivot(index='date', columns='ticker', values='signal').reindex(
+                    index=close.index, columns=close.columns,
+                ),
+                'factor_names': factor_names,
+                'spec': spec,
+                'price_start': price_start,
+                'price_end': price_end,
+            }
+            if _shared.get('prepare_only'):
+                return {}
         # Tradable forward return: signal[t] -> close[t+1+h] / close[t+1] - 1.
         future_ret = close.shift(-(horizon + 1)) / close.shift(-1) - 1
         ret_long = future_ret.stack().rename('future_return').reset_index()
@@ -328,8 +360,8 @@ def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, win
             'coverage': {
                 'factor_start': str(fv['date'].min()),
                 'factor_end': str(fv['date'].max()),
-                'price_start': str(close.index.min()) if len(close.index) else None,
-                'price_end': str(close.index.max()) if len(close.index) else None,
+                'price_start': str(price_start) if price_start else None,
+                'price_end': str(price_end) if price_end else None,
                 'ic_start': str(ic_df['date'].min()),
                 'ic_end': str(ic_df['date'].max()),
             },
@@ -337,6 +369,120 @@ def _compute_signal_quality_sync(account_id: str, market: str, horizon: int, win
         }
     finally:
         con.close()
+
+
+def _score_prepared_signal_quality(account_id: str, market: str, horizon: int,
+                                   window: int, prepared: dict[str, Any]) -> dict[str, Any]:
+    """Score one horizon from a shared composite signal and close matrix."""
+    fv = prepared['fv']
+    comp = prepared['comp']
+    close = prepared['close']
+    factor_names = prepared['factor_names']
+    spec = prepared['spec']
+    price_start = prepared.get('price_start')
+    price_end = prepared.get('price_end')
+
+    # Wide, vectorized row ranks/correlations preserve the legacy per-date
+    # Spearman definition while avoiding stack/merge/groupby for every horizon.
+    signal = prepared['signal']
+    future_ret = close.shift(-(horizon + 1)) / close.shift(-1) - 1
+    valid = signal.notna() & future_ret.notna()
+    counts = valid.sum(axis=1).astype(int)
+    signal_rank = signal.where(valid).rank(axis=1, pct=True)
+    return_rank = future_ret.where(valid).rank(axis=1, pct=True)
+    correlations = signal_rank.corrwith(return_rank, axis=1)
+    eligible = (counts >= 30) & correlations.notna() & np.isfinite(correlations)
+    ic_df = pd.DataFrame({
+        'date': correlations.index[eligible].astype(str),
+        'ic': correlations[eligible].astype(float).to_numpy(),
+        'n': counts[eligible].astype(int).to_numpy(),
+    }).sort_values('date')
+    if ic_df.empty:
+        return _empty(account_id, market, horizon, window,
+                      '有效横截面样本少于 30，无法计算 IC。',
+                      code='insufficient_data', source=spec)
+
+    min_periods = max(5, min(window, 10))
+    ic_df['rolling_ic'] = ic_df['ic'].rolling(window, min_periods=min_periods).mean()
+    roll_std = ic_df['ic'].rolling(window, min_periods=min_periods).std()
+    ic_df['rolling_icir'] = ic_df['rolling_ic'] / roll_std.replace(0, np.nan)
+    mean_ic = float(ic_df['ic'].mean())
+    std_ic = float(ic_df['ic'].std()) if len(ic_df) > 1 else float('nan')
+    icir = mean_ic / std_ic if std_ic and math.isfinite(std_ic) and std_ic != 0 else float('nan')
+    ann_icir = icir * math.sqrt(252) if math.isfinite(icir) else float('nan')
+    latest = ic_df.iloc[-1]
+    latest_rolling = ic_df['rolling_icir'].dropna()
+    latest_roll_ic = ic_df['rolling_ic'].dropna()
+
+    warnings: list[str] = []
+    if len(ic_df) < 50:
+        warnings.append(f'有效 IC 样本仅 {len(ic_df)} 天，统计显著性有限。')
+    if horizon >= 20 and len(ic_df) < 40:
+        warnings.append('长 horizon 会吞掉更多尾部样本；当前窗口更适合看方向，不适合下定论。')
+    if int(spec.get('direction') or 1) < 0:
+        warnings.append('该账户为均值回归/反转策略，IC 已按真实交易方向取反。')
+
+    series = [{
+        'date': r['date'], 'ic': _round(r['ic'], 5),
+        'rolling_ic': _round(r.get('rolling_ic'), 5),
+        'rolling_icir': _round(r.get('rolling_icir'), 4), 'n': int(r['n']),
+    } for r in ic_df.replace({np.nan: None}).to_dict(orient='records')]
+    return {
+        'account_id': account_id, 'market': market, 'horizon': horizon,
+        'window': window, 'method': 'rank_ic', 'supported': True, 'status': 'ok',
+        'signal_source': {
+            'group': spec.get('group'), 'base_id': spec.get('base_id'),
+            'strategy_name': spec.get('strategy_name'),
+            'strategy_type': spec.get('strategy_type'),
+            'factor_group': spec.get('factor_group'), 'factors': factor_names,
+            'aggregation': spec.get('aggregation'), 'direction': spec.get('direction', 1),
+        },
+        'summary': {
+            'mean_ic': _round(mean_ic, 5), 'std_ic': _round(std_ic, 5),
+            'icir': _round(icir, 4), 'annualized_icir': _round(ann_icir, 4),
+            'win_rate': _round(float((ic_df['ic'] > 0).mean()), 4),
+            'latest_ic': _round(float(latest['ic']), 5),
+            'latest_rolling_ic': _round(float(latest_roll_ic.iloc[-1]), 5) if len(latest_roll_ic) else None,
+            'latest_rolling_icir': _round(float(latest_rolling.iloc[-1]), 4) if len(latest_rolling) else None,
+            'n_days': int(len(ic_df)),
+            'avg_universe_size': int(round(float(ic_df['n'].mean()))),
+        },
+        'series': series,
+        'coverage': {
+            'factor_start': str(fv['date'].min()), 'factor_end': str(fv['date'].max()),
+            'price_start': str(price_start) if price_start else None,
+            'price_end': str(price_end) if price_end else None,
+            'ic_start': str(ic_df['date'].min()), 'ic_end': str(ic_df['date'].max()),
+        },
+        'warnings': warnings,
+    }
+
+
+def _compute_signal_quality_many_sync(account_id: str, market: str,
+                                      horizons: list[int], window: int) -> dict[int, dict[str, Any]]:
+    """Build factor composite/close pivot once, then score each horizon."""
+    if not horizons:
+        return {}
+    shared: dict[str, Any] = {'prepare_only': True}
+    first = horizons[0]
+    preparation_result = _compute_signal_quality_sync(
+        account_id, market, first, window, _shared=shared,
+    )
+    prepared = shared.get('prepared')
+    if prepared is not None:
+        return {
+            horizon: _score_prepared_signal_quality(
+                account_id, market, horizon, window, prepared,
+            )
+            for horizon in horizons
+        }
+
+    # Unsupported/empty-data responses never produce a prepared frame; retain
+    # exact single-horizon error semantics for those rare paths.
+    results = {first: preparation_result}
+    for horizon in horizons[1:]:
+        results[horizon] = _compute_signal_quality_sync(account_id, market, horizon, window)
+    return results
 
 
 @router.get('/{account_id}')
@@ -384,9 +530,30 @@ async def signal_quality_decay(
             hs.append(h)
     if not hs:
         raise HTTPException(status_code=400, detail='no valid horizons')
+    selected = hs[:8]
+    now = time.time()
+    results: dict[int, dict[str, Any]] = {}
+    missing = []
+    async with _CACHE_LOCK:
+        for h in selected:
+            cached = _CACHE.get((account_id, market, h, window))
+            if cached and now - cached[0] < _CACHE_TTL:
+                results[h] = cached[1]
+            else:
+                missing.append(h)
+    if missing:
+        computed = await asyncio.to_thread(
+            _compute_signal_quality_many_sync, account_id, market, missing, window,
+        )
+        async with _CACHE_LOCK:
+            stamped = time.time()
+            for h, result in computed.items():
+                _CACHE[(account_id, market, h, window)] = (stamped, result)
+                results[h] = result
+
     rows = []
-    for h in hs[:8]:
-        r = await signal_quality(account_id, horizon=h, window=window, market=market)
+    for h in selected:
+        r = results[h]
         rows.append({
             'horizon': h,
             'supported': r.get('supported'),

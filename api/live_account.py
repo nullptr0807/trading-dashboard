@@ -29,6 +29,25 @@ def get_client() -> MoomooClient:
     return _client
 
 
+def _daily_chart_close(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the chronological end-of-day point for each chart series."""
+    closes: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        ts = str(row.get("ts") or row.get("timestamp") or "")
+        series = str(row.get("series_id") or "")
+        day = ts[:10]
+        if not day:
+            continue
+        key = (series, day)
+        previous = closes.get(key)
+        if previous is None or ts >= str(previous.get("ts") or previous.get("timestamp") or ""):
+            closes[key] = row
+    return sorted(closes.values(), key=lambda row: (
+        str(row.get("series_id") or ""),
+        str(row.get("ts") or row.get("timestamp") or ""),
+    ))
+
+
 def _require_read_token(provided: str) -> None:
     client = get_client()
     expected = client.settings.read_api_token
@@ -148,8 +167,8 @@ async def live_control(x_moomoo_read_token: str = Header(default=""),
             "execution_holds": await asyncio.to_thread(store.list_execution_holds),
             "config": await asyncio.to_thread(store.config),
             "owned_positions": await asyncio.to_thread(store.positions),
-            "equity": await asyncio.to_thread(store.equity_history),
-            "paper_series": await asyncio.to_thread(store.paper_series),
+            "equity": _daily_chart_close(await asyncio.to_thread(store.equity_history)),
+            "paper_series": _daily_chart_close(await asyncio.to_thread(store.paper_series)),
             "events": await asyncio.to_thread(store.recent_events, event_limit),
             "hard_limits": {"initial_capital": 10_000, "exposure_cap": 10_000,
                             "loss_floor": 7_500, "regular_hours_only": True},
@@ -194,8 +213,8 @@ async def _live_strategy_payload(event_limit: int = 100,
         "data_scope": "strategy_subledger_only",
     }
     if include_history:
-        payload["equity"] = await asyncio.to_thread(store.equity_history)
-        payload["paper_series"] = await asyncio.to_thread(store.paper_series)
+        payload["equity"] = _daily_chart_close(await asyncio.to_thread(store.equity_history))
+        payload["paper_series"] = _daily_chart_close(await asyncio.to_thread(store.paper_series))
     return payload
 
 

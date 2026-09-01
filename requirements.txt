@@ -1,5 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 aiosqlite==0.20.0
+orjson==3.12.0
 moomoo-api==10.10.7008
 exchange-calendars==4.13.2

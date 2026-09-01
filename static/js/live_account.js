@@ -65,6 +65,7 @@ function laScheduleRefresh() {
 }
 async function laFetch(path, options) {
   options = options ? {...options} : {};
+  if (!options.signal && typeof getActiveRouteSignal === 'function') options.signal = getActiveRouteSignal();
   options.headers = {...(options.headers || {})};
   const res = await fetch(LA_API_BASE + path, options);
   const body = await res.json().catch(() => ({}));
@@ -94,19 +95,22 @@ function laHealthMeta(status, state, executionStatus) {
   return {tone:'live',label:laT('健康正常','Healthy'),detail:'ALL CHECKS'};
 }
 
+function laPrimaryStatus(status, control) {
+  const state=control.state||{}, execution=control.execution_status||{};
+  const ready=Boolean(status.place_order_ready);
+  const lifecycle=state.lifecycle||'UNKNOWN', executionState=execution.status||'UNKNOWN';
+  const sync=status.sync_proof_current&&status.control_sync_fresh?laT('对账有效','sync current'):laT('等待对账','sync stale');
+  const auto=status.auto_trading_enabled?laT('自动计划已启用（不代表可下单）','automation enabled (not order readiness)'):laT('自动计划关闭','automation off');
+  return {ready,tone:ready?'live':'danger',label:ready?laT('真实下单就绪','REAL ORDER READY'):laT('当前不可真实下单','REAL ORDERS BLOCKED'),detail:`${lifecycle} · ${executionState} · ${sync} · ${auto}`};
+}
+
 function laHero(control, status) {
   const state=control.state||{}, perf=control.performance_summary||{};
   const market=laMarketMeta(control.market_status&&control.market_status.state);
-  const health=laHealthMeta(status,state,control.execution_status);
-  const execution=status.auto_trading_enabled
-    ? {tone:'live',label:laT('自动交易中','Auto trading'),detail:'AUTO'}
-    : status.trading_enabled
-      ? {tone:'pre',label:laT('真实交易就绪','Live ready'),detail:'MANUAL GATE'}
-      : {tone:'closed',label:laT('真实交易关闭','Live trading off'),detail:'SAFE'};
+  const primary=laPrimaryStatus(status,control);
   const ret=Number(perf.total_return_pct||0), pnl=Number(perf.pnl||0), sharpe=perf.sharpe_ratio;
   const pnlText=`${pnl>=0?'+':'-'}$${Math.abs(pnl).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
-  const chips=[market,health,execution,{tone:status.control_sync_fresh?'live':'warn',label:laT('对账','Reconciliation'),detail:status.control_sync_fresh?laT('新鲜','FRESH'):laT('过期','STALE')}];
-  return `<section class="la-hero la-hero-pro"><div class="la-hero-copy"><span class="la-kicker">MOOMOO OPENAPI · STRATEGY COMMAND</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><p>${laT('独立$10,000策略子账本 · Long-only · Broker持仓逻辑隔离','Independent $10,000 sub-ledger · Long-only · Logically isolated broker inventory')}</p><div class="la-status-rack">${chips.map(x=>`<div class="la-status-chip ${x.tone}"><i></i><span><b>${laEsc(x.label)}</b><small>${laEsc(x.detail)}</small></span></div>`).join('')}</div></div><div class="la-command-deck"><div class="la-return-card ${laClass(ret)}"><small>${laT('累计收益','TOTAL RETURN')}</small><strong>${laPct(ret)}</strong><span>${pnlText}</span></div><div class="la-risk-pair"><div><small>SHARPE · ANN.</small><b>${sharpe==null?'—':Number(sharpe).toFixed(2)}</b><span>${Number(perf.sharpe_observations||0)}/20 ${laT('日收益样本','daily returns')}</span></div><div><small>MAX DRAWDOWN</small><b>${Number(perf.max_drawdown_pct||0).toFixed(2)}%</b><span>${laT('策略子账本','sub-ledger')}</span></div></div><div class="la-hero-sync">${laT('最后对账','Last reconciliation')} · ${laEsc(laTime(state.last_sync_at))}</div></div></section>`;
+  return `<section class="la-hero la-hero-pro"><div class="la-hero-copy"><span class="la-kicker">MOOMOO OPENAPI · STRATEGY COMMAND</span><h1>${laT('实盘策略账户','Live Strategy Account')}</h1><div class="la-primary-status ${primary.tone}" role="status"><b>${laEsc(primary.label)}</b><span>${laEsc(primary.detail)}</span></div><p>${laT('唯一可下单状态直接来自 place_order_ready；自动计划启用不等于可下单。','The single order-readiness truth comes from place_order_ready; automation enabled never means orders are ready.')}</p><div class="la-status-rack secondary"><div class="la-status-chip ${market.tone}"><i></i><span><b>${laEsc(market.label)}</b><small>${laEsc(market.detail)}</small></span></div></div></div><div class="la-command-deck"><div class="la-return-card ${laClass(ret)}"><small>${laT('累计收益','TOTAL RETURN')}</small><strong>${laPct(ret)}</strong><span>${pnlText}</span></div><div class="la-risk-pair"><div><small>SHARPE · ANN.</small><b>${sharpe==null?'—':Number(sharpe).toFixed(2)}</b><span>${Number(perf.sharpe_observations||0)}/20 ${laT('日收益样本','daily returns')}</span></div><div><small>MAX DRAWDOWN</small><b>${Number(perf.max_drawdown_pct||0).toFixed(2)}%</b><span>${laT('策略子账本','sub-ledger')}</span></div></div><div class="la-hero-sync">${laT('最后对账','Last reconciliation')} · ${laEsc(laTime(state.last_sync_at))}</div></div></section>`;
 }
 
 function laPolicyCard(policy, control) {
@@ -175,14 +179,14 @@ function laSetup(status) {
   </div></section>`;
 }
 
-function laControlPanel(control) {
+function laControlPanel(control, policy, status) {
   const s=control.state||{}, summary=control.execution_summary||{}, frozen=s.lifecycle!=='ACTIVE', execution=control.execution_status||{}, held=execution.status==='HELD';
   const holdText=(execution.active_holds||[]).map(h=>`${h.scope_type}:${h.scope_key} ${h.reason_code}`).join(' · ');
   const ret=(Number(s.strategy_equity||10000)/10000-1)*100;
-  return `<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">$10K STRATEGY SUB-LEDGER</span><h2>${laT('独立策略资金与交易总开关','Independent capital & master switch')}</h2></div><span class="la-risk-badge ${(frozen||held)?'':'ok'}">${laEsc(s.lifecycle||'UNKNOWN')} · ${laEsc(execution.status||'HELD')}</span></div>
-  <div class="la-metrics"><div class="la-metric hero"><small>${laT('策略权益','Strategy equity')}</small><b>${laMoney(s.strategy_equity)}</b><span class="${laClass(ret)}">${laPct(ret)}</span></div><div class="la-metric"><small>${laT('策略现金','Strategy cash')}</small><b>${laMoney(s.allocated_cash)}</b></div><div class="la-metric"><small>${laT('策略持仓市值','Strategy market value')}</small><b>${laMoney(s.owned_market_value)}</b></div><div class="la-metric"><small>${laT('总成交笔数','Total fills')}</small><b>${Number(summary.total_trades||0).toLocaleString()}</b><span>BUY ${Number(summary.buy_trades||0)} · SELL ${Number(summary.sell_trades||0)}</span></div><div class="la-metric"><small>${laT('累计交易费用','Total trading fees')}</small><b>${laMoney(summary.total_fees)}</b></div><div class="la-metric"><small>${laT('累计成交金额','Total traded notional')}</small><b>${laMoney(summary.total_notional)}</b></div><div class="la-metric"><small>${laT('不可变仓位上限','Immutable exposure cap')}</small><b>$10,000.00</b></div><div class="la-metric"><small>${laT('不可变停机线','Immutable loss floor')}</small><b>$7,500.00</b></div><div class="la-metric"><small>${laT('最后对账','Last reconciliation')}</small><b>${laEsc(laTime(s.last_sync_at))}</b></div></div>
-  <div class="la-order-warning">${frozen?laT(`人工总开关已冻结：${s.freeze_reason||'未启用'}`,`Manual master switch frozen: ${s.freeze_reason||'not armed'}`):held?laT(`生命周期 ACTIVE；执行状态 HELD：${holdText||'未决订单'}`,`Lifecycle ACTIVE; execution HELD: ${holdText||'unresolved intent'}`):laT('生命周期 ACTIVE；执行状态 READY；所有订单仍需通过门禁。','Lifecycle ACTIVE; execution READY; every order still passes all gates.')}</div>
-  <div class="la-order-form"><label>${laT('控制令牌（仅页面内存）','Control token — page memory only')}<input id="la-control-token" type="password" autocomplete="off"></label><label>${laT('操作原因','Action reason')}<input id="la-control-reason" maxlength="500" autocomplete="off"></label><button class="la-btn danger" id="la-freeze">FREEZE</button><button class="la-btn" id="la-unfreeze">UNFREEZE</button><button class="la-link danger" id="la-cleanup">${laT('冻结、归档并清理策略','Freeze, archive & clean')}</button></div></section>`;
+  return `<details class="la-control-center"><summary aria-label="${laT('展开实盘控制中心','Expand live control center')}"><span>${laT('实盘控制中心','Live control center')}</span><small>FREEZE · UNFREEZE · CLEANUP · CONFIG</small></summary><section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">$10K STRATEGY SUB-LEDGER</span><h2>${laT('独立策略资金与危险操作','Independent capital & dangerous operations')}</h2></div><span class="la-risk-badge ${(frozen||held)?'':'ok'}">${laEsc(s.lifecycle||'UNKNOWN')} · ${laEsc(execution.status||'HELD')}</span></div>
+  <div class="la-metrics"><div class="la-metric hero"><small>${laT('策略权益','Strategy equity')}</small><b>${laMoney(s.strategy_equity)}</b><span class="${laClass(ret)}">${laPct(ret)}</span></div><div class="la-metric"><small>${laT('策略现金','Strategy cash')}</small><b>${laMoney(s.allocated_cash)}</b></div><div class="la-metric"><small>${laT('策略持仓市值','Strategy market value')}</small><b>${laMoney(s.owned_market_value)}</b></div><div class="la-metric"><small>${laT('总成交笔数','Total fills')}</small><b>${Number(summary.total_trades||0).toLocaleString()}</b></div><div class="la-metric"><small>${laT('最后对账','Last reconciliation')}</small><b>${laEsc(laTime(s.last_sync_at))}</b></div></div>
+  <div class="la-order-warning">${frozen?laT(`人工总开关已冻结：${s.freeze_reason||'未启用'}`,`Manual master switch frozen: ${s.freeze_reason||'not armed'}`):held?laT(`生命周期 ACTIVE；执行状态 HELD：${holdText||'未决订单'}`,`Lifecycle ACTIVE; execution HELD: ${holdText||'unresolved intent'}`):laT('生命周期 ACTIVE；执行状态 READY；订单仍需通过全部门禁。','Lifecycle ACTIVE; execution READY; orders still pass every gate.')}</div>
+  <div class="la-order-form"><label>${laT('控制令牌（仅页面内存）','Control token — page memory only')}<input id="la-control-token" type="password" autocomplete="off"></label><label>${laT('操作原因','Action reason')}<input id="la-control-reason" maxlength="500" autocomplete="off"></label><button type="button" class="la-btn danger" id="la-freeze">FREEZE</button><button type="button" class="la-btn unfreeze" id="la-unfreeze">UNFREEZE</button><button type="button" class="la-link danger" id="la-cleanup">${laT('冻结、归档并清理策略','Freeze, archive & clean')}</button></div>${laPolicyCard(policy,control)}</section></details>`;
 }
 
 function laOwnedPositions(control) {
@@ -248,11 +252,11 @@ function laApplySnapshot(root,control){
   const set=(id,html)=>{const el=document.getElementById(id);if(el)el.innerHTML=html;};
   set('la-live-hero',laHero(control,st));
 
-  set('la-control-wrap',laControlPanel(control));
+  set('la-control-wrap',laControlPanel(control,p,st));
   set('la-performance-wrap',`<section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section>`);
   set('la-positions-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section>`);
   set('la-fills-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section>`);
-  set('la-policy-wrap',laPolicyCard(p,control));
+
   set('la-events-wrap',`<section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section>`);
 
   if(Object.prototype.hasOwnProperty.call(control,'equity')||Object.prototype.hasOwnProperty.call(control,'paper_series')){
@@ -281,6 +285,7 @@ function laStartStream(){
 }
 
 async function renderLiveAccountPage(token, options={}) {
+  if(!options.background)registerRouteCleanup(()=>{laStopStream();if(_laChartResizeObserver){_laChartResizeObserver.disconnect();_laChartResizeObserver=null;}if(_laChart){try{_laChart.remove();}catch{} _laChart=null;}document.querySelectorAll('.la-danger-dialog').forEach(dialog=>dialog.close());});
   if(_laRefreshTimer){clearTimeout(_laRefreshTimer);_laRefreshTimer=null;}
   if(_laRequestInFlight)return;
   _laRequestInFlight=true;
@@ -292,12 +297,12 @@ async function renderLiveAccountPage(token, options={}) {
     const st=root.status,p=root.policy;
     if(options.background&&document.getElementById('la-live-hero')){laApplySnapshot(root,control);return;}
     app.innerHTML=`<div class="la-shell"><div id="la-live-hero">${laHero(control,st)}</div>
-      <div id="la-control-wrap">${laControlPanel(control)}</div>
+      <div id="la-control-wrap">${laControlPanel(control,p,st)}</div>
       <section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">LIVE VS PAPER</span><h2>${laT('策略权益与Paper候选','Strategy equity & paper candidates')}</h2></div><span class="la-source">${laT('实线=实盘子账本 · 虚线=Paper','Solid=live sub-ledger · dashed=paper')}</span></div><div id="la-nav-chart" class="la-chart">${laT('等待权益快照','Awaiting equity snapshots')}</div></section>
       <div id="la-performance-wrap"><section class="la-panel"><div class="la-section-head"><div><span class="la-kicker">SYMBOL PERFORMANCE</span><h2>${laT('交易标的收益排行','Traded symbol performance')}</h2></div><span class="la-source">${Number(control.symbol_performance&&control.symbol_performance.length||0)} ${laT('个标的 · 策略子账本','symbols · strategy sub-ledger')}</span></div>${laSymbolPerformance(control)}</section></div>
       <div id="la-positions-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略持仓','Strategy positions')}</h2><span class="la-source">STRATEGY OWNED ONLY</span></div>${laOwnedPositions(control)}</section></div>
       <div id="la-fills-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('策略成交历史','Strategy fill history')}</h2><span class="la-source">${Number(control.execution_summary&&control.execution_summary.total_trades||0)} ${laT('笔','fills')}</span></div>${laStrategyFills(control)}</section></div>
-      <div id="la-policy-wrap">${laPolicyCard(p,control)}</div>
+
       <div id="la-events-wrap"><section class="la-panel"><div class="la-section-head"><h2>${laT('系统事件时间线','System event timeline')}</h2><span class="la-source">factor · signal · order · freeze · cleanup</span></div>${laEvents(control)}</section></div>
 
     </div>`;
@@ -310,11 +315,41 @@ async function renderLiveAccountPage(token, options={}) {
 
 function laControlAuth(){const input=document.getElementById('la-control-token');if(input&&input.value)_laControlToken=input.value;return _laControlToken;}
 async function laControlCall(path,method,body){const token=laControlAuth();if(!token)throw new Error(laT('请输入控制令牌','Enter the control token'));return laFetch(path,{method,headers:{'Content-Type':'application/json','X-Moomoo-Control-Token':token},body:JSON.stringify(body)});}
+function laConfirmDanger(action, confirmation, control) {
+  const state=control.state||{}, execution=control.execution_status||{};
+  const positions=control.owned_positions||[];
+  const activeHolds=execution.active_holds||[];
+  const pending=execution.pending||control.pending||[];
+  const dialog=document.createElement('dialog');
+  dialog.className='la-danger-dialog';
+  dialog.setAttribute('aria-labelledby','la-danger-title');
+  dialog.innerHTML=`<form method="dialog" class="la-panel">
+    <h2 id="la-danger-title">${laEsc(action)}</h2>
+    <p>${laT('请核对当前真实状态。关闭此窗口不会执行任何操作。','Review the current live state. Closing this dialog performs no action.')}</p>
+    <dl class="la-confirm-state">
+      <div><dt>${laT('当前状态','Current state')}</dt><dd>${laEsc(state.lifecycle||'UNKNOWN')}</dd></div>
+      <div><dt>${laT('策略持仓','Positions')}</dt><dd>${positions.length} · ${laEsc(positions.map(p=>`${p.symbol}:${laNum(p,'quantity')}`).join(', ')||'FLAT')}</dd></div>
+      <div><dt>Execution holds</dt><dd>${activeHolds.length} · ${laEsc(activeHolds.map(h=>h.reason_code||h.scope_key||'HOLD').join(', ')||'NONE')}</dd></div>
+      <div><dt>Pending</dt><dd>${Array.isArray(pending)?pending.length:Number(pending)||0}</dd></div>
+      <div><dt>Last sync</dt><dd>${laEsc(laTime(state.last_sync_at))}</dd></div>
+    </dl>
+    <label>${laT(`输入 ${confirmation} 以确认`,`Type ${confirmation} to confirm`)}<input id="la-danger-confirmation" autocomplete="off"></label>
+    <div class="la-order-form"><button value="cancel" class="la-link">${laT('取消','Cancel')}</button><button value="confirm" class="la-btn danger" disabled>${laT('确认执行','Confirm action')}</button></div>
+  </form>`;
+  document.body.appendChild(dialog);
+  const input=dialog.querySelector('#la-danger-confirmation'), confirmButton=dialog.querySelector('[value="confirm"]');
+  input.addEventListener('input',()=>{confirmButton.disabled=input.value!==confirmation;});
+  return new Promise(resolve=>{
+    dialog.addEventListener('close',()=>{const accepted=dialog.returnValue==='confirm'&&input.value===confirmation;dialog.remove();resolve(accepted);},{once:true});
+    dialog.addEventListener('cancel',()=>{dialog.returnValue='cancel';});
+    dialog.showModal();input.focus();
+  });
+}
 function laBindControls(control){
-  const freeze=document.getElementById('la-freeze');if(freeze)freeze.addEventListener('click',async()=>{try{const reason=document.getElementById('la-control-reason').value||'dashboard_one_click_freeze';await laControlCall('/control/freeze','POST',{confirmation:'FREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
-  const unfreeze=document.getElementById('la-unfreeze');if(unfreeze)unfreeze.addEventListener('click',async()=>{if(prompt(laT('输入 UNFREEZE LIVE TRADING 确认','Type UNFREEZE LIVE TRADING to confirm'))!=='UNFREEZE LIVE TRADING')return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/unfreeze','POST',{confirmation:'UNFREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
-  const cleanup=document.getElementById('la-cleanup');if(cleanup)cleanup.addEventListener('click',async()=>{if(prompt(laT('此操作只允许空仓执行。输入 FREEZE ARCHIVE AND CLEAN STRATEGY','Flat strategy only. Type FREEZE ARCHIVE AND CLEAN STRATEGY'))!=='FREEZE ARCHIVE AND CLEAN STRATEGY')return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/cleanup','POST',{confirmation:'FREEZE ARCHIVE AND CLEAN STRATEGY',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
-  const form=document.getElementById('la-config-form');if(form)form.addEventListener('submit',async ev=>{ev.preventDefault();const patch={};form.querySelectorAll('[data-la-param]').forEach(el=>{patch[el.dataset.laParam]=Number(el.value);});try{await laControlCall('/control/config','PUT',{expected_version:control.config.version,patch,reason:document.getElementById('la-config-reason').value});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const freeze=document.getElementById('la-freeze');if(freeze)freeze.addEventListener('click',async()=>{if(!await laConfirmDanger('FREEZE','FREEZE LIVE TRADING',control))return;try{const reason=document.getElementById('la-control-reason').value||'dashboard_confirmed_freeze';await laControlCall('/control/freeze','POST',{confirmation:'FREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const unfreeze=document.getElementById('la-unfreeze');if(unfreeze)unfreeze.addEventListener('click',async()=>{if(!await laConfirmDanger('UNFREEZE','UNFREEZE LIVE TRADING',control))return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/unfreeze','POST',{confirmation:'UNFREEZE LIVE TRADING',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const cleanup=document.getElementById('la-cleanup');if(cleanup)cleanup.addEventListener('click',async()=>{if(!await laConfirmDanger('CLEANUP','FREEZE ARCHIVE AND CLEAN STRATEGY',control))return;try{const reason=document.getElementById('la-control-reason').value||'';await laControlCall('/control/cleanup','POST',{confirmation:'FREEZE ARCHIVE AND CLEAN STRATEGY',reason});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
+  const form=document.getElementById('la-config-form');if(form)form.addEventListener('submit',async ev=>{ev.preventDefault();const patch={};form.querySelectorAll('[data-la-param]').forEach(el=>{patch[el.dataset.laParam]=Number(el.value);});if(!await laConfirmDanger('CONFIG','APPLY CONFIG',control))return;try{await laControlCall('/control/config','PUT',{expected_version:control.config.version,patch,reason:document.getElementById('la-config-reason').value});renderLiveAccountPage(window.__activeRouteToken);}catch(e){alert(e.message);}});
 }
 
 window.renderLiveAccountPage=renderLiveAccountPage;

@@ -1,48 +1,35 @@
 // trade.js — main trading overview page
 
 async function renderTradePage(routeToken) {
-  const app = document.getElementById('app');
   const routeOk = () => typeof isRouteCurrent !== 'function' || isRouteCurrent(routeToken, '/trade');
   if (!routeOk()) return;
-  app.innerHTML = createSkeleton();
+  renderHero({ distribution: {} });
+  _equityAggregateCache = null; _equityFullCache = null; _equityFullPromise = null;
 
-  // Pre-load ticker name map for current market so first paint of trades/holdings
-  // already shows "600522.SH 山西汾酒". Non-blocking — fall through if it fails.
   loadTickerNames(state.market).catch(() => {});
+  const summaryPromise = api('/trade/summary');
+  const equityPromise = api('/trade/equity-curves?view=aggregate');
+  const accountsPromise = api('/trade/accounts');
 
-  try {
-    const summary = await api('/trade/summary');
+  const summaryTask = summaryPromise.then(summary => {
     if (!routeOk()) return;
-    renderHero(summary);
-    loadSystemStatus(routeToken).catch(e => {
-      console.warn('system status', e);
-      const banner = document.getElementById('system-status-banner');
-      if (banner) {
-        banner.className = 'system-status-banner system-status-degraded';
-        banner.textContent = t('system_unavailable');
-      }
-    });
-  } catch (e) {
-    if (!routeOk()) return;
-    renderHeroFallback();
-  }
+    updateHeroSummary(summary);
+    return loadSystemStatus(routeToken);
+  }).catch(e => {
+    if (e.name !== 'AbortError') console.warn('Failed to load trade summary', e);
+    const banner = document.getElementById('system-status-banner');
+    if (banner) { banner.className = 'system-status-banner system-status-degraded'; banner.textContent = t('system_unavailable'); }
+  });
+  const equityTask = equityPromise.then(eqData => {
+    if (routeOk()) { _equityAggregateCache = eqData; renderEquityCurves(eqData); }
+  }).catch(e => {
+    if (e.name !== 'AbortError' && routeOk()) document.querySelector('.chart-section')?.remove();
+  });
+  const accountsTask = accountsPromise.then(accounts => {
+    if (routeOk()) renderAccountCards(accounts);
+  }).catch(e => { if (e.name !== 'AbortError') console.warn('Failed to load accounts', e); });
 
-  try {
-    const eqData = await api('/trade/equity-curves');
-    if (!routeOk()) return;
-    renderEquityCurves(eqData);
-  } catch (e) {
-    if (!routeOk()) return;
-    document.querySelector('.chart-section')?.remove();
-  }
-
-  try {
-    const accounts = await api('/trade/accounts');
-    if (!routeOk()) return;
-    renderAccountCards(accounts);
-  } catch (e) {
-    console.warn('Failed to load accounts', e);
-  }
+  await Promise.allSettled([summaryTask, equityTask, accountsTask]);
 }
 
 async function loadSystemStatus(routeToken) {
@@ -83,6 +70,18 @@ function _escStatus(value) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function updateHeroSummary(s) {
+  const hero = document.querySelector('.hero');
+  if (!hero) return;
+  const d=s.distribution||{}, medCls=(d.median_pct||0)>=0?'positive':'negative', medSign=(d.median_pct||0)>=0?'+':'';
+  const bestCls=d.best&&d.best.pnl_pct>=0?'positive':'negative', worstCls=d.worst&&d.worst.pnl_pct>=0?'positive':'negative';
+  hero.innerHTML=`<div class="hero-label">${t('dist_title')}</div><div class="hero-value ${medCls}" id="hero-median">${medSign}${(d.median_pct||0).toFixed(2)}%</div>
+    <div class="hero-pnl" style="font-size:1rem;opacity:0.85;">${t('dist_median')} across ${d.count||0} accounts${d.retired_count?` <span style="opacity:0.6;">(+${d.retired_count} ${t('retired_label')||'retired'})</span>`:''} &nbsp;·&nbsp; ${t('dist_win_rate')}: ${d.win_rate||0}% (${d.win_count||0}/${d.count||0})</div>
+    <div class="stats-row"><div class="glass-card stat-box"><div class="stat-label">${t('dist_best')}</div><div class="stat-value ${bestCls}">${d.best?(d.best.pnl_pct>=0?'+':'')+formatPercent(d.best.pnl_pct):'—'}</div><div class="stat-label" style="font-size:0.7rem;opacity:0.7;">${d.best?d.best.account_id:''}</div></div>
+    <div class="glass-card stat-box"><div class="stat-label">${t('dist_worst')}</div><div class="stat-value ${worstCls}">${d.worst?(d.worst.pnl_pct>=0?'+':'')+formatPercent(d.worst.pnl_pct):'—'}</div><div class="stat-label" style="font-size:0.7rem;opacity:0.7;">${d.worst?d.worst.account_id:''}</div></div>
+    <div class="glass-card stat-box"><div class="stat-label">${t('dist_iqr')} (Q1–Q3)</div><div class="stat-value" style="font-size:1.1rem;">${formatPercent(d.q1_pct||0)} ~ ${formatPercent(d.q3_pct||0)}</div></div></div>`;
+}
+
 function renderHero(s) {
   const app = document.getElementById('app');
   const d = s.distribution || {};
@@ -91,7 +90,6 @@ function renderHero(s) {
   const bestCls = d.best && d.best.pnl_pct >= 0 ? 'positive' : 'negative';
   const worstCls = d.worst && d.worst.pnl_pct >= 0 ? 'positive' : 'negative';
   const heroHtml = `
-    ${typeof eventsSectionHtml === 'function' ? eventsSectionHtml() : ''}
     <div id="system-status-banner" class="system-status-banner system-status-loading">${t('system_loading')}</div>
     <div class="hero fade-in">
       <div class="hero-label">${t('dist_title')}</div>
@@ -143,7 +141,7 @@ function renderHero(s) {
       <div class="section-title-row">
         <div class="section-title">${t('accounts_overview')}</div>
         <div class="sort-controls" id="sort-controls">
-          <label class="sort-label">${t('sort_by')}</label>
+          <label class="sort-label" for="sort-select">${t('sort_by')}</label>
           <select id="sort-select" class="sort-select">
             <option value="pnl_pct_desc">${t('sort_pnl_desc')}</option>
             <option value="pnl_pct_asc">${t('sort_pnl_asc')}</option>
@@ -157,194 +155,15 @@ function renderHero(s) {
         </div>
       </div>
       <div class="account-tabs" id="account-tabs" role="tablist">
-        <button class="account-tab active" data-tab="active" role="tab">${t('tab_active') || 'Active'} <span class="tab-count" id="tab-count-active">0</span></button>
-        <button class="account-tab" data-tab="retired" role="tab">${t('tab_retired') || 'Retired'} <span class="tab-count" id="tab-count-retired">0</span></button>
+        <button class="account-tab active" data-tab="active" role="tab" aria-selected="true">${t('tab_active') || 'Active'} <span class="tab-count" id="tab-count-active">0</span></button>
+        <button class="account-tab" data-tab="retired" role="tab" aria-selected="false">${t('tab_retired') || 'Retired'} <span class="tab-count" id="tab-count-retired">0</span></button>
       </div>
       <div class="accounts-grid" id="accounts-grid"></div>
       <div class="tombstone-wall" id="tombstone-wall" style="display:none;"></div>
     </div>
+    ${typeof eventsSectionHtml === 'function' ? eventsSectionHtml() : ''}
   `;
   app.innerHTML = heroHtml;
-  if (typeof startEventsStream === 'function') startEventsStream();
-}
-
-// Per-account PnL% histogram — independent $10k accounts → sum is meaningless,
-// distribution across the 20 accounts is what tells us strategy dispersion.
-function renderPnlHistogram(dist) {
-  const host = document.getElementById('pnl-histogram');
-  if (!host || !dist || !dist.accounts || !dist.accounts.length) {
-    if (host) host.innerHTML = `<div style="opacity:0.6;">No data</div>`;
-    return;
-  }
-  // Retired accounts are frozen; their stale PnL shouldn't skew the live
-  // distribution. API already excludes them from median/IQR/best/worst —
-  // exclude here too so bin counts match the headline numbers.
-  const accounts = dist.accounts.filter(a => (a.status || 'active') !== 'retired');
-  if (!accounts.length) {
-    host.innerHTML = `<div style="opacity:0.6;">No active accounts</div>`;
-    return;
-  }
-  const pcts = accounts.map(a => a.pnl_pct);
-  const minV = Math.min(...pcts, 0);
-  const maxV = Math.max(...pcts, 0);
-  const pad = Math.max(0.5, (maxV - minV) * 0.08);
-  const lo = minV - pad, hi = maxV + pad;
-  const N_BINS = 12;
-  const binW = (hi - lo) / N_BINS;
-  const bins = new Array(N_BINS).fill(null).map(() => ({ a: [], b: [], q: [], bench: [] }));
-  accounts.forEach(acc => {
-    let idx = Math.floor((acc.pnl_pct - lo) / binW);
-    if (idx < 0) idx = 0;
-    if (idx >= N_BINS) idx = N_BINS - 1;
-    const aid = acc.account_id || '';
-    if (aid.startsWith('IDX')) bins[idx].bench.push(acc);
-    // CN prefix 'C' on Q-accounts (CQ01) must match Q before A.
-    else if (/^C?Q\d/.test(aid)) bins[idx].q.push(acc);
-    else if (/^C?A\d/.test(aid)) bins[idx].a.push(acc);
-    else bins[idx].b.push(acc);
-  });
-  const maxCount = Math.max(1, ...bins.map(b => b.a.length + b.b.length + b.q.length + b.bench.length));
-
-  const W = host.clientWidth || 800;
-  const H = 220;
-  const ML = 44, MR = 16, MT = 16, MB = 36;
-  const plotW = W - ML - MR, plotH = H - MT - MB;
-  const xOf = v => ML + ((v - lo) / (hi - lo)) * plotW;
-  const yOf = c => MT + plotH - (c / maxCount) * plotH;
-
-  // x-axis ticks
-  const ticks = [];
-  for (let i = 0; i <= 6; i++) {
-    const v = lo + (hi - lo) * (i / 6);
-    ticks.push(v);
-  }
-  // Zero line
-  const zeroX = (lo <= 0 && hi >= 0) ? xOf(0) : null;
-
-  const colA = '#4da6ff', colB = '#b388ff', colQ = '#34d399', colBench = '#ffb74d';
-  let svg = `<svg width="${W}" height="${H}" style="display:block;">`;
-  // y-grid
-  for (let i = 0; i <= 4; i++) {
-    const y = MT + plotH * (i / 4);
-    const label = Math.round(maxCount * (1 - i / 4));
-    svg += `<line x1="${ML}" y1="${y}" x2="${W - MR}" y2="${y}" stroke="rgba(0,0,0,0.06)"/>`;
-    svg += `<text x="${ML - 6}" y="${y + 3}" fill="rgba(0,0,0,0.55)" font-size="10" text-anchor="end">${label}</text>`;
-  }
-  if (zeroX !== null) {
-    svg += `<line x1="${zeroX}" y1="${MT}" x2="${zeroX}" y2="${MT + plotH}" stroke="rgba(0,0,0,0.30)" stroke-dasharray="3,3"/>`;
-  }
-  // bars — stacked A, B, bench. Attach bin-index so mouse handler can look up accounts.
-  const gap = Math.max(1, (plotW / N_BINS) * 0.15);
-  bins.forEach((b, i) => {
-    const x0 = xOf(lo + i * binW) + gap / 2;
-    const bw = Math.max(1, (plotW / N_BINS) - gap);
-    const binLo = lo + i * binW;
-    const binHi = lo + (i + 1) * binW;
-    let stackTop = MT + plotH;
-    [['a', b.a, colA], ['b', b.b, colB], ['q', b.q, colQ], ['bench', b.bench, colBench]].forEach(([k, arr, color]) => {
-      if (!arr.length) return;
-      const h = (arr.length / maxCount) * plotH;
-      stackTop -= h;
-      svg += `<rect class="pnl-bar" x="${x0}" y="${stackTop}" width="${bw}" height="${h}" fill="${color}" opacity="0.85" data-bin="${i}" data-range="${binLo.toFixed(2)},${binHi.toFixed(2)}" style="cursor:pointer;"/>`;
-    });
-    // Transparent hover-capture rect covering full bin column (so gaps between stacks still trigger tooltip)
-    const totalH = ((b.a.length + b.b.length + b.q.length + b.bench.length) / maxCount) * plotH;
-    if (totalH > 0) {
-      svg += `<rect class="pnl-bar-hover" x="${x0}" y="${MT + plotH - totalH}" width="${bw}" height="${totalH}" fill="transparent" data-bin="${i}" data-range="${binLo.toFixed(2)},${binHi.toFixed(2)}" style="cursor:pointer;"/>`;
-    }
-  });
-  // x-axis labels
-  ticks.forEach(v => {
-    const x = xOf(v);
-    svg += `<text x="${x}" y="${H - MB + 18}" fill="rgba(0,0,0,0.55)" font-size="10" text-anchor="middle">${v >= 0 ? '+' : ''}${v.toFixed(1)}%</text>`;
-  });
-  // median / mean markers
-  if (typeof dist.median_pct === 'number') {
-    const mx = xOf(dist.median_pct);
-    svg += `<line x1="${mx}" y1="${MT}" x2="${mx}" y2="${MT + plotH}" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.7"/>`;
-    svg += `<text x="${mx + 4}" y="${MT + 12}" fill="rgba(0,0,0,0.75)" font-size="10" opacity="1">${t('dist_median')} ${dist.median_pct >= 0 ? '+' : ''}${dist.median_pct.toFixed(2)}%</text>`;
-  }
-  svg += `</svg>`;
-  // legend
-  const legend = `
-    <div style="display:flex;gap:16px;margin-top:10px;flex-wrap:wrap;font-size:0.8rem;opacity:0.85;">
-      <span><span style="display:inline-block;width:12px;height:12px;background:${colA};border-radius:2px;vertical-align:middle;"></span> Group A (Alpha158)</span>
-      <span><span style="display:inline-block;width:12px;height:12px;background:${colB};border-radius:2px;vertical-align:middle;"></span> Group B (GP)</span>
-      <span><span style="display:inline-block;width:12px;height:12px;background:${colQ};border-radius:2px;vertical-align:middle;"></span> Group Q (Qlib ML)</span>
-      <span><span style="display:inline-block;width:12px;height:12px;background:${colBench};border-radius:2px;vertical-align:middle;"></span> Benchmarks (IDX)</span>
-    </div>`;
-  host.innerHTML = svg + legend;
-
-  // Floating HTML tooltip for bin hover — lists each account with strategy & pnl%.
-  let tip = host.querySelector('.pnl-hist-tooltip');
-  if (!tip) {
-    tip = document.createElement('div');
-    tip.className = 'pnl-hist-tooltip';
-    tip.style.cssText = `
-      position:fixed; pointer-events:none; z-index:9999;
-      background:rgba(255,255,255,0.92); border:1px solid rgba(0,0,0,0.08); backdrop-filter:blur(20px) saturate(180%); -webkit-backdrop-filter:blur(20px) saturate(180%); color:var(--text-primary); box-shadow:0 12px 32px rgba(31,38,72,0.18);
-      border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.5;
-      color:#eaeaf0; box-shadow:0 8px 24px rgba(0,0,0,0.5);
-      max-width:320px; display:none; backdrop-filter:blur(8px);
-    `;
-    document.body.appendChild(tip);
-  }
-  const binsIndex = bins;
-  const showTip = (ev, el) => {
-    const idx = Number(el.getAttribute('data-bin'));
-    const rng = (el.getAttribute('data-range') || '').split(',');
-    const b = binsIndex[idx];
-    if (!b) return;
-    const all = [...b.a, ...b.b, ...b.q, ...b.bench].sort((a, z) => z.pnl_pct - a.pnl_pct);
-    const rows = all.map(a => {
-      const cls = a.pnl_pct >= 0 ? 'color:#4ade80;' : 'color:#f87171;';
-      const sign = a.pnl_pct >= 0 ? '+' : '';
-      return `<div style="display:flex;justify-content:space-between;gap:12px;">
-        <span><b>${a.account_id}</b></span>
-        <span style="${cls}font-variant-numeric:tabular-nums;">${sign}${a.pnl_pct.toFixed(2)}%</span>
-      </div>`;
-    }).join('');
-    tip.innerHTML = `
-      <div style="opacity:0.7;margin-bottom:6px;font-size:11px;">
-        Bin: ${rng[0]}% ~ ${rng[1]}% &nbsp;·&nbsp; ${all.length} account${all.length>1?'s':''}
-      </div>${rows}`;
-    tip.style.display = 'block';
-    const tw = tip.offsetWidth, th = tip.offsetHeight;
-    let x = ev.clientX + 14, y = ev.clientY + 14;
-    if (x + tw > window.innerWidth - 8) x = ev.clientX - tw - 14;
-    if (y + th > window.innerHeight - 8) y = ev.clientY - th - 14;
-    tip.style.left = x + 'px';
-    tip.style.top = y + 'px';
-  };
-  const hideTip = () => { tip.style.display = 'none'; };
-  host.querySelectorAll('.pnl-bar, .pnl-bar-hover').forEach(el => {
-    el.addEventListener('mousemove', ev => showTip(ev, el));
-    el.addEventListener('mouseleave', hideTip);
-  });
-}
-
-function renderHeroFallback() {
-  const app = document.getElementById('app');
-  app.innerHTML = `
-    ${typeof eventsSectionHtml === 'function' ? eventsSectionHtml() : ''}
-    <div class="hero fade-in">
-      <div class="hero-label">${t('dist_title')}</div>
-      <div class="hero-value">—</div>
-      <div class="hero-pnl" style="color:var(--text-secondary);">${t('cannot_connect')}</div>
-    </div>
-    <div class="section chart-section">
-      <div class="section-title">${t('equity_curve')}</div>
-      <div class="glass-card chart-container" id="equity-chart-container">
-        <div class="chart-tooltip" id="chart-tooltip"><div class="tooltip-name"></div><div class="tooltip-value"></div></div>
-        <div id="equity-chart" style="height:420px;"></div>
-      </div>
-    </div>
-    <div class="section">
-      <div class="section-title">${t('accounts_overview')}</div>
-      <div class="accounts-grid" id="accounts-grid"></div>
-      <div class="tombstone-wall" id="tombstone-wall" style="display:none;"></div>
-    </div>
-  `;
   if (typeof startEventsStream === 'function') startEventsStream();
 }
 
@@ -381,9 +200,76 @@ function installEquityTimeZoom(chart, container) {
   });
 }
 
-function renderEquityCurves(data) {
+let _overviewEquityChart = null;
+let _equityView = { mode: 'aggregate', showRetired: false };
+let _equityAggregateCache = null, _equityFullCache = null, _equityFullPromise = null;
+
+async function selectEquityView(options) {
+  _equityView = { ..._equityView, ...options };
+  const needsFull = _equityView.mode !== 'aggregate' || _equityView.showRetired;
+  if (!needsFull) { renderEquityCurves(_equityAggregateCache); return; }
+  if (!_equityFullCache) {
+    _equityFullPromise ||= api('/trade/equity-curves?view=full');
+    _equityFullCache = await _equityFullPromise;
+  }
+  renderEquityCurves(_equityFullCache);
+}
+
+function aggregateActiveCurves(data, options = { showRetired: false }) {
+  const curves = data && data.curves ? data.curves : (data || {});
+  const meta = data && data.meta ? data.meta : {};
+  const entries = Array.isArray(curves) ? curves : Object.entries(curves).map(([name, points]) => ({ name, data: points }));
+  const activeGroups = new Set(['A', 'B', 'F', 'Q']);
+  const groupOf = name => {
+    const clean = String(name || '').replace(/^C(?=[ABFQ]\d)/, '');
+    return activeGroups.has(clean.charAt(0)) ? clean.charAt(0) : null;
+  };
+  const isBenchmark = name => /^(IDX|QQQ|SPY|CSI|沪深)/.test(String(name || ''));
+  if (options.mode && options.mode !== 'aggregate') {
+    const filtered = entries.filter(e => {
+      if (isBenchmark(e.name)) return true;
+      if (!options.showRetired && meta[e.name] && meta[e.name].status === 'retired') return false;
+      return options.mode === 'all' || groupOf(e.name) === options.mode;
+    });
+    return { curves: filtered, meta };
+  }
+  const output = entries.filter(e => isBenchmark(e.name));
+  for (const group of activeGroups) {
+    const members = entries.filter(e => groupOf(e.name) === group && (options.showRetired || !meta[e.name] || meta[e.name].status !== 'retired'));
+    if (!members.length) continue;
+    const buckets = new Map();
+    members.forEach(e => (e.data || []).forEach(p => {
+      const ts = p.timestamp || p.time || p.date, value = Number(p.equity ?? p.value);
+      if (!ts || !Number.isFinite(value)) return;
+      if (!buckets.has(ts)) buckets.set(ts, []);
+      buckets.get(ts).push(value);
+    }));
+    const points = [...buckets.entries()].sort((a,b) => String(a[0]).localeCompare(String(b[0]))).map(([timestamp, values]) => {
+      values.sort((a,b) => a-b); const n=values.length, mid=Math.floor(n/2);
+      return { timestamp, equity: n%2 ? values[mid] : (values[mid-1]+values[mid])/2 };
+    });
+    output.push({ name: `${group} · MEDIAN`, data: points, aggregate: true });
+  }
+  return { curves: output, meta };
+}
+
+function renderEquityCurves(data, options) {
   const container = document.getElementById('equity-chart');
   if (!container || !window.LightweightCharts) return;
+  if (options) _equityView = { ..._equityView, ...options };
+  const sourceData = data;
+  data = aggregateActiveCurves(sourceData, _equityView);
+  if (_overviewEquityChart) { try { _overviewEquityChart.remove(); } catch {} _overviewEquityChart = null; }
+  container.textContent = '';
+  let controls = document.getElementById('equity-curve-controls');
+  if (!controls) {
+    controls = document.createElement('div'); controls.id = 'equity-curve-controls'; controls.className = 'equity-curve-controls';
+    container.parentElement.insertBefore(controls, container);
+  }
+  controls.innerHTML = `<label>${t('group') || '账户/组筛选'} <select id="equity-view-select"><option value="aggregate">${t('groups') || '活跃组中位数'}</option><option value="all">${t('all_accounts') || '全部账户'}</option>${['A','B','F','Q'].map(g=>`<option value="${g}">${g}</option>`).join('')}</select></label><label><input id="equity-retired-toggle" type="checkbox" ${_equityView.showRetired?'checked':''}> ${t('tab_retired') || '退休账户'}</label>`;
+  controls.querySelector('#equity-view-select').value = _equityView.mode;
+  controls.querySelector('#equity-view-select').addEventListener('change', e => selectEquityView({mode:e.target.value}).catch(console.warn));
+  controls.querySelector('#equity-retired-toggle').addEventListener('change', e => selectEquityView({showRetired:e.target.checked}).catch(console.warn));
 
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
@@ -396,8 +282,11 @@ function renderEquityCurves(data) {
     handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
     handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true },
   });
+  _overviewEquityChart = chart;
+  registerRouteCleanup(() => { if (_overviewEquityChart === chart) { try { chart.remove(); } catch {} _overviewEquityChart = null; } });
 
   const seriesMap = {};
+  const seriesNameByRef = new Map();
   const aColors = ['#0088ff','#00aaff','#00bbee','#0099dd','#00ccff','#1199ee','#2288dd','#00aacc','#0077ee','#0066dd'];
   const bColors = ['#7b2ff7','#9b59f7','#b388ff','#c77dff','#a855f7','#8b5cf6','#7c3aed','#9333ea','#a855f7','#b06cff'];
   const benchColors = {
@@ -472,6 +361,7 @@ function renderEquityCurves(data) {
       if (final.length) series.setData(final);
     }
     seriesMap[curve.name] = { series, color, data: curve.data, isBench, baseWidth: lineWidth, baseStyle: lineStyle };
+    seriesNameByRef.set(series, curve.name);
   });
 
   chart.timeScale().fitContent();
@@ -494,12 +384,17 @@ function renderEquityCurves(data) {
 
   // Tooltip on crosshair move
   const tooltip = document.getElementById('chart-tooltip');
+  let highlighted = null;
+  const restoreHighlighted = () => {
+    if (!highlighted) return;
+    const previous = seriesMap[highlighted];
+    if (previous && !previous.isBench) previous.series.applyOptions({ color: previous.color, lineWidth: previous.baseWidth, lineStyle: previous.baseStyle });
+    highlighted = null;
+  };
   chart.subscribeCrosshairMove(param => {
     if (!param.time || !param.seriesData || param.seriesData.size === 0) {
       tooltip.classList.remove('visible');
-      Object.values(seriesMap).forEach(s =>
-        s.series.applyOptions({ color: s.color, lineWidth: s.baseWidth, lineStyle: s.baseStyle })
-      );
+      restoreHighlighted();
       return;
     }
     // find hovered (highest value near mouse)
@@ -507,7 +402,7 @@ function renderEquityCurves(data) {
     param.seriesData.forEach((val, series) => {
       const v = val.value;
       if (v !== undefined) {
-        const name = Object.keys(seriesMap).find(k => seriesMap[k].series === series);
+        const name = seriesNameByRef.get(series);
         if (name) { if (!best || Math.abs(v) > Math.abs(bestVal)) { best = name; bestVal = v; } }
       }
     });
@@ -515,21 +410,18 @@ function renderEquityCurves(data) {
       tooltip.querySelector('.tooltip-name').textContent = best;
       tooltip.querySelector('.tooltip-value').textContent = formatCurrency(bestVal);
       tooltip.classList.add('visible');
-      Object.entries(seriesMap).forEach(([name, s]) => {
-        if (s.isBench) {
-          // benchmarks always stay visible
-          s.series.applyOptions({ lineWidth: s.baseWidth, lineStyle: s.baseStyle });
-        } else if (name === best) {
-          s.series.applyOptions({ lineWidth: 2.5 });
-        } else {
-          s.series.applyOptions({ lineWidth: 0.5 });
-        }
-      });
+      if (best !== highlighted) {
+        restoreHighlighted();
+        const current = seriesMap[best];
+        if (current && !current.isBench) { current.series.applyOptions({ lineWidth: 2.5 }); highlighted = best; }
+      }
     }
   });
 
   // resize
-  new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth })).observe(container);
+  const observer = new ResizeObserver(() => chart.applyOptions({ width: container.clientWidth }));
+  observer.observe(container);
+  registerRouteCleanup(() => observer.disconnect());
 }
 
 let _accountsCache = null;
@@ -647,7 +539,7 @@ function tombstoneHtml(a) {
   const reason = _esc(a.retire_reason || t('retired_tooltip') || '');
 
   return `
-    <div class="tombstone fade-in" data-id="${id}" title="${reason}">
+    <button type="button" class="tombstone fade-in" data-id="${id}" title="${reason}" aria-label="${_esc(id)} ${_esc(t('retired_badge') || 'retired')}">
       <div class="tombstone-cross">✝</div>
       <div class="tombstone-rip">R.I.P.</div>
       <div class="tombstone-id">${_esc(id)}</div>
@@ -655,23 +547,34 @@ function tombstoneHtml(a) {
       <div class="tombstone-dates">${born} — ${died}</div>
       <div class="tombstone-return ${pnlCls}">${sign}${formatPercent(pnlPct)}</div>
       <div class="tombstone-epitaph">${_esc((a.retire_reason || '').slice(0, 60) || (t('retired_tooltip') || ''))}</div>
-    </div>`;
+    </button>`;
 }
 
+let _tombstoneReturnFocus = null;
+function closeTombstoneModal() {
+  const modal = document.getElementById('tombstone-modal');
+  if (modal) { modal.classList.remove('open'); if (modal._removeFocusTrap) { modal._removeFocusTrap(); modal._removeFocusTrap = null; } }
+  if (_tombstoneReturnFocus && _tombstoneReturnFocus.isConnected) _tombstoneReturnFocus.focus();
+}
 async function openTombstoneModal(accountId) {
+  _tombstoneReturnFocus = document.activeElement;
   let modal = document.getElementById('tombstone-modal');
   if (!modal) {
     modal = document.createElement('div');
     modal.id = 'tombstone-modal';
     modal.className = 'tombstone-modal';
-    modal.innerHTML = `<div class="tombstone-modal-backdrop"></div><div class="tombstone-modal-body glass-card"></div>`;
+    modal.innerHTML = `<div class="tombstone-modal-backdrop"></div><div class="tombstone-modal-body glass-card" role="dialog" aria-modal="true" aria-label="${t('retired_label') || 'Retired account details'}" tabindex="-1"></div>`;
     document.body.appendChild(modal);
-    modal.querySelector('.tombstone-modal-backdrop').addEventListener('click', () => modal.classList.remove('open'));
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') modal.classList.remove('open'); });
+    modal.querySelector('.tombstone-modal-backdrop').addEventListener('click', closeTombstoneModal);
+    const onEscape = (e) => { if (e.key === 'Escape' && modal.classList.contains('open')) closeTombstoneModal(); };
+    document.addEventListener('keydown', onEscape);
+    registerRouteCleanup(() => { document.removeEventListener('keydown', onEscape); modal.remove(); });
   }
   const body = modal.querySelector('.tombstone-modal-body');
   body.innerHTML = `<div class="tombstone-modal-loading">${t('events_loading') || 'Loading…'}</div>`;
   modal.classList.add('open');
+  modal._removeFocusTrap = trapModalFocus(body, closeTombstoneModal);
+  requestAnimationFrame(() => (modal.querySelector('button') || body).focus());
   try {
     const [accData, factors] = await Promise.all([
       api(`/trade/account/${accountId}`),
@@ -680,7 +583,7 @@ async function openTombstoneModal(accountId) {
     renderTombstoneModal(body, accountId, accData, factors);
   } catch (e) {
     body.innerHTML = `<button class="tombstone-modal-close" aria-label="Close">×</button><p style="color:var(--negative);padding:24px;">${t('load_failed')} ${e.message}</p>`;
-    body.querySelector('.tombstone-modal-close').addEventListener('click', () => modal.classList.remove('open'));
+    body.querySelector('.tombstone-modal-close').addEventListener('click', closeTombstoneModal);
   }
 }
 
@@ -760,9 +663,8 @@ function renderTombstoneModal(body, accountId, accData, factors) {
       ${accData.trades_next_cursor ? `<button type="button" id="tomb-load-trades-${accountId}" class="btn-secondary">${t('tomb_load_older_trades') || 'Load older trades'}</button>` : ''}
     </div>
   `;
-  body.querySelector('.tombstone-modal-close').addEventListener('click', () => {
-    document.getElementById('tombstone-modal').classList.remove('open');
-  });
+  body.querySelector('.tombstone-modal-close').addEventListener('click', closeTombstoneModal);
+  body.querySelector('.tombstone-modal-close').focus();
   // Equity chart with markers — reuse renderRowEquity from components.js
   if (typeof renderRowEquity === 'function') {
     renderRowEquity(`tomb-equity-${accountId}`, equityCurve, accountId, accData.benchmarks, accData.alpha, accData.trade_markers || trades, accData.snapshots || []);

@@ -199,7 +199,7 @@ def test_mobile_css_contains_nav_width_guards_and_cache_bust():
     assert 'grid-template-columns: minmax(0, 1fr) auto auto' in css
     assert 'overflow-x: auto' in css
     assert 'max-width: 100%' in css
-    assert 'style.css?v=51' in html
+    assert 'style.css?v=53' in html
 
 
 def test_account_surfaces_display_ids_without_account_names():
@@ -222,7 +222,7 @@ def test_overview_equity_chart_has_continuous_mouse_time_zoom():
     assert 'event.preventDefault()' in js
     assert "container.addEventListener('dblclick'" in js
     assert "handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true }" in js
-    assert 'trade.js?v=24' in html
+    assert 'trade.js?v=26' in html
 
 
 def test_live_account_uses_sse_incremental_updates_and_cache_bust():
@@ -233,12 +233,12 @@ def test_live_account_uses_sse_incremental_updates_and_cache_bust():
     assert 'new EventSource(`${LA_API_BASE}/strategy/stream`)' in js
     assert "stream.addEventListener('snapshot'" in js
     assert 'function laApplySnapshot(root,control)' in js
-    assert "set('la-control-wrap',laControlPanel(control))" in js
+    assert "set('la-control-wrap',laControlPanel(control,p,st))" in js
     assert "if(signature!==_laChartSignature)" in js
     assert "if(document.hidden)laStopStream()" in js
     assert "window.addEventListener('hashchange'" in js
     assert 'laCaptureView(app)' in js and 'laRestoreView(app,view)' in js
-    assert 'live_account.js?v=17' in html
+    assert "live_account.js?v=19" in (ROOT / 'static/js/app.js').read_text()
 
 
 def test_return_histogram_and_opend_connection_panel_are_removed():

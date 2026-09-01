@@ -1,5 +1,27 @@
 // components.js — reusable UI components
 
+function registerComponentChart(chart, observer) {
+  if (typeof registerRouteCleanup === 'function') registerRouteCleanup(() => {
+    if (observer) observer.disconnect();
+    if (chart) { try { chart.remove(); } catch {} }
+  });
+}
+
+function trapModalFocus(container, onEscape) {
+  const selector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const onKeydown = event => {
+    if (event.key === 'Escape') { event.preventDefault(); onEscape(); return; }
+    if (event.key !== 'Tab') return;
+    const items = [...container.querySelectorAll(selector)].filter(el => !el.hidden && el.offsetParent !== null);
+    if (!items.length) { event.preventDefault(); container.focus(); return; }
+    const first = items[0], last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  };
+  document.addEventListener('keydown', onKeydown);
+  return () => document.removeEventListener('keydown', onKeydown);
+}
+
 function createCard(account) {
   const id = account.id || account.account_id;
   const groupChar = id.charAt(0) === 'C' ? id.charAt(1) : id.charAt(0);
@@ -35,7 +57,7 @@ function createCard(account) {
     ? `<span class="runtime-pill" title="${_esc(account.runtime_reason || runtimeStatus)}">${t('runtime_nontradeable')}</span>`
     : '';
   row.innerHTML = `
-    <div class="row-main">
+    <button class="row-main" type="button" aria-expanded="false">
       <div class="row-left">
         <span class="account-badge ${badgeClass}">${id}</span>
 
@@ -73,10 +95,13 @@ function createCard(account) {
         </div>
         <div class="row-chevron" aria-hidden="true">›</div>
       </div>
-    </div>
+    </button>
     <div class="row-detail"></div>
   `;
-  row.querySelector('.row-main').addEventListener('click', () => toggleRowExpand(row, id));
+  row.querySelector('.row-main').addEventListener('click', (event) => {
+    toggleRowExpand(row, id);
+    event.currentTarget.setAttribute('aria-expanded', String(row.classList.contains('expanded')));
+  });
   return row;
 }
 
@@ -378,10 +403,12 @@ function renderSignalQualityChart(containerId, sq) {
   container.appendChild(legend);
   chart.timeScale().fitContent();
   requestAnimationFrame(() => chart.timeScale().fitContent());
-  new ResizeObserver(() => {
+  const observer = new ResizeObserver(() => {
     chart.applyOptions({ width: container.clientWidth });
     chart.timeScale().fitContent();
-  }).observe(container);
+  });
+  observer.observe(container);
+  registerComponentChart(chart, observer);
 }
 
 function paintSignalQuality(root, sq) {
@@ -904,10 +931,12 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
   // container has stable width and the visible range gets stuck on the last
   // few points). Refit again after resize so width changes don't crop history.
   requestAnimationFrame(() => chart.timeScale().fitContent());
-  new ResizeObserver(() => {
+  const observer = new ResizeObserver(() => {
     chart.applyOptions({ width: container.clientWidth });
     chart.timeScale().fitContent();
-  }).observe(container);
+  });
+  observer.observe(container);
+  registerComponentChart(chart, observer);
 
   // Alpha summary + legend
   if (alpha || benchmarks?.length) {
@@ -950,13 +979,14 @@ function renderRowEquity(containerId, curve, accountId, benchmarks, alpha, trade
 }
 
 async function openAccountDrawer(accountId) {
+  const returnFocus = document.activeElement;
   let overlay = document.getElementById('account-drawer-overlay');
   if (overlay) overlay.remove();
   overlay = document.createElement('div');
   overlay.id = 'account-drawer-overlay';
   overlay.className = 'drawer-overlay';
   overlay.innerHTML = `
-    <div class="drawer-panel glass-card">
+    <div class="drawer-panel glass-card" role="dialog" aria-modal="true" aria-label="${t('account_details') || 'Account details'}" tabindex="-1">
       <div class="drawer-header">
         <div class="drawer-title">
           <span class="account-badge ${accountId.startsWith('A') ? 'badge-a' : 'badge-b'}">${accountId}</span>
@@ -990,10 +1020,21 @@ async function openAccountDrawer(accountId) {
   document.body.appendChild(overlay);
   requestAnimationFrame(() => overlay.classList.add('visible'));
 
-  const close = () => { overlay.classList.remove('visible'); setTimeout(() => overlay.remove(), 300); };
+  let removeFocusTrap = () => {};
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    removeFocusTrap();
+    overlay.classList.remove('visible');
+    setTimeout(() => overlay.remove(), 300);
+    if (returnFocus && returnFocus.isConnected) returnFocus.focus();
+  };
+  removeFocusTrap = trapModalFocus(overlay.querySelector('.drawer-panel'), close);
   overlay.querySelector('.drawer-close').addEventListener('click', close);
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
-  document.addEventListener('keydown', function onEsc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onEsc); } });
+  overlay.querySelector('.drawer-close').focus();
+  registerRouteCleanup(() => { removeFocusTrap(); overlay.remove(); });
 
   try {
     const [accData, factors] = await Promise.all([
@@ -1037,10 +1078,10 @@ function renderDrawerEquity(curve, accountId, benchmarks) {
   const color = isA ? '#00aaff' : '#b388ff';
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth, height: 300,
-    layout: { background: { type: 'solid', color: 'transparent' }, textColor: 'rgba(0,0,0,0.65)', fontSize: 11 },
-    grid: { vertLines: { color: 'rgba(0,0,0,0.06)' }, horzLines: { color: 'rgba(0,0,0,0.06)' } },
-    timeScale: { borderColor: 'rgba(0,0,0,0.12)', timeVisible: true, secondsVisible: false },
-    rightPriceScale: { borderColor: 'rgba(0,0,0,0.12)' },
+    layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#c7d2e2', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(199,210,226,0.10)' }, horzLines: { color: 'rgba(199,210,226,0.10)' } },
+    timeScale: { borderColor: 'rgba(199,210,226,0.24)', timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: 'rgba(199,210,226,0.24)' },
   });
   const series = chart.addAreaSeries({
     lineColor: color, topColor: color + '55', bottomColor: color + '05', lineWidth: 2,
@@ -1096,8 +1137,10 @@ function renderDrawerEquity(curve, accountId, benchmarks) {
   // Drawer animates in → container may be 0-width at first paint. Refit next
   // frame, and refit on every resize so width changes don't crop history.
   requestAnimationFrame(() => chart.timeScale().fitContent());
-  new ResizeObserver(() => {
+  const observer = new ResizeObserver(() => {
     chart.applyOptions({ width: container.clientWidth });
     chart.timeScale().fitContent();
-  }).observe(container);
+  });
+  observer.observe(container);
+  registerComponentChart(chart, observer);
 }

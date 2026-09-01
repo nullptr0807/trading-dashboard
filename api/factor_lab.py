@@ -290,6 +290,7 @@ class FactorLabRunRequest(BaseModel):
 
 _CATALOG_CACHE_TTL = 60.0
 _CATALOG_CACHE: dict[str, tuple[float, dict]] = {}
+_CATALOG_INFLIGHT: dict[str, asyncio.Task] = {}
 
 
 def _factor_lab_catalog_sync(market: str) -> dict:
@@ -349,9 +350,19 @@ async def factor_lab_catalog(market: str = Query("US")):
     now = time.monotonic()
     if cached and now - cached[0] < _CATALOG_CACHE_TTL:
         return cached[1]
-    payload = await asyncio.to_thread(_factor_lab_catalog_sync, market)
-    _CATALOG_CACHE[market] = (time.monotonic(), payload)
-    return payload
+    task = _CATALOG_INFLIGHT.get(market)
+    if task is None:
+        async def build():
+            try:
+                payload = await asyncio.to_thread(_factor_lab_catalog_sync, market)
+                _CATALOG_CACHE[market] = (time.monotonic(), payload)
+                return payload
+            finally:
+                _CATALOG_INFLIGHT.pop(market, None)
+
+        task = asyncio.create_task(build())
+        _CATALOG_INFLIGHT[market] = task
+    return await asyncio.shield(task)
 
 
 @router.post("/run")

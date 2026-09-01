@@ -14,6 +14,17 @@
   };
   let equityChart = null;
   let icChart = null;
+  let equityResizeObserver = null;
+  let icResizeObserver = null;
+  let chartFrame = null;
+
+  function disposeFactorLabResources() {
+    if (chartFrame != null) { cancelAnimationFrame(chartFrame); chartFrame = null; }
+    if (equityResizeObserver) { equityResizeObserver.disconnect(); equityResizeObserver = null; }
+    if (icResizeObserver) { icResizeObserver.disconnect(); icResizeObserver = null; }
+    if (equityChart) { try { equityChart.remove(); } catch (e) {} equityChart = null; }
+    if (icChart) { try { icChart.remove(); } catch (e) {} icChart = null; }
+  }
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -142,6 +153,8 @@
   }
 
   async function renderFactorLabPage() {
+    disposeFactorLabResources();
+    registerRouteCleanup(disposeFactorLabResources);
     const app = document.getElementById('app');
     app.innerHTML = `
       <div class="factor-lab-page fade-in">
@@ -271,7 +284,7 @@
     paintTerms();
 
     try {
-      const res = await fetch(`/api/factor-lab/catalog?market=${encodeURIComponent(state.market)}`);
+      const res = await fetch(`/api/factor-lab/catalog?market=${encodeURIComponent(state.market)}`, { signal: getActiveRouteSignal() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       _state.catalog = data.factors || [];
@@ -714,6 +727,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: getActiveRouteSignal(),
       });
       if (!res.ok) {
         let detail = `HTTP ${res.status}`;
@@ -784,7 +798,8 @@
         </div>
       </div>
     `;
-    requestAnimationFrame(() => {
+    chartFrame = requestAnimationFrame(() => {
+      chartFrame = null;
       renderEquity(data.equity_curve || []);
       renderIC(data.ic_series || []);
     });
@@ -845,6 +860,7 @@
     const container = document.getElementById('fl-equity-chart');
     if (!container) return;
     container.innerHTML = '';
+    if (equityResizeObserver) { equityResizeObserver.disconnect(); equityResizeObserver = null; }
     if (equityChart) { try { equityChart.remove(); } catch (e) {} equityChart = null; }
     if (!curve.length || typeof LightweightCharts === 'undefined') return;
     const chart = LightweightCharts.createChart(container, {
@@ -860,13 +876,15 @@
     series.setData(curve.map(p => ({ time: p.date, value: Number(p.equity) })).filter(p => p.time && Number.isFinite(p.value)));
     chart.timeScale().fitContent();
     requestAnimationFrame(() => chart.timeScale().fitContent());
-    new ResizeObserver(() => { chart.applyOptions({ width: container.clientWidth }); chart.timeScale().fitContent(); }).observe(container);
+    equityResizeObserver = new ResizeObserver(() => { chart.applyOptions({ width: container.clientWidth }); chart.timeScale().fitContent(); });
+    equityResizeObserver.observe(container);
   }
 
   function renderIC(rows) {
     const container = document.getElementById('fl-ic-chart');
     if (!container) return;
     container.innerHTML = '';
+    if (icResizeObserver) { icResizeObserver.disconnect(); icResizeObserver = null; }
     if (icChart) { try { icChart.remove(); } catch (e) {} icChart = null; }
     if (!rows.length || typeof LightweightCharts === 'undefined') return;
     const chart = LightweightCharts.createChart(container, {
@@ -884,7 +902,8 @@
     roll.setData(rows.map(r => ({ time: r.date, value: Number(r.rolling_icir) })).filter(p => p.time && Number.isFinite(p.value)));
     chart.timeScale().fitContent();
     requestAnimationFrame(() => chart.timeScale().fitContent());
-    new ResizeObserver(() => { chart.applyOptions({ width: container.clientWidth }); chart.timeScale().fitContent(); }).observe(container);
+    icResizeObserver = new ResizeObserver(() => { chart.applyOptions({ width: container.clientWidth }); chart.timeScale().fitContent(); });
+    icResizeObserver.observe(container);
   }
 
   window.renderFactorLabPage = renderFactorLabPage;

@@ -8,8 +8,9 @@
 //                         PnL table.
 
 (function () {
+  const PAGE_SIZE = 75;
   // Tiny debounced filter so big universes (1000+ tickers) stay smooth.
-  const _state = { rows: [], filter: '', sortKey: 'last_trade_ts', sortDir: 'desc' };
+  const _state = { rows: [], filter: '', sortKey: 'last_trade_ts', sortDir: 'desc', page: 0 };
 
   const SORT_KEYS = {
     accounts_count: 'num',
@@ -45,6 +46,7 @@
       // sensible defaults: timestamps & pnl & counts → desc first
       _state.sortDir = 'desc';
     }
+    _state.page = 0;
     paintSymbolTable();
   }
 
@@ -96,9 +98,11 @@
       clearTimeout(debTimer);
       debTimer = setTimeout(() => {
         _state.filter = input.value.trim().toLowerCase();
+        _state.page = 0;
         paintSymbolTable();
       }, 80);
     });
+    registerRouteCleanup(() => { if (debTimer) clearTimeout(debTimer); });
   }
 
   function paintSymbolTable() {
@@ -122,6 +126,10 @@
     }
 
     rows = sortRows(rows);
+    const totalRows = rows.length;
+    const pageCount = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+    _state.page = Math.min(_state.page, pageCount - 1);
+    rows = rows.slice(_state.page * PAGE_SIZE, (_state.page + 1) * PAGE_SIZE);
 
     const cur = currencySymbol();
     const fmtTs = (s) => s ? s.slice(0, 10) : '—';
@@ -130,13 +138,17 @@
       if (_state.sortKey !== key) return '<span class="sym-sort-ind">↕</span>';
       return `<span class="sym-sort-ind active">${_state.sortDir === 'asc' ? '↑' : '↓'}</span>`;
     };
+    const sortHeader = (key, label) => {
+      const ariaSort = _state.sortKey === key ? (_state.sortDir === 'asc' ? 'ascending' : 'descending') : 'none';
+      return `<div class="sym-cell-num sym-sortable" role="columnheader" aria-sort="${ariaSort}"><button type="button" data-sort="${key}">${label} ${arrow(key)}</button></div>`;
+    };
     const headerHtml = `
-      <div class="sym-row sym-row-head">
-        <div class="sym-cell-tk">${t('sym_col_ticker')}</div>
-        <div class="sym-cell-num sym-sortable" data-sort="accounts_count">${t('sym_col_accounts')} ${arrow('accounts_count')}</div>
-        <div class="sym-cell-num sym-sortable" data-sort="trade_count">${t('sym_col_trades')} ${arrow('trade_count')}</div>
-        <div class="sym-cell-num sym-sortable" data-sort="realized_pnl">${t('sym_col_realized')} ${arrow('realized_pnl')}</div>
-        <div class="sym-cell-num sym-sortable" data-sort="last_trade_ts">${t('sym_col_last')} ${arrow('last_trade_ts')}</div>
+      <div class="sym-row sym-row-head" role="row">
+        <div class="sym-cell-tk" role="columnheader">${t('sym_col_ticker')}</div>
+        ${sortHeader('accounts_count', t('sym_col_accounts'))}
+        ${sortHeader('trade_count', t('sym_col_trades'))}
+        ${sortHeader('realized_pnl', t('sym_col_realized'))}
+        ${sortHeader('last_trade_ts', t('sym_col_last'))}
       </div>
     `;
     const bodyHtml = rows.map(r => {
@@ -159,11 +171,18 @@
       `;
     }).join('');
 
-    host.innerHTML = `<div class="sym-table">${headerHtml}${bodyHtml}</div>`;
+    const pageHtml = pageCount > 1 ? `<nav class="sym-pagination" aria-label="${t('sym_pagination') || 'Symbol pages'}">
+      <button type="button" id="sym-page-prev" aria-label="${t('sym_previous_page') || 'Previous page'}" ${_state.page === 0 ? 'disabled' : ''}>‹</button>
+      <span>${_state.page + 1} / ${pageCount}</span>
+      <button type="button" id="sym-page-next" aria-label="${t('sym_next_page') || 'Next page'}" ${_state.page + 1 >= pageCount ? 'disabled' : ''}>›</button>
+    </nav>` : '';
+    host.innerHTML = `<div class="sym-table" role="table">${headerHtml}${bodyHtml}</div>${pageHtml}`;
 
-    host.querySelectorAll('.sym-sortable').forEach(el => {
+    host.querySelectorAll('.sym-sortable button').forEach(el => {
       el.addEventListener('click', () => setSort(el.dataset.sort));
     });
+    document.getElementById('sym-page-prev')?.addEventListener('click', () => { _state.page -= 1; paintSymbolTable(); });
+    document.getElementById('sym-page-next')?.addEventListener('click', () => { _state.page += 1; paintSymbolTable(); });
   }
 
   // ---------------------------------------------------------------- Detail
@@ -269,7 +288,7 @@
             <div class="num">${t('sym_acct_col_holding')}</div>
           </div>
           ${d.accounts.map(a => `
-            <div class="sym-arow sym-arow-body" data-account="${a.account}" data-trades='${encodeURIComponent(JSON.stringify(a.trades))}'>
+            <div class="sym-arow sym-arow-body" role="button" tabindex="0" aria-expanded="false" data-account="${a.account}" data-trades='${encodeURIComponent(JSON.stringify(a.trades))}'>
               <div><span class="sym-acct-toggle" aria-hidden="true">▸</span><a href="#/trade?focus=${a.account}" class="sym-acct-link" onclick="event.stopPropagation();">${a.account}</a><span class="sym-grp grp-${a.group||'X'}">${a.group||''}</span></div>
 
               <div class="num">${a.trade_count}</div>
@@ -354,7 +373,7 @@
   // Click an account row → expand FIFO trade-by-trade ledger inline.
   function bindAccountRowExpand(ticker) {
     document.querySelectorAll('.sym-arow-body').forEach(row => {
-      row.addEventListener('click', (ev) => {
+      const toggle = (ev) => {
         // Don't expand if clicking the account link itself.
         if (ev.target.closest('a')) return;
         const acc = row.dataset.account;
@@ -362,6 +381,7 @@
         if (next && next.classList.contains('sym-arow-detail')) {
           next.remove();
           row.classList.remove('expanded');
+          row.setAttribute('aria-expanded', 'false');
           return;
         }
         let trades = [];
@@ -372,7 +392,10 @@
         det.innerHTML = renderTradesLedger(trades, acc, ticker);
         row.after(det);
         row.classList.add('expanded');
-      });
+        row.setAttribute('aria-expanded', 'true');
+      };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(ev); } });
     });
   }
 

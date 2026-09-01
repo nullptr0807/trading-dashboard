@@ -12,6 +12,7 @@ router = APIRouter(prefix='/api/trade', tags=['trade'])
 # still correct; hot-path avoids re-scanning ~0.8M US account rows for every
 # tab render / language switch / market toggle.
 _API_CACHE: dict[tuple[str, str], tuple[float, object]] = {}
+_API_INFLIGHT: dict[tuple[str, str], asyncio.Task] = {}
 
 
 def _cache_get(kind: str, market: str, ttl: float):
@@ -19,19 +20,64 @@ def _cache_get(kind: str, market: str, ttl: float):
     if not item:
         return None
     ts, value = item
-    if time.time() - ts > ttl:
-        _API_CACHE.pop((kind, market), None)
+    if time.monotonic() - ts > ttl:
         return None
     return value
 
 
 def _cache_set(kind: str, market: str, value):
-    _API_CACHE[(kind, market)] = (time.time(), value)
+    _API_CACHE[(kind, market)] = (time.monotonic(), value)
     return value
 
 
+async def _cached_api_value(kind: str, market: str, ttl: float, builder,
+                            *, stale_ttl: float = 0.0):
+    """Coalesce misses and serve bounded stale data while one refresh runs."""
+    key = (kind, market)
+    now = time.monotonic()
+    cached = _API_CACHE.get(key)
+    if cached and now - cached[0] <= ttl:
+        return cached[1]
+
+    task = _API_INFLIGHT.get(key)
+    if task is None:
+        async def refresh():
+            try:
+                value = await builder()
+                return _cache_set(kind, market, value)
+            finally:
+                _API_INFLIGHT.pop(key, None)
+
+        task = asyncio.create_task(refresh())
+        _API_INFLIGHT[key] = task
+
+    if cached and now - cached[0] <= ttl + stale_ttl:
+        # Retrieve any refresh exception so background SWR failures do not emit
+        # "Task exception was never retrieved"; stale data remains available.
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return cached[1]
+    return await asyncio.shield(task)
+
+
+async def _singleflight_api_value(kind: str, market: str, builder):
+    """Coalesce concurrent builds without retaining a stale response."""
+    key = (kind, market)
+    task = _API_INFLIGHT.get(key)
+    if task is None:
+        async def build_once():
+            try:
+                return await builder()
+            finally:
+                _API_INFLIGHT.pop(key, None)
+        task = asyncio.create_task(build_once())
+        _API_INFLIGHT[key] = task
+    return await asyncio.shield(task)
+
+
 VALID_MARKETS = {'US', 'CN'}
+OVERVIEW_EQUITY_MAX_POINTS = 720
 ACCOUNT_EQUITY_MAX_POINTS = 1200
+ACCOUNT_BENCHMARK_MAX_POINTS = 600
 ACCOUNT_SNAPSHOT_MAX = 240
 ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX = 50
 ACCOUNT_TRADES_MAX = 200
@@ -178,12 +224,7 @@ async def _fetch_account_equity_rows(market: str, *, since_45d: bool = False) ->
     return await asyncio.to_thread(_fetch_account_equity_rows_sync, market, since_45d=since_45d)
 
 
-@router.get('/summary')
-async def summary(market: str = Query('US')):
-    market = _validate_market(market)
-    cached = _cache_get('summary', market, ttl=15)
-    if cached is not None:
-        return cached
+async def _build_summary(market: str):
     # Source of truth for market = account_meta.market (the `accounts` snapshot
     # table inherits the default 'US' for everything, so we always join through
     # account_meta to filter properly).
@@ -380,15 +421,18 @@ async def summary(market: str = Query('US')):
         **{f'group_{name}': group_stats(group_rows[name]) for name in group_rows},
         'distribution': distribution,
     }
-    return _cache_set('summary', market, payload)
+    return payload
 
 
-@router.get('/accounts')
-async def accounts(market: str = Query('US')):
+@router.get('/summary')
+async def summary(market: str = Query('US')):
     market = _validate_market(market)
-    cached = _cache_get('accounts', market, ttl=15)
-    if cached is not None:
-        return cached
+    return await _cached_api_value(
+        'summary', market, 15, lambda: _build_summary(market), stale_ttl=60,
+    )
+
+
+async def _build_accounts(market: str):
     rows = await fetch_all('''
         SELECT m.account_id AS name, a.cash, a.equity, a.timestamp,
                m."group", m.strategy_name, m.factors, m.status, m.initial_cash,
@@ -515,20 +559,23 @@ async def accounts(market: str = Query('US')):
             'trade_count': trade_counts.get(acc_id, 0),
             'sharpe_ratio': round(sharpe, 3),
         })
-    return _cache_set('accounts', market, result)
+    return result
 
 
-@router.get('/equity-curves')
-async def equity_curves(market: str = Query('US')):
+@router.get('/accounts')
+async def accounts(market: str = Query('US')):
     market = _validate_market(market)
-    cached = _cache_get('equity_curves', market, ttl=60)
-    if cached is not None:
-        return cached
+    return await _cached_api_value(
+        'accounts', market, 15, lambda: _build_accounts(market), stale_ttl=60,
+    )
+
+
+async def _build_equity_curves(market: str):
     # Pull retired metadata so we can truncate frozen accounts at retired_at
     # (snapshots written after retirement are skipped by update_prices.py, but
     # any historical drift is still visible — clip server-side to be safe).
     meta_rows = await fetch_all(
-        "SELECT account_id, status, retired_at, retire_reason, initial_cash "
+        "SELECT account_id, \"group\", status, retired_at, retire_reason, initial_cash "
         "FROM account_meta WHERE market = :market",
         {'market': market}
     )
@@ -639,7 +686,12 @@ async def equity_curves(market: str = Query('US')):
                 old_by_day[point['timestamp'][:10]] = point
             else:
                 recent.append(point)
-        return list(old_by_day.values()) + recent
+        coarsened = list(old_by_day.values()) + recent
+        if pts and (not coarsened or coarsened[0]['timestamp'] != pts[0]['timestamp']):
+            coarsened.insert(0, pts[0])
+        if pts and coarsened[-1]['timestamp'] != pts[-1]['timestamp']:
+            coarsened.append(pts[-1])
+        return coarsened
 
     curves: dict[str, list[dict]] = {}
     for name, by_bucket in bucket_values.items():
@@ -652,7 +704,10 @@ async def equity_curves(market: str = Query('US')):
             else:
                 eq = (vals[n // 2 - 1] + vals[n // 2]) / 2
             pts.append({'equity': round(eq, 2), 'timestamp': _bucket_ts(bk)})
-        curves[name] = _coarsen_old_history(_drop_isolated_outliers(pts))
+        curves[name] = _downsample_endpoints(
+            _coarsen_old_history(_drop_isolated_outliers(pts)),
+            OVERVIEW_EQUITY_MAX_POINTS,
+        )
 
     first_row = await fetch_one(
         'SELECT MIN(timestamp) as ts FROM trades '
@@ -662,17 +717,26 @@ async def equity_curves(market: str = Query('US')):
     )
     anchor_ts = first_row['ts'] if first_row else None
     # Align benchmarks to the already-deduped strategy timestamps.
-    align_ts = sorted({
+    align_points = [{'timestamp': ts} for ts in sorted({
         p['timestamp']
         for name, pts in curves.items() if not name.startswith('IDX')
         for p in pts
-    })
+    })]
+    align_ts = [
+        p['timestamp'] for p in _downsample_endpoints(
+            align_points, OVERVIEW_EQUITY_MAX_POINTS,
+        )
+    ]
     base_initial = 100000.0 if market == 'CN' else 10000.0
     if anchor_ts:
         for b in benchmarks_for(market):
             curve = await rebased_curve(b['ticker'], anchor_ts, initial=base_initial, align_to=align_ts)
             if curve:
-                curves[b['label']] = curve
+                # rebased_curve also includes raw 5m bars for detail consumers.
+                # Overview charts intentionally retain only the shared strategy
+                # timeline, preventing thousands of QQQ/SPY points from leaking.
+                aligned = {p['timestamp']: p for p in curve if p['timestamp'] in set(align_ts)}
+                curves[b['label']] = [aligned[ts] for ts in align_ts if ts in aligned]
     # Build per-account meta (status / retired_at / retire_reason) so the
     # frontend can style retired curves (gray dashed, truncated) and label
     # them in legends/tooltips. Only fields useful to the chart are exposed.
@@ -680,12 +744,140 @@ async def equity_curves(market: str = Query('US')):
     for name in curves:
         m = meta_by_acct.get(name) or {}
         curves_meta[name] = {
+            'group': m.get('group'),
             'status': m.get('status') or 'active',
             'retired_at': m.get('retired_at'),
             'retire_reason': m.get('retire_reason'),
         }
     payload = {'curves': curves, 'meta': curves_meta}
-    return _cache_set('equity_curves', market, payload)
+    return payload
+
+
+_AGGREGATE_EQUITY_GROUPS = ('A', 'B', 'F', 'Q')
+
+
+def _aggregate_equity_curves(payload: dict, market: str) -> dict:
+    """Reduce full account curves to active, timestamp-aligned group medians."""
+    curves = payload.get('curves') or {}
+    meta = payload.get('meta') or {}
+    benchmark_names = {item['label'] for item in benchmarks_for(market)}
+    output_curves = {
+        name: curves[name] for name in benchmark_names if name in curves
+    }
+    output_meta = {
+        name: {
+            **(meta.get(name) or {}),
+            'aggregate': False,
+            'benchmark': True,
+        }
+        for name in output_curves
+    }
+
+    for group in _AGGREGATE_EQUITY_GROUPS:
+        member_series: dict[str, dict[str, float]] = {}
+        for name, points in curves.items():
+            item_meta = meta.get(name) or {}
+            item_group = item_meta.get('group')
+            # The name fallback keeps aggregation compatible with a full payload
+            # cached by an older worker during a rolling restart.
+            if not item_group:
+                clean_name = name[1:] if name.startswith('C') else name
+                item_group = clean_name[:1]
+            if item_group != group or item_meta.get('status', 'active') == 'retired':
+                continue
+            series: dict[str, float] = {}
+            for point in points or []:
+                timestamp = point.get('timestamp') or point.get('time') or point.get('date')
+                value = point.get('equity', point.get('value'))
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp and numeric > 0:
+                    series[str(timestamp)] = numeric
+            if series:
+                member_series[name] = series
+        if not member_series:
+            continue
+
+        def median_value(values: list[float]) -> float:
+            ordered = sorted(values)
+            middle = len(ordered) // 2
+            return ordered[middle] if len(ordered) % 2 else (
+                ordered[middle - 1] + ordered[middle]
+            ) / 2
+
+        # Chain-link the median period return instead of taking the median of
+        # absolute account levels. A newly created account has no prior-period
+        # return, so joining the cohort cannot create a fictitious level jump.
+        timeline = sorted({timestamp for series in member_series.values() for timestamp in series})
+        previous: dict[str, float] = {}
+        composite = None
+        aggregate_points = []
+        for timestamp in timeline:
+            established = list(previous)
+            period_returns = []
+            for name in established:
+                prior = previous[name]
+                current = member_series[name].get(timestamp, prior)
+                period_returns.append(current / prior - 1.0)
+                previous[name] = current
+            entrants = [
+                series[timestamp] for name, series in member_series.items()
+                if name not in previous and timestamp in series
+            ]
+            if composite is None:
+                if not entrants:
+                    continue
+                composite = median_value(entrants)
+            elif period_returns:
+                composite *= 1.0 + median_value(period_returns)
+            for name, series in member_series.items():
+                if name not in previous and timestamp in series:
+                    previous[name] = series[timestamp]
+            aggregate_points.append({'timestamp': timestamp, 'equity': round(composite, 2)})
+
+        aggregate_name = f'{group} · MEDIAN'
+        output_curves[aggregate_name] = _downsample_endpoints(
+            aggregate_points, OVERVIEW_EQUITY_MAX_POINTS,
+        )
+        output_meta[aggregate_name] = {
+            'status': 'active',
+            'group': group,
+            'aggregate': True,
+            'aggregation': 'chain_linked_median_return',
+            'benchmark': False,
+            'member_count': len(member_series),
+        }
+
+    return {'curves': output_curves, 'meta': output_meta, 'view': 'aggregate'}
+
+
+async def _full_equity_curves(market: str):
+    return await _cached_api_value(
+        'equity_curves:full', market, 60, lambda: _build_equity_curves(market),
+        stale_ttl=5 * 60,
+    )
+
+
+@router.get('/equity-curves')
+async def equity_curves(market: str = Query('US'), view: str = Query('full')):
+    market = _validate_market(market)
+    # Direct Python callers written before `view` receive FastAPI's Query object.
+    view = view.lower() if isinstance(view, str) else 'full'
+    if view not in {'full', 'aggregate'}:
+        raise HTTPException(status_code=400, detail="invalid equity view; expected 'full' or 'aggregate'")
+    if view == 'full':
+        return await _full_equity_curves(market)
+    return await _cached_api_value(
+        'equity_curves:aggregate', market, 60,
+        lambda: _aggregate_equity_curves_from_full(market),
+        stale_ttl=5 * 60,
+    )
+
+
+async def _aggregate_equity_curves_from_full(market: str):
+    return _aggregate_equity_curves(await _full_equity_curves(market), market)
 
 
 @router.get('/recent-trades')
@@ -732,6 +924,8 @@ def _account_detail_sync(account_id: str, market: str) -> dict | None:
     con = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
     try:
         con.execute('PRAGMA query_only = ON')
+        # One explicit read transaction prevents mixed-generation components.
+        con.execute('BEGIN')
         params = {'a': account_id, 'm': market}
         meta_rows = _rows(con.execute(
             'SELECT * FROM account_meta WHERE account_id = :a AND market = :m', params
@@ -760,15 +954,41 @@ def _account_detail_sync(account_id: str, market: str) -> dict | None:
             {**params, 'lim': ACCOUNT_TRADES_MAX},
         ))
 
-        # Keep all equity tuples long enough to map every retained position
-        # snapshot. Only the chart curve is downsampled afterwards.
-        equity_tuples = con.execute(
-            'SELECT equity, timestamp FROM accounts '
-            'WHERE name = :a AND market = :m ORDER BY timestamp', params
-        ).fetchall()
-        equity_raw = [{'equity': row[0], 'timestamp': row[1]} for row in equity_tuples]
-        eq_map = {row[1]: row[0] for row in equity_tuples}
-        equity = _downsample_endpoints(equity_raw, ACCOUNT_EQUITY_MAX_POINTS)
+        equity_bounds = con.execute(
+            'SELECT MIN(id),MAX(id),COUNT(*) FROM accounts WHERE name = :a AND market = :m',
+            params,
+        ).fetchone()
+        min_equity_id, max_equity_id, equity_source_points = equity_bounds
+        equity_source_points = int(equity_source_points or 0)
+        if equity_source_points <= ACCOUNT_EQUITY_MAX_POINTS:
+            equity_tuples = con.execute(
+                'SELECT equity, timestamp FROM accounts '
+                'WHERE name = :a AND market = :m ORDER BY timestamp', params
+            ).fetchall()
+        else:
+            # Snapshot ids are append-ordered. Probe evenly-spaced rowids with
+            # indexed correlated seeks: bounded transfer without a 20s window
+            # sort/materialization over the complete account history.
+            target_ids = sorted({
+                round(min_equity_id + i * (max_equity_id - min_equity_id) /
+                      (ACCOUNT_EQUITY_MAX_POINTS - 1))
+                for i in range(ACCOUNT_EQUITY_MAX_POINTS)
+            })
+            values = ','.join('(?)' for _ in target_ids)
+            equity_tuples = con.execute(
+                f'WITH targets(id) AS (VALUES {values}) '
+                'SELECT (SELECT equity FROM accounts a WHERE a.id>=t.id '
+                ' AND a.name=? AND a.market=? ORDER BY a.id LIMIT 1),'
+                ' (SELECT timestamp FROM accounts a WHERE a.id>=t.id '
+                ' AND a.name=? AND a.market=? ORDER BY a.id LIMIT 1) '
+                'FROM targets t',
+                (*target_ids, account_id, market, account_id, market),
+            ).fetchall()
+            # Interleaved account batches can map adjacent probes to the same
+            # snapshot. Deduplicate and restore chart time order.
+            equity_tuples = sorted({row[1]: row for row in equity_tuples if row[1]}.values(),
+                                   key=lambda row: row[1])
+        equity = [{'equity': row[0], 'timestamp': row[1]} for row in equity_tuples]
 
         # SQL performs timestamp/holding windowing and carries the complete
         # snapshot market value, so cash remains exact even when holdings are cut.
@@ -788,6 +1008,17 @@ def _account_detail_sync(account_id: str, market: str) -> dict | None:
             {**params, 'snap_lim': ACCOUNT_SNAPSHOT_MAX,
              'holding_lim': ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX},
         ))
+        snapshot_ts = sorted({row['timestamp'] for row in ph_rows})
+        eq_map = {}
+        if snapshot_ts:
+            placeholders = ','.join('?' for _ in snapshot_ts)
+            eq_map = {
+                ts: eq for ts, eq in con.execute(
+                    'SELECT timestamp,equity FROM accounts WHERE name=? AND market=? '
+                    f'AND timestamp IN ({placeholders})',
+                    (account_id, market, *snapshot_ts),
+                )
+            }
         snap_map: dict[str, dict] = {}
         for row in ph_rows:
             snap = snap_map.setdefault(row['timestamp'], {
@@ -826,7 +1057,7 @@ def _account_detail_sync(account_id: str, market: str) -> dict | None:
         return {
             'meta': meta_rows[0], 'state': state_rows[0] if state_rows else None,
             'positions': positions, 'trades': trades, 'equity': equity,
-            'equity_source_points': len(equity_raw), 'snapshots': snapshots,
+            'equity_source_points': equity_source_points, 'snapshots': snapshots,
             'anchor_ts': anchor_ts, 'trade_total': trade_total,
             'trade_stats': {'total': trade_total, 'buys': buy_total, 'sells': sell_total},
             'trade_markers': trade_markers,
@@ -876,10 +1107,7 @@ async def account_trades(account_id: str, market: str = Query('US'),
     return {'market': market, 'account_id': account_id, **payload}
 
 
-@router.get('/account/{account_id}')
-async def account_detail(account_id: str, market: str = Query('US')):
-    market = _validate_market(market)
-    account_id = _validate_account_id(account_id)
+async def _build_account_detail(account_id: str, market: str):
     detail = await asyncio.to_thread(_account_detail_sync, account_id, market)
     if detail is None:
         raise HTTPException(status_code=404, detail='account not found in requested market')
@@ -889,6 +1117,14 @@ async def account_detail(account_id: str, market: str = Query('US')):
     anchor_ts = detail['anchor_ts']
 
     align_ts = [r['timestamp'] for r in equity] if equity else None
+    benchmark_align_ts = None
+    if align_ts:
+        benchmark_align_ts = [
+            point['timestamp'] for point in _downsample_endpoints(
+                [{'timestamp': timestamp} for timestamp in align_ts],
+                ACCOUNT_BENCHMARK_MAX_POINTS,
+            )
+        ]
     benchmarks = []
     base_initial = 100000.0 if market == 'CN' else 10000.0
     if not account_id.startswith('IDX') and anchor_ts:
@@ -898,14 +1134,20 @@ async def account_detail(account_id: str, market: str = Query('US')):
             # a multi-second network cold path. Cached overlays usually return
             # immediately; otherwise the core account response wins after 2s.
             curves = await asyncio.wait_for(asyncio.gather(*[
-                rebased_curve(b['ticker'], anchor_ts, initial=base_initial, align_to=align_ts)
+                rebased_curve(b['ticker'], anchor_ts, initial=base_initial, align_to=benchmark_align_ts)
                 for b in benchmark_defs
             ]), timeout=2.0)
         except asyncio.TimeoutError:
             curves = []
         for b, curve in zip(benchmark_defs, curves):
             if curve:
-                benchmarks.append({'label': b['label'], 'ticker': b['ticker'], 'curve': curve})
+                allowed = set(benchmark_align_ts or [])
+                if allowed:
+                    curve = [point for point in curve if point.get('timestamp') in allowed]
+                else:
+                    curve = _downsample_endpoints(curve, ACCOUNT_EQUITY_MAX_POINTS)
+                if curve:
+                    benchmarks.append({'label': b['label'], 'ticker': b['ticker'], 'curve': curve})
 
     alpha_info = None
     if equity and anchor_ts:
@@ -952,6 +1194,7 @@ async def account_detail(account_id: str, market: str = Query('US')):
         'alpha': alpha_info,
         'limits': {
             'equity_points': ACCOUNT_EQUITY_MAX_POINTS,
+            'benchmark_points': ACCOUNT_BENCHMARK_MAX_POINTS,
             'snapshot_timestamps': ACCOUNT_SNAPSHOT_MAX,
             'holdings_per_snapshot': ACCOUNT_HOLDINGS_PER_SNAPSHOT_MAX,
             'trades': ACCOUNT_TRADES_MAX,
@@ -960,3 +1203,13 @@ async def account_detail(account_id: str, market: str = Query('US')):
             'trade_marker_source_points': detail['trade_marker_source_points'],
         },
     }
+
+
+@router.get('/account/{account_id}')
+async def account_detail(account_id: str, market: str = Query('US')):
+    market = _validate_market(market)
+    account_id = _validate_account_id(account_id)
+    return await _singleflight_api_value(
+        f'account_detail:{account_id}', market,
+        lambda: _build_account_detail(account_id, market),
+    )
